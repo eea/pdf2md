@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 setup(
     name="pdf2md",
     version="0.1.0",
-    author="Matteo Mattiuzzi, Maciej Dudek",
-    author_email="matteo@mattiuzzi.com",
+    author="Maciej Dudek, Matteo Mattiuzzi",
+    author_email="Dudek.Maciej@eea.europa.eu, matteo@mattiuzzi.com",
     description="Convert a PDF document into Markdown (.md) or Quarto (.qmd) detecting figures, transcribing tables and writing structured content using LLM APIs.",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
