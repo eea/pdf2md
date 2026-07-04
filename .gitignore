@@ -7,3 +7,4 @@ test_output_gfm/
 dist/
 *.fixed
 *_backup.py
+build/
