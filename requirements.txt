@@ -1,0 +1,14 @@
+# Runtime dependencies for pdf2md (PDF → Markdown .md/.qmd converter).
+# Python 3.9+.  Install with:  python3 -m pip install -r requirements.txt
+#
+# External (NOT pip-installable) — must be present separately:
+#   - Quarto CLI            (only required for the Typst PDF render; skip with --no-render)
+#   - OPENROUTER_API_KEY    environment variable (for LLM calls)
+
+PyMuPDF>=1.26      # 'fitz' — PDF parsing, page rendering, table/figure geometry
+requests>=2.32     # OpenRouter HTTP + SSE streaming
+rich>=13.7         # terminal UI (degrades to plain logging if missing)
+
+# Dev / test only (not needed to run the tool):
+#   pytest>=7.4
+pymupdf-layout>=1.24         # better table detection (suppresses find_tables warning)

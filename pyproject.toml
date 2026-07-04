@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2md"
+version = "0.1.0"
+description = "Convert PDF to Markdown/Quarto .md/.qmd (detect, transcribe, render, verify)"
+readme = "README.md"
+authors = [
+    { name = "Matteo Mattiuzzi", email = "matteo@mattiuzzi.com" },
+    { name = "Maciej Dudek", email = "Dudek.Maciej@eea.europa.eu" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: European Union Public Licence 1.2 (EUPL 1.2)",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "PyMuPDF>=1.26",
+    "requests>=2.32",
+    "rich>=13.7"
+]
+
+[project.scripts]
+pdf2md = "pdf2md.app_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

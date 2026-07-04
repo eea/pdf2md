@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+output/
+test_output_gfm/
+*.egg-info/
+dist/
+*.fixed
+*_backup.py
