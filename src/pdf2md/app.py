@@ -233,78 +233,72 @@ def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str,
     bodies = []
     total_cost = 0.0
     _chunk_temp_dirs = []  # track temp dirs for cleanup
-    
-    for i, start in enumerate(chunks):
-        end = min(start + chunk_size, total)
-        # Create chunk PDF
-        chunk_doc = fitz.open()
-        for p in range(start, end):
-            chunk_doc.insert_pdf(doc, from_page=p, to_page=p)
-        # Use a local temp dir for chunks (WebDAV can't handle rapid mkdir/write)
-        import tempfile as _tempfile
-        chunk_dir = Path(_tempfile.mkdtemp(prefix=f"pdf2md_chunk{i}_"))
-        _chunk_temp_dirs.append(chunk_dir)
-        chunk_pdf = chunk_dir / f"{stem}_chunk{i}.placeholders.pdf"
-        chunk_doc.save(str(chunk_pdf))
-        chunk_doc.close()
-        
-        # Copy detections sidecar (figures are in the main dir)
-        import shutil
-        det = out_dir / "detections.json"
-        if det.exists():
-            shutil.copy2(str(det), str(chunk_dir / "detections.json"))
-        
-        events.convert_start()
-        p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
-                        default_date=default_date, format=format)
-        events.convert_done()
-        
-        chunk_qmd = chunk_dir / f"{stem}_chunk{i}.qmd" if format == "qmd" else chunk_dir / f"{stem}_chunk{i}.md"
-        if not chunk_qmd.exists():
-            doc.close()
-            raise RuntimeError(f"Chunk {i} conversion produced no output")
-        
-        chunk_text = chunk_qmd.read_text(encoding="utf-8")
-        # Strip frontmatter from chunks 1+ (keep only body)
-        if i > 0:
-            import re
-            m = re.match(r"^---\s*\n.*?\n---\s*\n?", chunk_text, re.DOTALL)
-            if m:
-                chunk_text = chunk_text[m.end():]
-        else:
-            # First chunk: keep frontmatter, but extract for concatenation
-            pass
-        
-        bodies.append(chunk_text.lstrip())
-        total_cost += p2.get("cost_usd", 0.0)
-    
-    doc.close()
-    
-    # Concatenate bodies
-    full_body = "\n\n".join(bodies)
-    ext = "qmd" if format == "qmd" else "md"
-    out_qmd = out_dir / f"{stem}.{ext}"
-    
-    # If first chunk had frontmatter, it's in bodies[0]; otherwise add it
-    if not bodies[0].startswith("---"):
-        from .resolve import normalize_frontmatter
-        from .pass2 import DEFAULT_CATEGORY
-        full_body = normalize_frontmatter(full_body, DEFAULT_CATEGORY, default_date, cover_fields)
-    
-    # Rewrite chunk-specific media paths to the main {stem}-media/ dir.
-    # Each chunk's Phase 2 references images under {stem}_chunkI-media/
-    # but the actual images live in {stem}-media/ (created by Phase 1).
-    for i in range(len(chunks)):
-        full_body = full_body.replace(
-            f"{stem}_chunk{i}-media/", f"{stem}-media/"
-        )
 
-    out_qmd.write_text(full_body, encoding="utf-8")
-    
-    # Clean up chunk temp dirs
-    for chunk_dir in _chunk_temp_dirs:
-        if chunk_dir.exists():
-            shutil.rmtree(str(chunk_dir), ignore_errors=True)
+    try:
+        for i, start in enumerate(chunks):
+            end = min(start + chunk_size, total)
+            # Create chunk PDF
+            chunk_doc = fitz.open()
+            for p in range(start, end):
+                chunk_doc.insert_pdf(doc, from_page=p, to_page=p)
+            # Use a local temp dir for chunks
+            import tempfile as _tempfile
+            chunk_dir = Path(_tempfile.mkdtemp(prefix=f"pdf2md_chunk{i}_"))
+            _chunk_temp_dirs.append(chunk_dir)
+            chunk_pdf = chunk_dir / f"{stem}_chunk{i}.placeholders.pdf"
+            chunk_doc.save(str(chunk_pdf))
+            chunk_doc.close()
+            
+            # Copy detections sidecar
+            import shutil
+            det = out_dir / "detections.json"
+            if det.exists():
+                shutil.copy2(str(det), str(chunk_dir / "detections.json"))
+            
+            events.convert_start()
+            p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
+                            default_date=default_date, format=format)
+            events.convert_done()
+            
+            chunk_qmd = chunk_dir / f"{stem}_chunk{i}.qmd" if format == "qmd" else chunk_dir / f"{stem}_chunk{i}.md"
+            if not chunk_qmd.exists():
+                raise RuntimeError(f"Chunk {i} conversion produced no output")
+            
+            chunk_text = chunk_qmd.read_text(encoding="utf-8")
+            # Strip frontmatter from chunks 1+
+            if i > 0:
+                import re
+                m = re.match(r"^---\s*\n.*?\n---\s*\n?", chunk_text, re.DOTALL)
+                if m:
+                    chunk_text = chunk_text[m.end():]
+            
+            bodies.append(chunk_text.lstrip())
+            total_cost += p2.get("cost_usd", 0.0)
+        
+        # Concatenate bodies
+        full_body = "\n\n".join(bodies)
+        ext = "qmd" if format == "qmd" else "md"
+        out_qmd = out_dir / f"{stem}.{ext}"
+        
+        # If first chunk had frontmatter, it's in bodies[0]; otherwise add it
+        if not bodies[0].startswith("---"):
+            from .resolve import normalize_frontmatter
+            from .pass2 import DEFAULT_CATEGORY
+            full_body = normalize_frontmatter(full_body, DEFAULT_CATEGORY, default_date, cover_fields)
+        
+        # Rewrite chunk-specific media paths to the main {stem}-media/ dir
+        for i in range(len(chunks)):
+            full_body = full_body.replace(
+                f"{stem}_chunk{i}-media/", f"{stem}-media/"
+            )
+
+        out_qmd.write_text(full_body, encoding="utf-8")
+    finally:
+        doc.close()
+        # Always clean up chunk temp dirs, even on failure
+        for chunk_dir in _chunk_temp_dirs:
+            if chunk_dir.exists():
+                shutil.rmtree(str(chunk_dir), ignore_errors=True)
     
     log.info("Auto-split done: %d chunks → %s", len(chunks), out_qmd.name)
     return out_qmd, total_cost
