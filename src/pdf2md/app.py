@@ -117,15 +117,54 @@ def _ensure_scaffolding(out_root: Path) -> None:
         _link_or_copy((_RENDER_ASSETS / "_meta").resolve(), meta_link, is_dir=True)
 
 
-def _render(out_dir: Path, stem: str) -> tuple:
+def _find_quarto() -> str | None:
+    """Find the Quarto binary: config override > PATH > common install locations."""
+    import shutil as _shutil, json as _json
+    
+    # 1. Config override
+    cfg_path = Path.home() / ".pdf2md" / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = _json.loads(cfg_path.read_text())
+            qp = cfg.get("quarto_path", "")
+            if qp and Path(qp).exists():
+                return qp
+        except Exception:
+            pass
+    
+    # 2. PATH
+    found = _shutil.which("quarto")
+    if found:
+        return found
+    
+    # 3. Common install locations
+    candidates = [
+        Path.home() / "quarto" / "bin" / "quarto",
+        Path.home() / "opt" / "quarto" / "bin" / "quarto",
+        Path("/usr/local/bin/quarto"),
+        Path("/opt/quarto/bin/quarto"),
+        Path("C:/Program Files/Quarto/bin/quarto.exe"),
+        Path.home() / "AppData" / "Local" / "Programs" / "Quarto" / "bin" / "quarto.exe",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    
+    return None
+
+
+def _render(out_dir: Path, stem: str, quarto_path: str | None = None) -> tuple:
     """Render <stem>.qmd to <stem>.pdf via Quarto/Typst. Returns (ok, log_text)."""
-    # partials resolve relative to the doc dir, so symlink a local _meta to the
-    # project-root _meta (out_dir/.. == out_root, which has _meta).
+    quarto = quarto_path or _find_quarto()
+    if not quarto:
+        return False, "Quarto not found. Install from https://quarto.org or set quarto_path in ~/.pdf2md/config.json"
+    
+    # partials resolve relative to the doc dir
     link = out_dir / "_meta"
     if not link.exists():
         target = (link.parent / "../_meta").resolve()
         _link_or_copy(target, link, is_dir=True)
-    cmd = ["quarto", "render", f"{stem}.qmd", "--to", "typst",
+    cmd = [quarto, "render", f"{stem}.qmd", "--to", "typst",
            "--metadata-file", "../_typst.yml"]
     proc = subprocess.run(cmd, cwd=str(out_dir), capture_output=True, text=True)
     return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")

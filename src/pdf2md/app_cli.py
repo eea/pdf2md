@@ -101,8 +101,28 @@ def run_setup() -> int:
     except (ValueError, IndexError):
         model = DEFAULT_MODEL
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps({"model": model}, indent=2), encoding="utf-8")
+    cfg = {"model": model}
+    
+    # Quarto auto-detection (for --render)
+    import shutil as _shutil
+    quarto = _shutil.which("quarto")
+    if quarto:
+        print(f"\nQuarto found at: {quarto} (optional, only needed for --render)")
+        print("Press Enter to accept, or type a different path (Enter to skip):")
+        alt = input("> ").strip()
+        if alt:
+            quarto = alt
+    else:
+        print("\nQuarto not found in PATH (optional, only needed for --render).")
+        print("Enter path to quarto binary, or press Enter to skip:")
+        quarto = input("> ").strip() or None
+    if quarto:
+        cfg["quarto_path"] = quarto
+    
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     print(f"  Default model set to: {model}")
+    if quarto:
+        print(f"  Quarto path: {quarto}")
     print(f"  (override with --model or OPENROUTER_MODEL env var)")
     return 0
 
