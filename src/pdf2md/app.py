@@ -215,7 +215,12 @@ def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str,
     doc = fitz.open(str(pdf_path))
     total = doc.page_count
     # Chunk size: aim for ~25 pages per chunk (fits 16K token limit with margin)
-    chunk_size = 40
+    # Dynamic chunk size: scale to the model's max_tokens
+    # ~650 completion tokens/page (observed avg for technical docs),
+    # use 60% of max_tokens as safety margin
+    from .llm_client import _model_max_tokens
+    max_tok = _model_max_tokens(model)
+    chunk_size = max(10, int(max_tok * 0.6 / 650))
     chunks = list(range(0, total, chunk_size))
     if len(chunks) == 1:
         # shouldn't happen -- caller should only invoke this on failure
