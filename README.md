@@ -2,7 +2,6 @@
 
 Standalone multi-format PDF converter — detect figures and tables, then convert to Quarto `.qmd`, Markdown `.md`, or GitHub-Flavored Markdown `.gfm`.
 
-Extracted from [CLMS_documents](https://github.com/MatMatt/CLMS_documents).
 
 ## Authors
 
