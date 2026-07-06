@@ -30,7 +30,16 @@ python3 pdf2md.py inbox/ --out output/
 python3 pdf2md.py document.pdf --format gfm    # GitHub-Flavored Markdown
 python3 pdf2md.py document.pdf --format md     # Plain Markdown
 python3 pdf2md.py document.pdf --render        # Also render to PDF via Quarto
+
+# Use a YAML frontmatter template (only with --format qmd)
+python3 pdf2md.py document.pdf --template path/to/template.qmd
+python3 pdf2md.py document.pdf --template https://raw.githubusercontent.com/org/repo/main/template.qmd
 ```
+
+When --template is used, the template's YAML frontmatter block is injected into the
+conversion prompt. The LLM fills in document-specific values (title, date, etc.)
+while preserving the template's field set, order, and structure. This ensures
+every converted document starts with a consistent, pre-defined header.
 
 ## Pipeline
 
