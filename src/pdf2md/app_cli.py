@@ -141,6 +141,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help=f"OpenRouter model for detect+convert (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
+    p.add_argument("--template", type=Path, default=None, metavar="TEMPLATE",
+                   help="path to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (only with --format qmd)")
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
     p.add_argument("--no-verify", action="store_true", help="skip the content-fidelity verify pass")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")
@@ -335,6 +337,7 @@ def main() -> int:
         allow_over_budget=args.allow_over_budget,
         events=events,
         detect_workers=args.detect_workers,
+        template=str(args.template) if args.template else None,
     )
 
     try:

@@ -46,5 +46,54 @@ def parse_prompt_file(prompt_path: Path) -> tuple:
     return system_instruction, user_prompt
 
 
+def extract_template_frontmatter(template_path) -> str:
+    """Read a .qmd template (local file or URL) and extract its YAML frontmatter body."""
+    if not template_path:
+        return ""
+    tp = str(template_path) if not isinstance(template_path, str) else template_path
+    
+    if tp.startswith("http://") or tp.startswith("https://"):
+        try:
+            from urllib.request import urlopen
+            text = urlopen(tp, timeout=10).read().decode("utf-8")
+        except Exception as exc:
+            log.warning("Failed to fetch template from %s: %s", tp, exc)
+            return ""
+    else:
+        pp = Path(tp)
+        if not pp.exists():
+            return ""
+        text = pp.read_text(encoding="utf-8")
+    
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL | re.MULTILINE)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def inject_template_frontmatter(system_instruction: str, template_path) -> str:
+    """Replace the FRONTMATTER section with a template's YAML header."""
+    if template_path is None:
+        return system_instruction
+    tp = Path(template_path) if not isinstance(template_path, Path) else template_path
+    yaml_body = extract_template_frontmatter(tp)
+    if not yaml_body:
+        return system_instruction
+    replacement = (
+        "FRONTMATTER:\n"
+        "Begin the output with this EXACT YAML frontmatter block, filling in the\n"
+        "values from the document. Keep ALL key names and the key order — only\n"
+        "replace placeholder values with actual document metadata.\n"
+        "Do NOT add, remove, or rename any keys.\n\n"
+        "    ---\n"
+        f"{yaml_body}\n"
+        "    ---\n\n"
+        "Leave the structure intact — only update the VALUES."
+    )
+    pattern = r"(FRONTMATTER:.*?)(?=\n\n[A-Z][A-Z]+:|\Z)"
+    return re.sub(pattern, replacement, system_instruction, flags=re.DOTALL)
+
+
+
 def build_user_prompt(user_prompt_template: str, filename: str) -> str:
     return user_prompt_template.replace("{{FILENAME}}", filename)

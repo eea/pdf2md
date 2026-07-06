@@ -296,6 +296,7 @@ def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str,
             
             events.convert_start()
             p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
+                            template_path=template,
                             default_date=default_date, format=format)
             events.convert_done()
             
@@ -360,6 +361,7 @@ def convert_one(
     total: int = 1,
     format: str = "qmd", strip_headers: bool = None,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
+    template: str = None,               # path to a .qmd template for YAML frontmatter
 ) -> FileResult:
     """Run the full pipeline for one PDF. Never raises; failures land in the
     returned FileResult (status="fail", or "skip" when gated by the estimate)."""
@@ -431,7 +433,8 @@ def convert_one(
         fallback_date = datetime.date.today().isoformat()
         try:
             p2 = run_phase2(out_dir, api_key=api_key, model=model,
-                            default_date=fallback_date, on_delta=on_delta, format=format)
+                            default_date=fallback_date, on_delta=on_delta, format=format,
+                            template_path=template)
         except RuntimeError as e:
             if "Output truncated" in str(e) or "too long" in str(e) or "output-token limit" in str(e):
                 log.warning("Output truncated — attempting auto-split")

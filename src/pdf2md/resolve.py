@@ -395,6 +395,7 @@ def _coerce_date(val: str) -> str:
 def normalize_frontmatter(
     qmd_text: str, category: str = "uncategorized", date: str = None,
     cover_fields: dict = None,
+    keep_template_fields: bool = False,
 ) -> str:
     """Ensure the .qmd frontmatter carries the fields the PR gate requires.
 
@@ -407,6 +408,12 @@ def normalize_frontmatter(
     cover page. Empty cover values fall back to the converter's value.
     """
     fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+
+    if keep_template_fields:
+        if not fm_re.match(qmd_text.lstrip()):
+            qmd_text = "---\n---\n\n" + qmd_text.lstrip()
+        return qmd_text
+
     m = fm_re.match(qmd_text.lstrip())
     cat_line = f"category: {category}"
 

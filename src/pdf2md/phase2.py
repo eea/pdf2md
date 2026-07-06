@@ -21,6 +21,7 @@ def run_phase2(
     category: str = DEFAULT_CATEGORY,
     format: str = "qmd",
     default_date: str = None,
+    template_path = None,
     on_delta=None,
     timeout: int = 300,
 ) -> dict:
@@ -58,6 +59,7 @@ def run_phase2(
         format=format,
         default_date=default_date,
         cover_fields=cover_fields,
+        template_path=template_path,
         on_delta=on_delta,
         timeout=timeout,
     )

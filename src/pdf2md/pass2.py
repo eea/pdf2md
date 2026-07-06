@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 from .llm_client import call_openrouter
-from .prompt import build_user_prompt, parse_prompt_file
+from .prompt import build_user_prompt, inject_template_frontmatter, parse_prompt_file
 from .resolve import (
     close_unbalanced_fences,
     drop_empty_table_rows,
@@ -48,6 +48,7 @@ def convert_placeholdered(
     category: str = DEFAULT_CATEGORY,
     default_date: str = None,
     cover_fields: dict = None,
+    template_path: Path | str | None = None,
     on_delta=None,
     timeout: int = 300,
     max_tokens: int = None,
@@ -67,6 +68,10 @@ def convert_placeholdered(
     else:
         system_instruction, user_template = parse_prompt_file(prompt_file)
     user_prompt = build_user_prompt(user_template, placeholders_pdf.name)
+
+    # Inject template frontmatter if provided
+    if template_path is not None:
+        system_instruction = inject_template_frontmatter(system_instruction, template_path)
 
     # working PDF is small (chrome stripped), so inline base64 is fine
     b64 = base64.b64encode(placeholders_pdf.read_bytes()).decode("ascii")
@@ -119,7 +124,7 @@ def convert_placeholdered(
     if n_hr:
         log.info("[Pass 2] Converted %d body '---' rule(s) to '***' "
                  "(a body '---…---' block is misread by Quarto as a YAML metadata block)", n_hr)
-    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields)
+    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=template_path is not None)
 
     out_qmd.parent.mkdir(parents=True, exist_ok=True)
     # atomic write: resume keys off the .qmd's existence, so a Ctrl-C mid-write must
