@@ -59,6 +59,17 @@ API key and default model are stored in `~/.pdf2md/`:
 python3 pdf2md.py --setup    # Interactive configuration
 ```
 
+## Updating
+
+```bash
+cd pdf2md
+git pull
+```
+
+The editable install (`pip install -e .`) picks up changes automatically — no need to
+re-install unless new dependencies were added. If the pull adds new packages, run
+`pip install -e .` again to install them.
+
 ## License
 
 EUPL-1.2 — see [LICENSE](LICENSE).
