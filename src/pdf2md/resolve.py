@@ -466,6 +466,8 @@ def _apply_template_frontmatter(qmd_text: str, template_ref) -> str:
         merged.append(line)
     
     body = qmd_text[m.end():]
+    if not body.startswith(chr(10)):
+        body = chr(10) + body
     return "---\n" + "\n".join(merged) + "\n---" + body
 
 def normalize_frontmatter(
