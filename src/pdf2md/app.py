@@ -540,6 +540,7 @@ def convert_batch(
     events: Events = None,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
     format: str = "qmd", strip_headers: bool = None,
+    template: str = None,               # path to a .qmd template for YAML frontmatter
 ) -> list:
     """Convert every *.pdf in input_dir, sequentially, continue-and-report.
 
@@ -590,7 +591,7 @@ def convert_batch(
             pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
             do_render=do_render, do_verify=do_verify, force=force,
             max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
-            estimate=est, events=events, index=i, total=len(pdfs),
+            estimate=est, events=events, index=i, total=len(pdfs), template=template,
             detect_workers=detect_workers,
         )
         results.append(r)
