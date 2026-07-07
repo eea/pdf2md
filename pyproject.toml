@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Convert PDF to Markdown/Quarto .md/.qmd (detect, transcribe, render, verify)"
 readme = "README.md"
 authors = [
-    { name = "Maciej Dudek", email = "Dudek.Maciej@eea.europa.eu" },
-    { name = "Matteo Mattiuzzi", email = "matteo@mattiuzzi.com" }
+    { name = "Maciej Dudek" },
+    { name = "Matteo Mattiuzzi" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

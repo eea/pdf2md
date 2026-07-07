@@ -9,7 +9,7 @@ Extracted from [CLMS_documents](https://github.com/MatMatt/CLMS_documents).
 - Maciej Dudek
 - Matteo Mattiuzzi
 
-Copyright © 2026 European Environment Agency. Licensed under EUPL-1.2.
+Copyright © 2026 European Union. Licensed under EUPL-1.2.
 
 ## Quick start
 
