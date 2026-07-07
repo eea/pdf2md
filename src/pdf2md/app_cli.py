@@ -142,7 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
     p.add_argument("--template", type=Path, default=None, metavar="TEMPLATE",
-                   help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (only with --format qmd)")
+                   help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
     p.add_argument("--no-verify", action="store_true", help="skip the content-fidelity verify pass")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")

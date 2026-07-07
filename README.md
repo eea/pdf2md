@@ -31,7 +31,7 @@ python3 pdf2md.py document.pdf --format gfm    # GitHub-Flavored Markdown
 python3 pdf2md.py document.pdf --format md     # Plain Markdown
 python3 pdf2md.py document.pdf --render        # Also render to PDF via Quarto
 
-# Use a YAML frontmatter template (only with --format qmd)
+# Use a YAML frontmatter template (with --format qmd or gfm)
 python3 pdf2md.py document.pdf --template path/to/template.qmd
 python3 pdf2md.py document.pdf --template https://raw.githubusercontent.com/org/repo/main/template.qmd
 ```
