@@ -392,10 +392,86 @@ def _coerce_date(val: str) -> str:
     return val
 
 
+def _apply_template_frontmatter(qmd_text: str, template_ref) -> str:
+    """Merge LLM output values into a template YAML structure.
+
+    When --template is used, the LLM often ignores the injected prompt
+    and produces a minimal YAML. This post-processes the output: it reads
+    the template, extracts the LLM's discovered values (title, subtitle,
+    date, description), and writes a merged YAML that keeps the template
+    structure but uses the LLM's values where keys match.
+    """
+    # Ensure YAML block exists
+    fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+    m = fm_re.match(qmd_text.lstrip())
+    if not m:
+        qmd_text = "---\n---\n\n" + qmd_text.lstrip()
+        return qmd_text
+    
+    # template_ref is True (bool) when no actual path available — keep as-is
+    if template_ref is True or not isinstance(template_ref, (str, Path)):
+        return qmd_text
+    
+    tp = str(template_ref)
+    
+    # Fetch template
+    try:
+        if tp.startswith("http://") or tp.startswith("https://"):
+            from urllib.request import urlopen
+            tmpl = urlopen(tp, timeout=10).read().decode("utf-8")
+        else:
+            tmpl = Path(tp).read_text(encoding="utf-8")
+    except Exception:
+        return qmd_text
+    
+    # Extract template YAML
+    mt = re.search(r"^---\s*\n(.*?)\n---", tmpl, re.DOTALL | re.MULTILINE)
+    if not mt:
+        return qmd_text
+    template_lines = mt.group(1).split("\n")
+    
+    # Extract LLM YAML values
+    llm_yaml = m.group(1)
+    llm_vals = {}
+    for line in llm_yaml.split("\n"):
+        line = line.strip()
+        if ":" in line and not line.startswith("#"):
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip().lstrip(chr(34)).rstrip(chr(34)).lstrip(chr(39)).rstrip(chr(39))
+            if v:
+                llm_vals[k] = v
+    
+    # Merge: template structure, LLM values for content keys
+    CONTENT_KEYS = {"title", "subtitle", "date", "description", "author"}
+    merged = []
+    skip_cont = False
+    for line in template_lines:
+        if skip_cont:
+            if line and line[0] in (" ", "	"):
+                continue
+            skip_cont = False
+        s = line.strip()
+        if ":" in s and not s.startswith("#"):
+            k = s.split(":", 1)[0].strip()
+            indent = " " * (len(line) - len(line.lstrip()))
+            if k in llm_vals and k in CONTENT_KEYS:
+                v = llm_vals[k]
+                need_q = " " in v or ":" in v
+                if need_q:
+                    merged.append(f"{indent}{k}: '{v}'")
+                else:
+                    merged.append(f"{indent}{k}: {v}")
+                skip_cont = True
+                continue
+        merged.append(line)
+    
+    body = qmd_text[m.end():]
+    return "---\n" + "\n".join(merged) + "\n---" + body
+
 def normalize_frontmatter(
     qmd_text: str, category: str = "uncategorized", date: str = None,
     cover_fields: dict = None,
-    keep_template_fields: bool = False,
+    keep_template_fields = False,  # bool or template path/URL
 ) -> str:
     """Ensure the .qmd frontmatter carries the fields the PR gate requires.
 
@@ -410,9 +486,7 @@ def normalize_frontmatter(
     fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
     if keep_template_fields:
-        if not fm_re.match(qmd_text.lstrip()):
-            qmd_text = "---\n---\n\n" + qmd_text.lstrip()
-        return qmd_text
+        return _apply_template_frontmatter(qmd_text, keep_template_fields)
 
     m = fm_re.match(qmd_text.lstrip())
     cat_line = f"category: {category}"

@@ -71,7 +71,9 @@ def convert_placeholdered(
 
     # Inject template frontmatter if provided
     if template_path is not None:
+        log.info("[Pass 2] Injecting template from %s", template_path)
         system_instruction = inject_template_frontmatter(system_instruction, template_path)
+        log.info("[Pass 2] Template injected — prompt is %d chars", len(system_instruction))
 
     # working PDF is small (chrome stripped), so inline base64 is fine
     b64 = base64.b64encode(placeholders_pdf.read_bytes()).decode("ascii")
@@ -124,7 +126,7 @@ def convert_placeholdered(
     if n_hr:
         log.info("[Pass 2] Converted %d body '---' rule(s) to '***' "
                  "(a body '---…---' block is misread by Quarto as a YAML metadata block)", n_hr)
-    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=template_path is not None)
+    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=template_path)
 
     out_qmd.parent.mkdir(parents=True, exist_ok=True)
     # atomic write: resume keys off the .qmd's existence, so a Ctrl-C mid-write must
