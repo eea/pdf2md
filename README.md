@@ -59,6 +59,39 @@ API key and default model are stored in `~/.pdf2md/`:
 python3 pdf2md.py --setup    # Interactive configuration
 ```
 
+## Model Selection
+
+Not all models work equally well for PDF conversion. Before switching models, run
+the bundled edge-case benchmark to see how a candidate model handles tricky content:
+
+```bash
+python3 pdf2md.py src/pdf2md/tests/fixtures/pdf2md_edgecases.pdf \
+    --out /tmp/benchmark-out/ \
+    --model <model-slug> \
+    --postfix 0
+```
+
+Then check `verify_report.md` — the document is designed to surface failures in:
+
+- Table detection: text-based tables with merged cells, plus rasterized PNG tables
+- Figure extraction: embedded charts, wrapped figures, subfigures
+- Text fidelity: soft hyphens, ligatures, Unicode, intra-word formatting changes
+- Structure: nested lists, definition lists, blockquotes, task lists, two-column layout
+- Scientific content: chemical formulas, subscripts/superscripts, display equations
+- Metadata: YAML frontmatter generation (title detection, date parsing)
+
+### Known model characteristics
+
+| Model               | Vision | Verdict                  |
+|---------------------|--------|--------------------------|
+| Gemini 2.5 Pro      | yes    | Default — best all-round |
+| Gemini 2.5 Flash    | yes    | Faster, slightly weaker  |
+| Kimi K2.6           | yes    | Capable, mid-price       |
+| DeepSeek V4 Pro     | no     | Unsuitable — no vision   |
+
+Models without vision/image support cannot extract figures and will fail
+`verify=fail` on figure placement. Stick to multimodal models.
+
 ## Updating
 
 ```bash
