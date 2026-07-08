@@ -11,3 +11,8 @@ from . import text_coverage      # noqa: F401
 from . import table_coverage     # noqa: F401
 from . import oversized_tables   # noqa: F401
 from . import wide_table_legibility  # noqa: F401
+from . import footnote_placement  # noqa: F401
+from . import link_preservation   # noqa: F401
+from . import heading_hierarchy   # noqa: F401
+from . import math_presence       # noqa: F401
+from . import code_block_presence  # noqa: F401
