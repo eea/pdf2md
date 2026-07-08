@@ -80,16 +80,6 @@ Then check `verify_report.md` — the document is designed to surface failures i
 - Scientific content: chemical formulas, subscripts/superscripts, display equations
 - Metadata: YAML frontmatter generation (title detection, date parsing)
 
-### Known model characteristics
-
-| Model               | Vision | Verdict                  |
-|---------------------|--------|--------------------------|
-| Gemini 2.5 Pro      | yes    | Default — best all-round |
-| Gemini 2.5 Flash    | yes    | Faster, slightly weaker  |
-| Kimi K2.6           | yes    | Capable, mid-price       |
-| DeepSeek V4 Pro     | no     | Unsuitable — no vision   |
-
-Models without vision/image support cannot extract figures and will fail
 `verify=fail` on figure placement. Stick to multimodal models.
 
 ## Updating
