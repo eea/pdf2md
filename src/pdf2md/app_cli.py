@@ -21,9 +21,55 @@ from pathlib import Path
 from .app import DEFAULT_MODEL, Events, convert_batch, convert_one
 from .cost import eur_to_usd, fmt_eur
 from .cover import DEFAULT_COVER_MODEL
+from . import __version__
 from .ui import make_ui
 
 log = logging.getLogger(__name__)
+
+
+def _build_json_report(result, timing, model, cover_model):
+    """Write a comprehensive machine-readable report alongside result.json."""
+    import json, time as _time
+    report = {
+        "version": __version__,
+        "generated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "model": model,
+        "cover_model": cover_model,
+        "file": {
+            "pdf": str(result.pdf),
+            "stem": result.stem,
+            "pages": result.est.get("pages") if result.est else None,
+        },
+        "status": result.status,
+        "timing": timing,
+        "cost": {
+            "total_usd": result.cost_usd,
+            "phases": result.phase_cost,
+        },
+        "verify": {
+            "status": result.verify_status,
+            "text_coverage": result.text_cov,
+            "table_coverage": result.table_cov,
+            "issues": result.verify_issues,
+        },
+        "figures": result.figures,
+        "tables": result.tables,
+        "postfix": {
+            "items_recovered": result.postfix_items,
+            "applied": result.postfixes_applied,
+        },
+        "tablefix": result.tablefix,
+    }
+    if result.est:
+        report["estimate"] = {
+            "expected_usd": result.est.get("expected_usd"),
+            "low_usd": result.est.get("low_usd"),
+            "high_usd": result.est.get("high_usd"),
+            "candidate_pages": result.est.get("candidate_pages"),
+        }
+    if result.error:
+        report["error"] = result.error
+    return report
 
 # ── Key & config helpers ───────────────────────────────────────────────────────
 
@@ -78,6 +124,9 @@ def run_setup() -> int:
     print("Paste your OpenRouter API key (or press Enter to skip):")
     key = input("> ").strip()
     if key:
+        if not key.startswith("sk-or-"):
+            print("  Error: key must start with 'sk-or-' (OpenRouter API key format).")
+            return 1
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         KEY_FILE.write_text(key, encoding="utf-8")
         KEY_FILE.chmod(0o600)
@@ -134,6 +183,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("path", nargs="?", type=Path, help="a PDF file, or a directory of PDFs (batch)")
+    p.add_argument("--version", "-V", action="version", version=f"pdf2md {__version__}")
     p.add_argument("--format", "-f", default="qmd", choices=["qmd", "md", "gfm"], help="output format (default: qmd)")
     p.add_argument("--out", type=Path, default=Path("output"),
                    help="output root directory (default: output/)")
@@ -141,10 +191,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help=f"OpenRouter model for detect+convert (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
-    p.add_argument("--template", type=Path, default=None, metavar="TEMPLATE",
+    p.add_argument("--template", type=str, default=None, metavar="TEMPLATE",
                    help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
     p.add_argument("--no-verify", action="store_true", help="skip the content-fidelity verify pass")
+    p.add_argument("--json-report", action="store_true", help="write a comprehensive machine-readable <stem>-report.json alongside the output")
+    p.add_argument("--postfix", type=int, default=1, metavar="N", help="post-conversion fixes after verify (default: 1, 0 to disable)")
+    p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and postfix existing output")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")
     p.add_argument("--max-cost-per-file", type=float, default=None, metavar="EUR",
                    help="skip a file whose pre-flight estimate exceeds this (EUR); "
@@ -266,11 +319,15 @@ def _dry_run(args) -> int:
     from .replay import DEFAULT_DELAY, replay_batch, replay_mock_batch, replay_one
 
     delay = args.delay if args.delay is not None else DEFAULT_DELAY
-    single_dir = (args.path / f"{args.path.name}.qmd").exists()
-    # no recorded outputs but the dir holds raw PDFs -> show MOCK data so the UX
-    # can be previewed on un-converted PDFs (fabricated numbers, no LLM)
-    has_outputs = single_dir or any(
-        d.is_dir() and (d / f"{d.name}.qmd").exists() for d in args.path.iterdir())
+    try:
+        single_dir = (args.path / f"{args.path.name}.qmd").exists()
+        # no recorded outputs but the dir holds raw PDFs -> show MOCK data so the UX
+        # can be previewed on un-converted PDFs (fabricated numbers, no LLM)
+        has_outputs = single_dir or any(
+            d.is_dir() and (d / f"{d.name}.qmd").exists() for d in args.path.iterdir())
+    except NotADirectoryError:
+        log.error("--dry-run: %s is a file, not a directory (re-run without --dry-run on a converted output directory)", args.path)
+        return 1
     mock = not has_outputs and any(args.path.glob("*.pdf"))
     batch = not single_dir
     events, rich_active = _setup_ui_and_logging(args, batch)
@@ -309,6 +366,11 @@ def main() -> int:
     if args.setup:
         return run_setup()
 
+    if args.path is None:
+        parser.print_help()
+        print("\nSupply a PDF file or directory, or use --setup to configure.")
+        return 1
+
     if not args.path.exists():
         log.error("path not found: %s", args.path)
         return 1
@@ -333,11 +395,14 @@ def main() -> int:
         api_key=api_key, model=model, cover_model=args.cover_model,
         do_render=args.render, do_verify=not args.no_verify, force=args.force,
         format=args.format, strip_headers=(not args.keep_headers),
+        postfix_passes=args.postfix,
+        improve_only=args.improve,
         max_cost_per_file=eur_to_usd(args.max_cost_per_file),
         allow_over_budget=args.allow_over_budget,
         events=events,
         detect_workers=args.detect_workers,
         template=str(args.template) if args.template else None,
+        json_report=args.json_report,
     )
 
     try:
@@ -345,7 +410,17 @@ def main() -> int:
             results = convert_batch(args.path, args.out,
                                     max_cost_total=eur_to_usd(args.max_cost_total), **common)
         else:
-            results = [convert_one(args.path, args.out, index=1, total=1, **common)]
+            results = [convert_one(args.path, args.out, **common)]
+
+        # Write json reports
+        if args.json_report:
+            import json as _json
+            for r in results:
+                if r.status in ("ok", "warn") and hasattr(r, "timing"):
+                    report = _build_json_report(r, r.timing, model, args.cover_model)
+                    report_path = r.out_dir / f"{r.stem}-report.json"
+                    report_path.write_text(_json.dumps(report, indent=2, default=str), encoding="utf-8")
+                    log.info("Wrote json report: %s", report_path)
     except KeyboardInterrupt:
         events.abort()
         _print_cancelled(events, args.out, rich_active)

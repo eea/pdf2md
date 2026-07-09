@@ -20,6 +20,7 @@ from .cover import DEFAULT_COVER_MODEL
 from .estimate import estimate_file, load_calibration
 from .phase1 import run_phase1
 from .phase2 import run_phase2
+from .postfix import run_postfix
 from .tablefix import run_phase_tablefix
 from .phase25 import run_phase25
 from .verify import VerifyContext, overall_status, run_verify, write_report
@@ -46,6 +47,8 @@ class FileResult:
     tables: int = 0
     verify_status: str = ""      # ok | warn | fail ("" if verify skipped)
     verify_issues: list = field(default_factory=list)  # non-ok checks: {name, status, summary}
+    postfixes_applied: list = field(default_factory=list)
+    postfix_items: int = 0   # postfix passes that ran
     text_cov: float = None
     table_cov: float = None
     cover: dict = None
@@ -55,6 +58,7 @@ class FileResult:
     cost_usd: float = 0.0
     phase_cost: dict = field(default_factory=dict)
     tablefix: dict = None        # Phase 2.5 summary; kept for dry-run replay
+    timing: dict = field(default_factory=dict)   # phase -> seconds
 
 
 class Events:
@@ -166,8 +170,11 @@ def _render(out_dir: Path, stem: str, quarto_path: str | None = None) -> tuple:
         _link_or_copy(target, link, is_dir=True)
     cmd = [quarto, "render", f"{stem}.qmd", "--to", "typst",
            "--metadata-file", "../_typst.yml"]
-    proc = subprocess.run(cmd, cwd=str(out_dir), capture_output=True, text=True)
-    return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+    try:
+        proc = subprocess.run(cmd, cwd=str(out_dir), capture_output=True, text=True, timeout=300)
+        return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return False, "render timed out (300s)"
 
 
 def _run_verify(out_dir: Path, stem: str) -> list:
@@ -247,8 +254,8 @@ def _persist_result(result: "FileResult") -> None:
 
 
 def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str, 
-                   model: str, cover_fields: dict, default_date: str, 
-                   format: str, figures: list, events) -> tuple:
+                   model: str, cover_fields: dict, default_date: str,
+                   format: str, figures: list, template_path, events) -> tuple:
     """Split a too-large placeholder PDF into chunks, convert each, concatenate."""
     import fitz
     doc = fitz.open(str(pdf_path))
@@ -296,7 +303,7 @@ def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str,
             
             events.convert_start()
             p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
-                            template_path=template,
+                            template_path=template_path,
                             default_date=default_date, format=format)
             events.convert_done()
             
@@ -362,6 +369,9 @@ def convert_one(
     format: str = "qmd", strip_headers: bool = None,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
     template: str = None,               # path to a .qmd template for YAML frontmatter
+    postfix_passes: int = 1,
+    improve_only: bool = False,
+    json_report: bool = False,
 ) -> FileResult:
     """Run the full pipeline for one PDF. Never raises; failures land in the
     returned FileResult (status="fail", or "skip" when gated by the estimate)."""
@@ -371,14 +381,48 @@ def convert_one(
     result = FileResult(pdf=pdf, stem=stem, out_dir=out_dir)
     events.file_start(pdf, index, total)
 
+    ext = "qmd" if format == "qmd" else "md"
+
+    # improve-only: skip conversion, just verify + postfix existing output
+    if improve_only and out_dir.exists() and (out_dir / f"{stem}.{ext}").exists():
+        log.info("Improve-only mode: skipping conversion, running verify + postfix on existing output")
+        result.qmd = out_dir / f"{stem}.{ext}"
+        det_path = out_dir / "detections.json"
+        detections = {}
+        if det_path.exists():
+            import json as _json
+            detections = _json.loads(det_path.read_text())
+        events.verify_start()
+        results = _run_verify(out_dir, stem)
+        result.verify_status = overall_status(results)
+        events.verify_done(result.verify_status)
+        result.text_cov = _metric(results, "text_coverage")
+        result.table_cov = _metric(results, "table_coverage")
+        result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+                                for r in results if r.status in ("warn", "fail")]
+        result.verify_report = out_dir / "verify_report.md"
+        if postfix_passes > 0 and results:
+            postfix_summary = run_postfix(
+                result.qmd, results, out_dir,
+                api_key=api_key, passes=postfix_passes,
+            )
+            result.phase_cost["postfix"] = postfix_summary.get("cost_usd", 0.0)
+            result.cost_usd = sum(result.phase_cost.values())
+            if postfix_summary.get("postfixes_applied"):
+                result.postfixes_applied = postfix_summary["postfixes_applied"]
+                log.info("Postfix applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
+                if postfix_summary.get("verify_after"):
+                    result.verify_status = postfix_summary["verify_after"]
+        result.status = "warn" if result.verify_status in ("warn", "fail") else "ok"
+        events.file_done(result)
+        return result
+
     # resume: a completed .qmd means this file is done. checked before estimating
     # so a resume run doesn't even estimate files it'll skip.
-    ext = "qmd" if format == "qmd" else "md"
     if out_dir.exists() and (out_dir / f"{stem}.{ext}").exists() and not force:
         log.info("Skipping %s — %s already exists (use force to overwrite)", pdf.name, out_dir)
         result.status = "ok"
         result.resumed = True
-        ext = "qmd" if format == "qmd" else "md"
         result.qmd = out_dir / f"{stem}.{ext}"
         result.error = "already done (skipped on resume)"
         events.file_done(result)
@@ -410,10 +454,12 @@ def convert_one(
             return result
 
     try:
+        import time as _time
+        t0 = _time.perf_counter()
         if do_render: _ensure_scaffolding(out_root)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Phase 1 — detect
+    # Phase 1 — detect
         do_strip = strip_headers
         p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
                         do_strip_chrome=do_strip,
@@ -424,11 +470,14 @@ def convert_one(
         p1_cost = p1.get("cost_usd") or {}
         result.phase_cost["cover"] = p1_cost.get("cover", 0.0)
         result.phase_cost["detect"] = p1_cost.get("detect", 0.0)
+        result.timing["cover"] = p1_cost.get("cover_time", 0.0)
+        result.timing["detect"] = p1_cost.get("detect_time", 0.0)
 
         # Phase 2 — convert. Stream deltas to the UI only if it wants them.
         # `date` is required frontmatter; fall back to today's date when neither
         # the cover nor the converter supplies one (operator corrects).
         events.convert_start()
+        t_conv = _time.perf_counter()
         on_delta = events.convert_delta if events.wants_stream else None
         fallback_date = datetime.date.today().isoformat()
         try:
@@ -445,7 +494,7 @@ def convert_one(
                     figures = _json.loads(det_path.read_text()).get("figures", [])
                 split_qmd, split_cost = _split_convert(
                     out_dir / f"{stem}.placeholders.pdf", out_dir, stem,
-                    api_key, model, result.cover, fallback_date, format, figures, events)
+                    api_key, model, result.cover, fallback_date, format, figures, template, events)
                 if split_qmd:
                     p2 = {"cost_usd": split_cost or 0.0}
                     result.qmd = split_qmd
@@ -460,8 +509,10 @@ def convert_one(
             result.qmd = out_dir / f"{stem}.{ext}"
         result.phase_cost["convert"] = p2.get("cost_usd", 0.0)
         result.cost_usd = sum(result.phase_cost.values())
+        result.timing["convert"] = round(_time.perf_counter() - t_conv, 3)
         events.convert_done()
 
+        t_phase25 = _time.perf_counter()
         # Phase 2.5 — figure rescue (deterministic leftover tokens + LLM insertion)
         # Runs after Phase 2 to catch figures the converter missed.
         p25 = run_phase25(
@@ -480,14 +531,17 @@ def convert_one(
         # match each table's authored page geometry.
         result.tablefix = run_phase_tablefix(
             result.qmd, source_pdf=out_dir / f"{stem}.source.pdf", events=events)
+        result.timing["phase25"] = round(_time.perf_counter() - t_phase25, 3)
         result.tables = _count_tables(result.qmd)
 
         # Phase 3 — render. A render failure is a warn; the .qmd is still produced.
         render_failed = False
+        t_render = _time.perf_counter()
         if do_render and format == "qmd":
             events.render_start()
             ok, render_log = _render(out_dir, stem)
             events.render_done(ok)
+            result.timing["render"] = round(_time.perf_counter() - t_render, 3)
             if ok:
                 result.pdf_out = out_dir / f"{stem}.pdf"
             else:
@@ -496,6 +550,8 @@ def convert_one(
                 log.warning("Render failed for %s:\n%s", pdf.name, render_log[-1500:])
 
         # Phase 4 — verify
+        results = []
+        t_verify = _time.perf_counter()
         if do_verify and format == "qmd":
             events.verify_start()
             results = _run_verify(out_dir, stem)
@@ -506,7 +562,25 @@ def convert_one(
             result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
                                     for r in results if r.status in ("warn", "fail")]
             result.verify_report = out_dir / "verify_report.md"
+            result.timing["verify"] = round(_time.perf_counter() - t_verify, 3)
 
+# Phase 4.5 -- postfix (surgical fixes driven by verify results)
+        t_postfix = _time.perf_counter()
+        if postfix_passes > 0 and results:
+            postfix_summary = run_postfix(
+                result.qmd, results, out_dir,
+                api_key=api_key, passes=postfix_passes,
+            )
+            result.phase_cost["repair"] = postfix_summary.get("cost_usd", 0.0)
+            result.cost_usd = sum(result.phase_cost.values())
+            result.postfix_items = postfix_summary.get("items_recovered", 0)
+            if postfix_summary.get("postfixes_applied"):
+                result.postfixes_applied = postfix_summary["postfixes_applied"]
+                log.info("Repair applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
+                if postfix_summary.get("verify_after"):
+                    result.verify_status = postfix_summary["verify_after"]
+            result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
+        result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)
         sev = {"ok": 0, "warn": 1, "fail": 2}
         worst = max(1 if render_failed else 0, sev.get(result.verify_status, 0))
@@ -541,6 +615,9 @@ def convert_batch(
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
     format: str = "qmd", strip_headers: bool = None,
     template: str = None,               # path to a .qmd template for YAML frontmatter
+    postfix_passes: int = 1,
+    improve_only: bool = False,
+    json_report: bool = False,
 ) -> list:
     """Convert every *.pdf in input_dir, sequentially, continue-and-report.
 
@@ -555,48 +632,53 @@ def convert_batch(
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                           datefmt="%Y-%m-%d %H:%M:%S"))
     logging.getLogger().addHandler(fh)
+    try:
+        pdfs = sorted(p for p in input_dir.glob("*.pdf") if p.is_file())
+        events.batch_start(pdfs)
+        calib = load_calibration(out_root)
+        results = []
+        spent_usd = 0.0
+        stop_reason = ""
+        for i, pdf in enumerate(pdfs, 1):
+            # already done (resume)? skip estimate/budget; convert_one marks it
+            # resumed at ~zero cost.
+            ext = "qmd" if format == "qmd" else "md"
+            already_done = (out_root / pdf.stem / f"{pdf.stem}.{ext}").exists() and not force
+            try:
+                est = None if already_done else estimate_file(pdf, calib)
+            except Exception:                   # noqa: BLE001
+                est = None
 
-    pdfs = sorted(p for p in input_dir.glob("*.pdf") if p.is_file())
-    events.batch_start(pdfs)
-    calib = load_calibration(out_root)
-    results = []
-    spent_usd = 0.0
-    stop_reason = ""
-    for i, pdf in enumerate(pdfs, 1):
-        # already done (resume)? skip estimate/budget; convert_one marks it
-        # resumed at ~zero cost.
-        ext = "qmd" if format == "qmd" else "md"
-        already_done = (out_root / pdf.stem / f"{pdf.stem}.{ext}").exists() and not force
-        try:
-            est = None if already_done else estimate_file(pdf, calib)
-        except Exception:                   # noqa: BLE001
-            est = None
+            # batch backstop: would actual spend + this file's estimate exceed the
+            # total? stop here, mark this and the rest skipped.
+            if (max_cost_total is not None and not allow_over_budget and est
+                    and spent_usd + est["expected_usd"] > max_cost_total):
+                stop_reason = (f"batch budget {fmt_eur(max_cost_total)} would be exceeded "
+                               f"({fmt_eur(spent_usd)} spent + est {fmt_eur(est['expected_usd'])})")
+                for j in range(i, len(pdfs) + 1):
+                    r = FileResult(pdf=pdfs[j - 1], stem=pdfs[j - 1].stem,
+                                   out_dir=out_root / pdfs[j - 1].stem, status="skip",
+                                   error=f"batch budget reached — {stop_reason}")
+                    events.file_start(r.pdf, j, len(pdfs))
+                    events.file_done(r)
+                    results.append(r)
+                break
 
-        # batch backstop: would actual spend + this file's estimate exceed the
-        # total? stop here, mark this and the rest skipped.
-        if (max_cost_total is not None and not allow_over_budget and est
-                and spent_usd + est["expected_usd"] > max_cost_total):
-            stop_reason = (f"batch budget {fmt_eur(max_cost_total)} would be exceeded "
-                           f"({fmt_eur(spent_usd)} spent + est {fmt_eur(est['expected_usd'])})")
-            for j in range(i, len(pdfs) + 1):
-                r = FileResult(pdf=pdfs[j - 1], stem=pdfs[j - 1].stem,
-                               out_dir=out_root / pdfs[j - 1].stem, status="skip",
-                               error=f"batch budget reached — {stop_reason}")
-                events.file_start(r.pdf, j, len(pdfs))
-                events.file_done(r)
-                results.append(r)
-            break
-
-        r = convert_one(
-            pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
-            do_render=do_render, do_verify=do_verify, force=force,
-            max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
-            estimate=est, events=events, index=i, total=len(pdfs), template=template,
-            detect_workers=detect_workers,
-        )
-        results.append(r)
-        spent_usd += r.cost_usd or 0.0
-    if stop_reason:
-        log.warning("Batch halted: %s", stop_reason)
-    events.batch_done(results)
-    return results
+            r = convert_one(
+                pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
+                do_render=do_render, do_verify=do_verify, force=force,
+                max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
+                estimate=est, events=events, index=i, total=len(pdfs), template=template,
+                detect_workers=detect_workers,
+                postfix_passes=postfix_passes,
+                json_report=json_report,
+            )
+            results.append(r)
+            spent_usd += r.cost_usd or 0.0
+        if stop_reason:
+            log.warning("Batch halted: %s", stop_reason)
+        events.batch_done(results)
+        return results
+    finally:
+        logging.getLogger().removeHandler(fh)
+        fh.close()

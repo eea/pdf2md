@@ -418,6 +418,11 @@ class RichUI(Events):
                 cell = Text.from_markup(f"{_ICON.get(iss['status'], '[yellow]⚠[/]')} ")
                 cell.append(_clip(iss["summary"], 64), style="dim")
                 t.add_row("", cell)
+            if r.postfixes_applied:
+                for postfix in r.postfixes_applied:
+                    t.add_row("", f"[green]🔧 {postfix}[/]")
+            if r.postfix_items:
+                t.add_row("", f"[dim]   ↳ {r.postfix_items} details recovered[/]")
             if r.error:
                 t.add_row("note", f"[yellow]{r.error}[/]")
 
