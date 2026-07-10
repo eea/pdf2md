@@ -306,9 +306,9 @@ FRONTMATTER:
 Begin the output with a YAML frontmatter block containing exactly these keys:
 
     ---
-    title: "<document title>"
-    subtitle: "<document subtitle, or the series name e.g. Copernicus Land Monitoring Service>"
-    date: "<YYYY-MM-DD if a date is present in the document, else omit the line>"
+    title: '<document title>'
+    subtitle: '<document subtitle, or the series name e.g. Copernicus Land Monitoring Service>'
+    date: '<YYYY-MM-DD if a date is present in the document, else omit the line>'
     ---
 
 Do NOT add a "category" key (it is set downstream). Do NOT add any other keys.

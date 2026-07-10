@@ -1136,6 +1136,19 @@ class TestNormalizeFrontmatter:
         assert 'subtitle: "My Subtitle"' in out
         assert 'subtitle: ""' not in out
 
+    def test_apostrophe_in_title_escaped(self):
+        """Apostrophes in YAML single-quoted scalars must be doubled."""
+        import yaml
+        from pdf2md.resolve import normalize_frontmatter
+        qmd = '---\ntitle: T\n---\nBody\n'
+        out = normalize_frontmatter(qmd, cover_fields={"title": "User's Guide"})
+        # Parse the frontmatter block - must not raise a YAML error
+        fm_text = out.split("---")[1]
+        parsed = yaml.safe_load(fm_text)
+        assert parsed["title"] == "User's Guide"
+        # Verify the raw output has doubled apostrophe in single-quoted scalar
+        assert "User''s Guide" in out
+
     def test_coerces_year_only_date(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\ndate: "2011"\n---\nBody\n'

@@ -494,10 +494,10 @@ def normalize_frontmatter(
     cat_line = f"category: {category}"
 
     def _set_or_add(fm: str, key: str, value: str) -> str:
-        """Force `key: "value"` in the frontmatter block."""
+        """Force `key: 'value'` in the frontmatter block."""
         if not value:
             return fm
-        quoted = f'"{value}"'
+        quoted = "'" + value.replace("'", "''") + "'"
         pat = re.compile(r"^\s*" + re.escape(key) + r"\s*:.*$", re.MULTILINE)
         if pat.search(fm):
             return pat.sub(f"{key}: {quoted}", fm, count=1)
@@ -521,7 +521,7 @@ def normalize_frontmatter(
             cover_date = cover_fields.get("date", "") if cover_fields else ""
             chosen = cover_date or (date or "")
             if chosen:
-                fm = fm.rstrip() + f'\ndate: "{chosen}"'
+                fm = fm.rstrip() + f"\ndate: '{chosen}'"
                 if not cover_date and chosen == date:
                     log.warning("No date on cover or in converter output — defaulting to %s "
                                 "(operator should correct)", date)
@@ -529,13 +529,13 @@ def normalize_frontmatter(
         dm = re.search(r"^\s*date\s*:\s*(.+)$", fm, re.MULTILINE)
         if dm:
             coerced = _coerce_date(dm.group(1))
-            if coerced != dm.group(1).strip().strip('"'):
+            if coerced != dm.group(1).strip().strip('"').strip("'"):
                 log.info("Coerced date %r → %r", dm.group(1).strip(), coerced)
-            fm = re.sub(r"^\s*date\s*:.*$", f'date: "{coerced}"', fm,
+            fm = re.sub(r"^\s*date\s*:.*$", f"date: '{coerced}'", fm,
                         count=1, flags=re.MULTILINE)
         # subtitle is required by the PR gate; emit an empty one when none supplied
         if not re.search(r"^\s*subtitle\s*:", fm, re.MULTILINE):
-            fm = fm.rstrip() + '\nsubtitle: ""'
+            fm = fm.rstrip() + "\nsubtitle: ''"
         return fm
 
     if not m:
@@ -544,13 +544,15 @@ def normalize_frontmatter(
         cover_date = cover_fields.get("date", "") if cover_fields else ""
         chosen_date = cover_date or (date or "")
         if chosen_date:
-            fields.append(f'date: "{_coerce_date(chosen_date)}"')
+            fields.append(f"date: '{_coerce_date(chosen_date)}'")
         if cover_fields:
             for key in ("title", "version"):
                 if cover_fields.get(key):
-                    fields.append(f'{key}: "{cover_fields[key]}"')
+                    v = cover_fields[key].replace("'", "''")
+                    fields.append(f"{key}: '{v}'")
         # subtitle required by the PR gate — emit it even when empty
-        fields.append(f'subtitle: "{(cover_fields or {}).get("subtitle", "")}"')
+        sub = (cover_fields or {}).get('subtitle', '').replace("'", "''")
+        fields.append(f"subtitle: '{sub}'")
         return f"---\n{chr(10).join(fields)}\n---\n\n{qmd_text.lstrip()}"
 
     body_start = qmd_text.lstrip()[m.end():]
