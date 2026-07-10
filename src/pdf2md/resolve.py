@@ -497,7 +497,7 @@ def normalize_frontmatter(
         """Force `key: 'value'` in the frontmatter block."""
         if not value:
             return fm
-        quoted = f"'{value}'"
+        quoted = "'" + value.replace("'", "''") + "'"
         pat = re.compile(r"^\s*" + re.escape(key) + r"\s*:.*$", re.MULTILINE)
         if pat.search(fm):
             return pat.sub(f"{key}: {quoted}", fm, count=1)
