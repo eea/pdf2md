@@ -411,6 +411,11 @@ def normalize_frontmatter(
 
     if keep_template_fields:
         if not fm_re.match(qmd_text.lstrip()):
+            # The model ignored the template and emitted no frontmatter. Prepend a
+            # bare block so the file is still valid, but warn loudly: the required
+            # gate fields (category/date) are absent and verify will flag them.
+            log.warning("Template requested but model produced no frontmatter — "
+                        "output has an empty header (missing category/date)")
             qmd_text = "---\n---\n\n" + qmd_text.lstrip()
         return qmd_text
 

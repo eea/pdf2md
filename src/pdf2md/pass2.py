@@ -69,8 +69,12 @@ def convert_placeholdered(
         system_instruction, user_template = parse_prompt_file(prompt_file)
     user_prompt = build_user_prompt(user_template, placeholders_pdf.name)
 
-    # Inject template frontmatter if provided
-    if template_path is not None:
+    # --template only applies to Quarto output (frontmatter is a .qmd concept, and
+    # only qmd is wired for render/verify). Ignore it for md/gfm, but say so.
+    use_template = template_path is not None and format == "qmd"
+    if template_path is not None and format != "qmd":
+        log.warning("--template is ignored for --format %s (Quarto .qmd only)", format)
+    if use_template:
         system_instruction = inject_template_frontmatter(system_instruction, template_path)
 
     # working PDF is small (chrome stripped), so inline base64 is fine
@@ -124,7 +128,7 @@ def convert_placeholdered(
     if n_hr:
         log.info("[Pass 2] Converted %d body '---' rule(s) to '***' "
                  "(a body '---…---' block is misread by Quarto as a YAML metadata block)", n_hr)
-    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=template_path is not None)
+    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=use_template)
 
     out_qmd.parent.mkdir(parents=True, exist_ok=True)
     # atomic write: resume keys off the .qmd's existence, so a Ctrl-C mid-write must
