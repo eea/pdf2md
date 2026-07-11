@@ -18,7 +18,7 @@ import os
 import sys
 from pathlib import Path
 
-from .app import DEFAULT_MODEL, Events, convert_batch, convert_one
+from .app import CONFIG_DIR, CONFIG_FILE, DEFAULT_MODEL, Events, convert_batch, convert_one
 from .cost import eur_to_usd, fmt_eur
 from .cover import DEFAULT_COVER_MODEL
 from .ui import make_ui
@@ -27,9 +27,7 @@ log = logging.getLogger(__name__)
 
 # ── Key & config helpers ───────────────────────────────────────────────────────
 
-CONFIG_DIR = Path.home() / ".pdf2md"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-KEY_FILE = CONFIG_DIR / "key"
+KEY_FILE = CONFIG_DIR / "key"  # CONFIG_DIR/CONFIG_FILE are the canonical defs in app
 
 
 def resolve_key() -> str:

@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 _TOOL_DIR = Path(__file__).resolve().parent
 _RENDER_ASSETS = _TOOL_DIR / "render_assets"
 
+# Canonical config location (app_cli imports these; keep the definition here since
+# app_cli already depends on app, and _find_quarto below reads the same file).
+CONFIG_DIR = Path.home() / ".pdf2md"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
 DEFAULT_MODEL = "google/gemini-2.5-pro"
 
 
@@ -120,12 +125,11 @@ def _ensure_scaffolding(out_root: Path) -> None:
 def _find_quarto() -> str | None:
     """Find the Quarto binary: config override > PATH > common install locations."""
     import shutil as _shutil, json as _json
-    
+
     # 1. Config override
-    cfg_path = Path.home() / ".pdf2md" / "config.json"
-    if cfg_path.exists():
+    if CONFIG_FILE.exists():
         try:
-            cfg = _json.loads(cfg_path.read_text())
+            cfg = _json.loads(CONFIG_FILE.read_text())
             qp = cfg.get("quarto_path", "")
             if qp and Path(qp).exists():
                 return qp
@@ -153,9 +157,9 @@ def _find_quarto() -> str | None:
     return None
 
 
-def _render(out_dir: Path, stem: str, quarto_path: str | None = None) -> tuple:
+def _render(out_dir: Path, stem: str) -> tuple:
     """Render <stem>.qmd to <stem>.pdf via Quarto/Typst. Returns (ok, log_text)."""
-    quarto = quarto_path or _find_quarto()
+    quarto = _find_quarto()
     if not quarto:
         return False, "Quarto not found. Install from https://quarto.org or set quarto_path in ~/.pdf2md/config.json"
     
