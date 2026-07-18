@@ -95,12 +95,12 @@ def _extract_page_image(working_pdf: Path, page_num: int, out_dir: Path,
 def _insert_unreferenced_figures(qmd_path: Path, unreferenced: list,
                                   working_pdf: Path, api_key: str,
                                   model: str = 'google/gemini-2.5-flash',
-                                  timeout: int = 120) -> int:
+                                  timeout: int = 120) -> tuple:
     """For each unreferenced figure, send a focused LLM call to insert it.
     Sends the page image via image_url so the model can see the figure.
-    Returns count of successfully inserted figures."""
+    Returns (count inserted, total USD cost)."""
     if not unreferenced:
-        return 0
+        return 0, 0.0
 
     import base64
     from .llm_client import _post_with_retries, _model_max_tokens
@@ -109,6 +109,7 @@ def _insert_unreferenced_figures(qmd_path: Path, unreferenced: list,
     media_dirname = f'{qmd_path.stem}-media'
     out_dir = qmd_path.parent
     inserted = 0
+    cost = 0.0
 
     for fig in unreferenced:
         fig_id = fig.get('fig_id', '')
@@ -154,6 +155,7 @@ def _insert_unreferenced_figures(qmd_path: Path, unreferenced: list,
                 api_key=api_key, payload=payload,
                 label=f'rescue-{fig_id}', timeout=timeout
             )
+            cost += (_usage or {}).get('cost', 0.0)
             # Refresh visible_text (may have been modified by previous insertions)
             visible_text = re.sub(r'<!--.*?-->', '', qmd_text, flags=re.DOTALL)
             if text and len(text) > 50:
@@ -182,7 +184,7 @@ def _insert_unreferenced_figures(qmd_path: Path, unreferenced: list,
     if inserted:
         qmd_path.write_text(qmd_text, encoding='utf-8')
 
-    return inserted
+    return inserted, cost
 
 
 # ── Main entry point ────────────────────────────────────────────────────────
@@ -238,11 +240,11 @@ def run_phase25(qmd_path: Path, detections_path: Path,
                 continue
             unreferenced.append(fig)
 
-    inserted = 0
+    inserted, rescue_cost = 0, 0.0
     if unreferenced and working_pdf and working_pdf.exists() and api_key:
         log.info('Phase 2.5b: %d unreferenced figure(s) to rescue via LLM',
                  len(unreferenced))
-        inserted = _insert_unreferenced_figures(
+        inserted, rescue_cost = _insert_unreferenced_figures(
             qmd_path, unreferenced, working_pdf, api_key,
             model=rescue_model, timeout=timeout
         )
@@ -254,4 +256,5 @@ def run_phase25(qmd_path: Path, detections_path: Path,
         'resolved_2_5a': resolved,
         'unreferenced_count': len(unreferenced),
         'inserted_2_5b': inserted,
+        'cost_usd': rescue_cost,
     }

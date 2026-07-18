@@ -358,7 +358,8 @@ def convert_one(
             working_pdf=out_dir / f'{stem}.working.pdf',
             api_key=api_key,
         )
-        result.phase_cost['rescue'] = 0.0  # LLM costs tracked separately for now
+        result.phase_cost['rescue'] = p25.get('cost_usd', 0.0)
+        result.cost_usd = sum(result.phase_cost.values())
         figures_rescued = p25.get('resolved_2_5a', 0) + p25.get('inserted_2_5b', 0)
         if figures_rescued:
             log.info('Phase 2.5 rescued %d figure(s)', figures_rescued)
