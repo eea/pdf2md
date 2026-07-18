@@ -127,6 +127,65 @@ def _extract_retry_delay(s: str, default: float = 60.0) -> float:
     return default
 
 
+# ── Continuation (long-output) support ─────────────────────────────────────────
+# A doc whose Markdown exceeds the output cap can't emit in one reply. Rather than
+# slice the source PDF (loses cross-section context), we keep the whole PDF in context
+# and stream the *output* across calls, trimming seams to a block boundary (never mid-table).
+_MAX_CONTINUATIONS = 8   # runaway backstop; keep partial + warn if hit
+_CONTINUE_INSTRUCTION = (
+    "Continue converting the SAME PDF from exactly where your previous message ended. "
+    "Output ONLY the remaining Markdown — do not repeat any text you already produced, "
+    "do not restart, and do not re-emit the YAML frontmatter or any preamble."
+)
+
+
+def _is_truncated(finish) -> bool:
+    """Did the model hit its output-token ceiling? ('length' via OpenRouter, 'MAX_TOKENS' native.)"""
+    return bool(finish and str(finish).lower() in ("length", "max_tokens"))
+
+
+def _trim_to_block_boundary(text: str) -> tuple:
+    """Split `text` at the last blank-line boundary that leaves no code fence or
+    HTML table open, returning (safe, carry). `carry` (the partial trailing block)
+    is regenerated whole next call so seams never land mid-table/fence. Returns
+    (text, "") when no clean boundary exists (one block > the whole output)."""
+    idx = len(text)
+    while True:
+        cut = text.rfind("\n\n", 0, idx)
+        if cut == -1:
+            return text, ""            # no earlier boundary — continue in place
+        cut += 2
+        head = text[:cut]
+        fences_balanced = head.count("```") % 2 == 0
+        tables_balanced = (len(re.findall(r"<table\b", head, re.I))
+                           == len(re.findall(r"</table\s*>", head, re.I)))
+        if fences_balanced and tables_balanced:
+            return head, text[cut:]
+        idx = cut - 2
+
+
+def _dedup_seam(acc: str, cont: str, window: int = 2000) -> str:
+    """Strip any leading overlap where a continuation re-emits text already in
+    `acc` (a model ignoring 'do not repeat'). Requires a ≥24-char match so
+    coincidental short overlaps aren't stripped."""
+    if not acc or not cont:
+        return cont
+    tail = acc[-window:]
+    for k in range(min(len(tail), len(cont)), 24, -1):
+        if tail.endswith(cont[:k]):
+            return cont[k:]
+    return cont
+
+
+def _merge_usage(dst: dict, src: dict) -> None:
+    """Accumulate token counts and USD cost across continuation calls."""
+    for k, v in (src or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            dst[k] = dst.get(k, 0) + v
+        else:
+            dst.setdefault(k, v)
+
+
 # ── API call ──────────────────────────────────────────────────────────────────
 
 def call_openrouter(
@@ -160,32 +219,62 @@ def call_openrouter(
         log.info("[DRY RUN] file_data prefix: %s…", file_data[:80])
         return ("", {}) if return_usage else ""
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "file",
-                        "file": {
-                            "filename": filename,
-                            "file_data": file_data,
-                        },
-                    },
-                ],
-            },
-        ],
-        "max_tokens": max_tokens or _model_max_tokens(model),
-        "plugins": [{"id": "file-parser", "pdf": {"engine": engine}}],
-    }
-    if stream:
-        payload["stream"] = True
-    text, usage = _post_with_retries(api_key=api_key, payload=payload, label=filename,
-                                     timeout=timeout, stream=stream, on_delta=on_delta)
-    return (text, usage) if return_usage else text
+    cap = max_tokens or _model_max_tokens(model)
+    # The PDF lives in this base message, re-sent every call (source never sliced).
+    base_messages = [
+        {"role": "system", "content": system_instruction},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                # Cache breakpoint on the PDF: maps to Gemini's prompt cache, so each
+                # continuation bills the byte-identical PDF prefix at the cached rate.
+                {"type": "file", "file": {"filename": filename, "file_data": file_data},
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+        },
+    ]
+
+    accumulated, merged_usage, prev_safe = "", {}, None
+    for i in range(_MAX_CONTINUATIONS):
+        messages = list(base_messages)
+        if accumulated:
+            # feed the output-so-far back and ask to continue (PDF stays in context)
+            messages.append({"role": "assistant", "content": accumulated})
+            messages.append({"role": "user", "content": _CONTINUE_INSTRUCTION})
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": cap,
+            "plugins": [{"id": "file-parser", "pdf": {"engine": engine}}],
+        }
+        if stream:
+            payload["stream"] = True
+        content, usage, finish = _post_with_retries(
+            api_key=api_key, payload=payload, label=filename, timeout=timeout,
+            stream=stream, on_delta=on_delta, allow_truncation=True)
+        _merge_usage(merged_usage, usage)
+        content = _dedup_seam(accumulated, content or "")
+        accumulated += content
+
+        if not _is_truncated(finish):
+            break
+        if not content.strip():
+            break   # no progress — stop rather than loop on an empty continuation
+        # Trim to a block boundary and drop the partial trailing block so the model
+        # regenerates it whole. If no boundary can advance (a block bigger than one
+        # output, e.g. a giant table), keep the partial and let the model continue it.
+        safe, _carry = _trim_to_block_boundary(accumulated)
+        if safe and safe != prev_safe:
+            accumulated = safe
+        prev_safe = safe
+        if i == _MAX_CONTINUATIONS - 1:
+            log.error(
+                "Continuation cap (%d) reached for %s — output kept but likely "
+                "incomplete; verify text_coverage will flag missing content.",
+                _MAX_CONTINUATIONS, filename)
+
+    return (accumulated, merged_usage) if return_usage else accumulated
 
 
 # Detection returns a small JSON object; observed gemini-2.5-pro completions
@@ -197,11 +286,8 @@ DETECT_MAX_TOKENS=8192
 
 # ── Model output limits (OpenRouter caps) ──────────────────────────────────────
 # Conservative defaults; the model may support more, but we cap here for safety.
-# Only models needing conservative overrides (API-reported limits used for others)
-_CONVERSION_MAX_TOKENS = {
-    "anthropic/claude-3.5-sonnet": 8192,
-    "anthropic/claude-3-opus": 16384,
-}
+# Per-model overrides go here if ever needed; API-reported limits used otherwise.
+_CONVERSION_MAX_TOKENS = {}
 _CONVERSION_DEFAULT_MAX = 16384
 
 
@@ -389,14 +475,17 @@ def _consume_sse(resp, on_delta) -> tuple:
 
 
 def _post_with_retries(*, api_key: str, payload: dict, label: str, timeout: int,
-                       stream: bool = False, on_delta=None) -> tuple:
+                       stream: bool = False, on_delta=None,
+                       allow_truncation: bool = False) -> tuple:
     """POST a chat-completions payload with retry/backoff and error classification.
 
     Shared by call_openrouter and call_vision. With ``stream=True`` reads content
     incrementally from the SSE stream, firing ``on_delta`` per chunk. Returns
-    ``(content, usage_dict)`` (usage may be {}). Raises _TooLargeError on 413 and
-    RuntimeError on context overflow, no-credits, non-retryable errors, or
-    persistent failure after MAX_ATTEMPTS.
+    ``(content, usage_dict)`` — or ``(content, usage_dict, finish_reason)`` when
+    ``allow_truncation`` is set, so the caller can continue a truncated output
+    instead of failing. Raises _TooLargeError on 413 and RuntimeError on context
+    overflow, no-credits, non-retryable errors, or persistent failure after
+    MAX_ATTEMPTS.
     """
     headers = _headers(api_key)
     # ask OpenRouter to include cost + token accounting in usage
@@ -419,11 +508,10 @@ def _post_with_retries(*, api_key: str, payload: dict, label: str, timeout: int,
                     content = (choice.get("message") or {}).get("content")
                     finish = choice.get("finish_reason") or choice.get("native_finish_reason")
                 _log_usage(usage, label)
-                # Truncation: model hit its output-token ceiling, returned an
-                # incomplete document. Hard-fail rather than ship a half-converted
-                # .qmd; retrying can't help (doc too long for one pass). OpenRouter
-                # normalizes to "length", Gemini's native reason is "MAX_TOKENS".
-                if finish and str(finish).lower() in ("length", "max_tokens"):
+                # Truncation (hit output-token ceiling): conversion passes
+                # allow_truncation to continue across calls; detect/postfix have small
+                # bounded outputs, so a truncated JSON/patch there is a real error.
+                if _is_truncated(finish) and not allow_truncation:
                     raise RuntimeError(
                         f"Output truncated for {label}: the model hit its output-token "
                         f"limit (finish_reason={finish}) and returned an incomplete "
@@ -431,7 +519,7 @@ def _post_with_retries(*, api_key: str, payload: dict, label: str, timeout: int,
                         f"to convert in a single pass — split it or convert in sections."
                     )
                 if content:
-                    return content, usage
+                    return (content, usage, finish) if allow_truncation else (content, usage)
                 # Empty 200: thinking models (e.g. gemini-2.5-pro) intermittently
                 # return no content. A stream yielding zero content tokens is the
                 # same failure; retry.

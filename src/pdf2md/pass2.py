@@ -77,7 +77,8 @@ def convert_placeholdered(
     if use_template:
         system_instruction = inject_template_frontmatter(system_instruction, template_path)
 
-    # working PDF is small (chrome stripped), so inline base64 is fine
+    # Placeholders PDF is small (figures/chrome stripped), so inline base64 fits any
+    # page count; the re-sent PDF prefix is billed at the implicit-cache rate.
     b64 = base64.b64encode(placeholders_pdf.read_bytes()).decode("ascii")
     file_data = "data:application/pdf;base64," + b64
 

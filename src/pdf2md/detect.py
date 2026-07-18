@@ -204,11 +204,20 @@ def _extract_excluded_tables(text: str) -> list:
     return []
 
 
-def _box_to_region(box: dict, page, page_idx: int) -> Region:
+def _box_to_region(box: dict, page, page_idx: int):
     """Convert one model box (normalized 0-1000 bbox) to a Region in PDF points on
-    `page_idx` (the page we sent)."""
+    `page_idx`. Returns None for a malformed bbox (not exactly 4 numbers) — some
+    models occasionally emit those, and one bad box must not crash detection."""
+    coords = box.get("bbox")
+    if not isinstance(coords, (list, tuple)) or len(coords) != 4:
+        log.warning("page %d: skipping figure with malformed bbox %r", page_idx + 1, coords)
+        return None
     pw, ph = page.rect.width, page.rect.height
-    x0, y0, x1, y1 = (float(v) for v in box["bbox"])
+    try:
+        x0, y0, x1, y1 = (float(v) for v in coords)
+    except (TypeError, ValueError):
+        log.warning("page %d: skipping figure with non-numeric bbox %r", page_idx + 1, coords)
+        return None
     bx0, bx1 = sorted((x0, x1))
     by0, by1 = sorted((y0, y1))
     bbox = (bx0 / _NORM * pw, by0 / _NORM * ph, bx1 / _NORM * pw, by1 / _NORM * ph)
@@ -293,7 +302,8 @@ def detect_figures(
             return {"i": i, "ok": False, "cost": page_cost, "regions": [], "excluded": 0}
         excluded = _extract_excluded_tables(response)
         with _fitz_lock:
-            page_regions = [_box_to_region(b, doc[i], i) for b in boxes]
+            page_regions = [r for b in boxes
+                            if (r := _box_to_region(b, doc[i], i)) is not None]
         return {"i": i, "ok": True, "cost": page_cost,
                 "regions": page_regions, "excluded": len(excluded)}
 

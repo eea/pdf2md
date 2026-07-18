@@ -54,7 +54,7 @@ class TestConvertOne:
     def test_happy_path(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch)
         pdf = _make_pdf(tmp_path / "doc.pdf")
-        r = app.convert_one(pdf, tmp_path / "out", api_key="k")
+        r = app.convert_one(pdf, tmp_path / "out", api_key="k", do_render=True)
         assert r.status == "ok"
         assert r.figures == 2
         assert r.qmd.name == "doc.qmd"
@@ -63,7 +63,7 @@ class TestConvertOne:
         assert r.cover["title"] == "T"
         # cost accumulated across phases (cover 0.01 + detect 0.20 + convert 1.00)
         assert abs(r.cost_usd - 1.21) < 1e-9
-        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00}
+        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00, "rescue": 0.0}
 
     def test_verify_warn_sets_warn(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch, verify_status="warn")
@@ -80,7 +80,7 @@ class TestConvertOne:
     def test_render_failure_is_warn(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch, render_ok=False)
         pdf = _make_pdf(tmp_path / "doc.pdf")
-        r = app.convert_one(pdf, tmp_path / "out", api_key="k")
+        r = app.convert_one(pdf, tmp_path / "out", api_key="k", do_render=True)
         assert r.status == "warn" and "render failed" in r.error
 
     def test_no_render_no_verify_honored(self, tmp_path, monkeypatch):

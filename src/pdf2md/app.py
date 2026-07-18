@@ -34,7 +34,8 @@ _RENDER_ASSETS = _TOOL_DIR / "render_assets"
 CONFIG_DIR = Path.home() / ".pdf2md"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-DEFAULT_MODEL = "google/gemini-2.5-pro"
+# Validated best cost/quality for table-heavy docs (MODEL_EVALUATION.md); override with --model.
+DEFAULT_MODEL = "google/gemini-2.5-flash"
 
 
 @dataclass
@@ -250,103 +251,6 @@ def _persist_result(result: "FileResult") -> None:
         log.debug("could not persist result.json: %s", exc)
 
 
-def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str, 
-                   model: str, cover_fields: dict, default_date: str, 
-                   format: str, figures: list, events) -> tuple:
-    """Split a too-large placeholder PDF into chunks, convert each, concatenate."""
-    import fitz
-    doc = fitz.open(str(pdf_path))
-    total = doc.page_count
-    # Chunk size: aim for ~25 pages per chunk (fits 16K token limit with margin)
-    # Dynamic chunk size: scale to the model's max_tokens
-    # ~650 completion tokens/page (observed avg for technical docs),
-    # use 60% of max_tokens as safety margin
-    from .llm_client import _model_max_tokens
-    max_tok = _model_max_tokens(model)
-    chunk_size = max(10, int(max_tok * 0.6 / 650))
-    chunks = list(range(0, total, chunk_size))
-    if len(chunks) == 1:
-        # shouldn't happen -- caller should only invoke this on failure
-        return None, None
-    
-    log.info("Auto-splitting %s: %d pages → %d chunks of ~%d pages each", 
-             pdf_path.name, total, len(chunks), chunk_size)
-    
-    from .phase2 import run_phase2
-    bodies = []
-    total_cost = 0.0
-    _chunk_temp_dirs = []  # track temp dirs for cleanup
-
-    try:
-        for i, start in enumerate(chunks):
-            end = min(start + chunk_size, total)
-            # Create chunk PDF
-            chunk_doc = fitz.open()
-            for p in range(start, end):
-                chunk_doc.insert_pdf(doc, from_page=p, to_page=p)
-            # Use a local temp dir for chunks
-            import tempfile as _tempfile
-            chunk_dir = Path(_tempfile.mkdtemp(prefix=f"pdf2md_chunk{i}_"))
-            _chunk_temp_dirs.append(chunk_dir)
-            chunk_pdf = chunk_dir / f"{stem}_chunk{i}.placeholders.pdf"
-            chunk_doc.save(str(chunk_pdf))
-            chunk_doc.close()
-            
-            # Copy detections sidecar
-            import shutil
-            det = out_dir / "detections.json"
-            if det.exists():
-                shutil.copy2(str(det), str(chunk_dir / "detections.json"))
-            
-            events.convert_start()
-            p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
-                            template_path=template,
-                            default_date=default_date, format=format)
-            events.convert_done()
-            
-            chunk_qmd = chunk_dir / f"{stem}_chunk{i}.qmd" if format == "qmd" else chunk_dir / f"{stem}_chunk{i}.md"
-            if not chunk_qmd.exists():
-                raise RuntimeError(f"Chunk {i} conversion produced no output")
-            
-            chunk_text = chunk_qmd.read_text(encoding="utf-8")
-            # Strip frontmatter from chunks 1+
-            if i > 0:
-                import re
-                m = re.match(r"^---\s*\n.*?\n---\s*\n?", chunk_text, re.DOTALL)
-                if m:
-                    chunk_text = chunk_text[m.end():]
-            
-            bodies.append(chunk_text.lstrip())
-            total_cost += p2.get("cost_usd", 0.0)
-        
-        # Concatenate bodies
-        full_body = "\n\n".join(bodies)
-        ext = "qmd" if format == "qmd" else "md"
-        out_qmd = out_dir / f"{stem}.{ext}"
-        
-        # If first chunk had frontmatter, it's in bodies[0]; otherwise add it
-        if not bodies[0].startswith("---"):
-            from .resolve import normalize_frontmatter
-            from .pass2 import DEFAULT_CATEGORY
-            full_body = normalize_frontmatter(full_body, DEFAULT_CATEGORY, default_date, cover_fields)
-        
-        # Rewrite chunk-specific media paths to the main {stem}-media/ dir
-        for i in range(len(chunks)):
-            full_body = full_body.replace(
-                f"{stem}_chunk{i}-media/", f"{stem}-media/"
-            )
-
-        out_qmd.write_text(full_body, encoding="utf-8")
-    finally:
-        doc.close()
-        # Always clean up chunk temp dirs, even on failure
-        for chunk_dir in _chunk_temp_dirs:
-            if chunk_dir.exists():
-                shutil.rmtree(str(chunk_dir), ignore_errors=True)
-    
-    log.info("Auto-split done: %d chunks → %s", len(chunks), out_qmd.name)
-    return out_qmd, total_cost
-
 def convert_one(
     pdf: Path,
     out_root: Path,
@@ -435,30 +339,10 @@ def convert_one(
         events.convert_start()
         on_delta = events.convert_delta if events.wants_stream else None
         fallback_date = datetime.date.today().isoformat()
-        try:
-            p2 = run_phase2(out_dir, api_key=api_key, model=model,
-                            default_date=fallback_date, on_delta=on_delta, format=format,
-                            template_path=template)
-        except RuntimeError as e:
-            if "Output truncated" in str(e) or "too long" in str(e) or "output-token limit" in str(e):
-                log.warning("Output truncated — attempting auto-split")
-                figures = []
-                det_path = out_dir / "detections.json"
-                if det_path.exists():
-                    import json as _json
-                    figures = _json.loads(det_path.read_text()).get("figures", [])
-                split_qmd, split_cost = _split_convert(
-                    out_dir / f"{stem}.placeholders.pdf", out_dir, stem,
-                    api_key, model, result.cover, fallback_date, format, figures, events)
-                if split_qmd:
-                    p2 = {"cost_usd": split_cost or 0.0}
-                    result.qmd = split_qmd
-                    events.convert_done()
-                    # skip the normal result.qmd assignment below
-                else:
-                    raise
-            else:
-                raise
+        # Long docs stream output across continuation calls, not source slicing (see llm_client).
+        p2 = run_phase2(out_dir, api_key=api_key, model=model,
+                        default_date=fallback_date, on_delta=on_delta, format=format,
+                        template_path=template)
         ext = "qmd" if format == "qmd" else "md"
         if not result.qmd:
             result.qmd = out_dir / f"{stem}.{ext}"
@@ -591,7 +475,8 @@ def convert_batch(
             break
 
         r = convert_one(
-            pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
+            pdf, out_root, api_key=api_key, model=model,
+            cover_model=cover_model,
             do_render=do_render, do_verify=do_verify, force=force,
             max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
             estimate=est, events=events, index=i, total=len(pdfs),

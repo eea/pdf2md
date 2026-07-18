@@ -227,31 +227,58 @@ class TestCallOpenrouter:
         assert result == "real content"
         assert mock_post.call_count == 2
 
-    def test_truncation_hard_fails_no_retry(self):
-        # finish_reason=length with partial content → incomplete doc; must hard-fail
-        # (not return the truncated .qmd as success, not waste retries).
-        import pytest
-        r = MagicMock()
-        r.status_code = 200
-        r.text = "## Section 1\npartial body that stops mid-"
-        r.json.return_value = {"choices": [{
-            "message": {"content": "## Section 1\npartial body that stops mid-"},
-            "finish_reason": "length",
-        }]}
-        with pytest.raises(RuntimeError, match="truncated"):
-            self._call([r])
+    def test_truncation_triggers_continuation_not_failure(self):
+        # finish_reason=length no longer hard-fails: call_openrouter keeps the whole
+        # PDF in context and continues the output across calls. First reply is cut
+        # mid-block (partial trailing block discarded), second completes.
+        trunc = MagicMock()
+        trunc.status_code = 200
+        trunc.text = ""
+        trunc.json.return_value = {"choices": [{
+            "message": {"content": "## Section 1\n\nFull para.\n\npartial mid-"},
+            "finish_reason": "length"}], "usage": {"cost": 0.1}}
+        done = MagicMock()
+        done.status_code = 200
+        done.text = ""
+        done.json.return_value = {"choices": [{
+            "message": {"content": "partial middle done.\n\n## Section 2\n\nEnd.\n"},
+            "finish_reason": "stop"}], "usage": {"cost": 0.1}}
+        result, mock_post = self._call([trunc, done])
+        assert mock_post.call_count == 2
+        assert "Full para." in result and "## Section 2" in result and "End." in result
 
-    def test_truncation_detects_gemini_native_max_tokens(self):
+    def test_gemini_native_max_tokens_triggers_continuation(self):
+        # native_finish_reason=MAX_TOKENS is recognized as truncation → continue.
+        trunc = MagicMock()
+        trunc.status_code = 200
+        trunc.text = ""
+        trunc.json.return_value = {"choices": [{
+            "message": {"content": "Body one.\n\nmore"},
+            "native_finish_reason": "MAX_TOKENS"}]}
+        done = MagicMock()
+        done.status_code = 200
+        done.text = ""
+        done.json.return_value = {"choices": [{
+            "message": {"content": "more content complete.\n"},
+            "finish_reason": "stop"}]}
+        result, mock_post = self._call([trunc, done])
+        assert mock_post.call_count == 2
+        assert "Body one." in result
+
+    def test_truncation_still_hard_fails_without_allow_truncation(self):
+        # detect/postfix/phase25 have small bounded outputs — a truncated JSON/patch
+        # there is a genuine error, so _post_with_retries still raises by default.
         import pytest
+        from pdf2md.llm_client import _post_with_retries
         r = MagicMock()
         r.status_code = 200
         r.text = "partial"
         r.json.return_value = {"choices": [{
-            "message": {"content": "partial"},
-            "native_finish_reason": "MAX_TOKENS",
-        }]}
-        with pytest.raises(RuntimeError, match="truncated"):
-            self._call([r])
+            "message": {"content": "partial"}, "finish_reason": "length"}]}
+        with patch("pdf2md.llm_client.requests.post", side_effect=[r]):
+            with pytest.raises(RuntimeError, match="truncated"):
+                _post_with_retries(api_key="t", payload={"model": "m"},
+                                   label="f", timeout=10)
 
     def test_retry_on_connection_reset(self):
         # a transient connection reset must be retried, not abort the run

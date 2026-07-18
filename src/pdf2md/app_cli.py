@@ -6,7 +6,7 @@ The production entry, distinct from the legacy single-pass `cli.py`.
     python3 tools/pdf2md/pdf2md.py FILE.pdf
     python3 tools/pdf2md/pdf2md.py inbox/                 # batch: every *.pdf in inbox/
     python3 tools/pdf2md/pdf2md.py FILE.pdf
-    python3 tools/pdf2md/pdf2md.py inbox/ --out output --model google/gemini-2.5-pro
+    python3 tools/pdf2md/pdf2md.py inbox/ --out output    # batch to a chosen dir
 
 Environment:
     OPENROUTER_API_KEY   (required)
@@ -70,7 +70,7 @@ def resolve_model(args_model=None):
 
 
 def run_setup() -> int:
-    """Interactive setup: API key + default model, saved to ~/.pdf2md/."""
+    """Interactive setup: API key (+ optional Quarto path), saved to ~/.pdf2md/."""
     import json
     print("pdf2md — one-time setup\n")
     print("Paste your OpenRouter API key (or press Enter to skip):")
@@ -83,24 +83,10 @@ def run_setup() -> int:
     else:
         print("  (skipped — set OPENROUTER_API_KEY env var to use pdf2md)\n")
 
-    models = [
-        ("google/gemini-2.5-pro",   "Best quality, slower (~EUR 0.15-0.60/doc)"),
-        ("google/gemini-2.5-flash", "Fast, cheap (~EUR 0.02-0.10/doc)"),
-        ("google/gemini-3.5-flash", "Newest flash model"),
-    ]
-    print("Pick a default model:")
-    for i, (m, desc) in enumerate(models, 1):
-        print(f"  {i}. {m}  -- {desc}")
-    print(f"  {len(models)+1}. {DEFAULT_MODEL} (default)")
-    choice = input(f"[1-{len(models)+1}, Enter=default]> ").strip()
-    try:
-        idx = int(choice) - 1
-        model = models[idx][0] if 0 <= idx < len(models) else DEFAULT_MODEL
-    except (ValueError, IndexError):
-        model = DEFAULT_MODEL
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = {"model": model}
-    
+    cfg = {}
+
+
     # Quarto auto-detection (for --render)
     import shutil as _shutil
     quarto = _shutil.which("quarto")
@@ -118,10 +104,9 @@ def run_setup() -> int:
         cfg["quarto_path"] = quarto
     
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"  Default model set to: {model}")
+    print(f"  Model: {DEFAULT_MODEL} (override with --model or OPENROUTER_MODEL env var)")
     if quarto:
         print(f"  Quarto path: {quarto}")
-    print(f"  (override with --model or OPENROUTER_MODEL env var)")
     return 0
 
 
@@ -136,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=Path("output"),
                    help="output root directory (default: output/)")
     p.add_argument("--model", default=None,
-                   help=f"OpenRouter model for detect+convert (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
+                   help=f"OpenRouter model (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
     p.add_argument("--template", type=Path, default=None, metavar="TEMPLATE",
