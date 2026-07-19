@@ -131,12 +131,85 @@ def _extract_retry_delay(s: str, default: float = 60.0) -> float:
 # A doc whose Markdown exceeds the output cap can't emit in one reply. Rather than
 # slice the source PDF (loses cross-section context), we keep the whole PDF in context
 # and stream the *output* across calls, trimming seams to a block boundary (never mid-table).
-_MAX_CONTINUATIONS = 8   # runaway backstop; keep partial + warn if hit
-_CONTINUE_INSTRUCTION = (
-    "Continue converting the SAME PDF from exactly where your previous message ended. "
-    "Output ONLY the remaining Markdown — do not repeat any text you already produced, "
-    "do not restart, and do not re-emit the YAML frontmatter or any preamble."
+#
+# We do NOT feed the whole output-so-far back each call — that grows input linearly with
+# page count and caps the doc at ~500 pages (the context window). Instead each continuation
+# gets only a bounded TAIL of the output plus a resume anchor (last heading + the model's own
+# cursor hint), so per-call input stays ~constant. The real ceiling then becomes the PDF
+# itself fitting the context window (~1200 text pages), not the output length.
+_MAX_CONTINUATIONS = 40   # tail-only keeps each call cheap, so a high cap is safe; the real
+                          # wall is the PDF fitting context. Keep partial + warn if hit.
+_TAIL_CHARS = 8000        # ~2 pages of output fed back as the exact-resume anchor
+
+# Appended to the conversion system prompt so every reply ends with a machine-readable
+# progress marker we can parse and strip. Best-effort: if the model omits it, the
+# deterministic tail + last-heading anchor still locate the resume point.
+_CURSOR_DIRECTIVE = (
+    "\n\nAt the VERY END of your response, on its own final line, emit this progress "
+    "marker and nothing after it:\n"
+    "<!-- pdf2md:cursor next=\"<a few words naming the next section/content in the "
+    "source PDF, or END if the document is complete>\" page=\"<approx source page number "
+    "you reached, if known>\" -->\n"
+    "This marker is tooling metadata; it will be stripped from the output."
 )
+
+_CURSOR_RE = re.compile(r"\n?<!--\s*pdf2md:cursor\b(.*?)-->\s*\Z", re.DOTALL | re.I)
+
+
+def _extract_cursor(text: str) -> tuple:
+    """Strip a trailing ``<!-- pdf2md:cursor … -->`` marker and parse its attrs.
+    Returns (clean_text, cursor) where cursor is {"next": str, "page": str} or None.
+    Only the marker at the very end is touched, so real body comments are left alone."""
+    m = _CURSOR_RE.search(text)
+    if not m:
+        return text, None
+    attrs = m.group(1)
+    cursor = {}
+    for key in ("next", "page"):
+        a = re.search(rf'{key}\s*=\s*"([^"]*)"', attrs, re.I)
+        if a and a.group(1).strip():
+            cursor[key] = a.group(1).strip()
+    return text[:m.start()], (cursor or None)
+
+
+def _last_landmark(text: str) -> str:
+    """The last structural landmark in `text` — a markdown heading (preferred) or a
+    'Table N' / 'Figure N' caption — extracted deterministically so the resume anchor
+    never depends on the model self-reporting where it stopped. '' if none found."""
+    heads = re.findall(r"^\s*#{1,6}\s+(.+?)\s*$", text, re.MULTILINE)
+    if heads:
+        return heads[-1].strip()
+    caps = re.findall(r"\b((?:Table|Figure)\s+\d+[.:][^\n]{0,80})", text, re.IGNORECASE)
+    return caps[-1].strip() if caps else ""
+
+
+def _output_tail(text: str, max_chars: int = _TAIL_CHARS) -> str:
+    """The last ~max_chars of `text`, advanced to start at a blank-line boundary so the
+    tail begins on a clean block (not mid-paragraph). Bounded, so feeding it back does
+    not grow with total output length."""
+    tail = text[-max_chars:]
+    if len(text) > max_chars:
+        nl = tail.find("\n\n")
+        if nl != -1:
+            tail = tail[nl + 2:]              # ponytail: start-of-tail readability only;
+    return tail                              # the tail END is the real (block-trimmed) anchor
+
+
+def _build_continue_message(landmark: str, tail: str, cursor: dict) -> str:
+    """Assemble the tail-only continuation prompt: coarse anchor (landmark + optional
+    model cursor) for fast location, plus the verbatim tail for the exact resume point."""
+    where = f"You last completed: «{landmark}».\n" if landmark else ""
+    if cursor and cursor.get("next"):
+        where += f"Next in the source: {cursor['next']}.\n"
+    if cursor and cursor.get("page"):
+        where += f"(You had reached approximately source page {cursor['page']}.)\n"
+    return (
+        "Continue converting the SAME PDF (still in context) from exactly where you "
+        "stopped.\n" + where +
+        "The final text you already produced was:\n---\n" + tail + "\n---\n"
+        "Continue from immediately AFTER that text. Output ONLY new Markdown — do not "
+        "repeat any of the above, do not restart, do not re-emit the YAML frontmatter."
+    )
 
 
 def _is_truncated(finish) -> bool:
@@ -221,8 +294,9 @@ def call_openrouter(
 
     cap = max_tokens or _model_max_tokens(model)
     # The PDF lives in this base message, re-sent every call (source never sliced).
+    # Append the cursor directive so each reply ends with a strippable progress marker.
     base_messages = [
-        {"role": "system", "content": system_instruction},
+        {"role": "system", "content": system_instruction + _CURSOR_DIRECTIVE},
         {
             "role": "user",
             "content": [
@@ -235,13 +309,14 @@ def call_openrouter(
         },
     ]
 
-    accumulated, merged_usage, prev_safe = "", {}, None
+    accumulated, merged_usage, prev_safe, cursor = "", {}, None, None
     for i in range(_MAX_CONTINUATIONS):
         messages = list(base_messages)
         if accumulated:
-            # feed the output-so-far back and ask to continue (PDF stays in context)
-            messages.append({"role": "assistant", "content": accumulated})
-            messages.append({"role": "user", "content": _CONTINUE_INSTRUCTION})
+            # Tail-only continuation: bounded tail + resume anchor, NOT the whole output,
+            # so per-call input stays flat regardless of page count (PDF stays in context).
+            messages.append({"role": "user", "content": _build_continue_message(
+                _last_landmark(accumulated), _output_tail(accumulated), cursor)})
         payload = {
             "model": model,
             "messages": messages,
@@ -254,7 +329,10 @@ def call_openrouter(
             api_key=api_key, payload=payload, label=filename, timeout=timeout,
             stream=stream, on_delta=on_delta, allow_truncation=True)
         _merge_usage(merged_usage, usage)
-        content = _dedup_seam(accumulated, content or "")
+        # Strip the progress marker before it can land in the document, keep it as the
+        # next call's forward anchor.
+        content, cursor = _extract_cursor(content or "")
+        content = _dedup_seam(accumulated, content)
         accumulated += content
 
         if not _is_truncated(finish):

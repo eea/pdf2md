@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pdf2md import llm_client  # noqa: E402
 from pdf2md.llm_client import (  # noqa: E402
     _dedup_seam,
+    _extract_cursor,
+    _last_landmark,
+    _output_tail,
     _trim_to_block_boundary,
     call_openrouter,
 )
@@ -88,11 +91,13 @@ def _fake_poster(segments):
 
 def test_two_truncations_then_stop_concatenates(monkeypatch):
     # segment 1 truncates mid second block; the partial block is discarded and
-    # regenerated whole in segment 2; segment 3 finishes.
+    # regenerated whole in segment 2; segment 3 finishes. Segments carry cursor
+    # markers to verify they are stripped and their next-hint flows forward.
     segments = [
-        ("# Doc\n\nBlock A done.\n\nBlock B was cut halfw", "length"),
+        ("# Doc\n\nBlock A done.\n\nBlock B was cut halfw"
+         "\n<!-- pdf2md:cursor next=\"Block B and C\" page=\"1\" -->", "length"),
         ("Block B in full now.\n\nBlock C done.\n\nBlock D cut", "length"),
-        ("Block D in full now.\n", "stop"),
+        ("Block D in full now.\n<!-- pdf2md:cursor next=\"END\" -->", "stop"),
     ]
     fake, calls = _fake_poster(segments)
     monkeypatch.setattr(llm_client, "_post_with_retries", fake)
@@ -109,16 +114,22 @@ def test_two_truncations_then_stop_concatenates(monkeypatch):
                   "Block D in full now."):
         assert block in text
     assert "halfw" not in text and "Block D cut" not in text
+    # progress markers never leak into the document
+    assert "pdf2md:cursor" not in text
     # cost accrues across all three calls
     assert abs(usage["cost"] - 0.30) < 1e-9
-    # the PDF (file part) is resent on every call, and continuations add a prefill
+    # the PDF (file part) is resent on every call
     assert len(calls) == 3
     for msgs in calls:
         assert any(part.get("type") == "file"
                    for m in msgs if isinstance(m["content"], list)
                    for part in m["content"])
-    assert calls[1][-2]["role"] == "assistant"   # output-so-far fed back
-    assert calls[1][-1]["role"] == "user"        # + continue instruction
+    # a continuation adds exactly ONE user turn (tail + anchor), no assistant prefill
+    cont = calls[1][-1]
+    assert cont["role"] == "user"
+    assert not any(m["role"] == "assistant" for m in calls[1])
+    assert "Block A done." in cont["content"]        # the tail is fed back
+    assert "Block B and C" in cont["content"]         # cursor next-hint flowed forward
 
 
 def test_single_pass_stop_makes_one_call(monkeypatch):
@@ -147,3 +158,77 @@ def test_cap_keeps_partial_and_does_not_raise(monkeypatch):
     )
     assert len(calls) == llm_client._MAX_CONTINUATIONS
     assert "chunk 0." in text
+
+
+# ── cursor marker parsing ───────────────────────────────────────────────────────
+
+def test_extract_cursor_parses_and_strips():
+    clean, cur = _extract_cursor('body text\n<!-- pdf2md:cursor next="§8 Sampling" page="44" -->')
+    assert clean == "body text"
+    assert cur == {"next": "§8 Sampling", "page": "44"}
+
+
+def test_extract_cursor_none_when_absent():
+    clean, cur = _extract_cursor("just body\n\nmore body")
+    assert cur is None and clean == "just body\n\nmore body"
+
+
+def test_extract_cursor_ignores_body_comments():
+    # a genuine comment mid-body is not the trailing marker → left untouched
+    text = "a\n<!-- keep this -->\n\nb"
+    clean, cur = _extract_cursor(text)
+    assert cur is None and clean == text
+
+
+def test_extract_cursor_partial_attrs():
+    # a truncated/omitted page attr still yields a usable next-hint
+    clean, cur = _extract_cursor('x\n<!-- pdf2md:cursor next="More tables" -->')
+    assert cur == {"next": "More tables"} and clean == "x"
+
+
+# ── deterministic landmark extraction ───────────────────────────────────────────
+
+def test_last_landmark_prefers_last_heading():
+    assert _last_landmark("# One\n\ntext\n\n## 7.3 Two\n\nmore") == "7.3 Two"
+
+
+def test_last_landmark_falls_back_to_caption():
+    assert "Table 12" in _last_landmark("no headings here\n\nTable 12: Water quality\n\nrows")
+
+
+def test_last_landmark_empty_when_none():
+    assert _last_landmark("plain prose, no structure at all") == ""
+
+
+# ── bounded tail ────────────────────────────────────────────────────────────────
+
+def test_output_tail_bounded_and_block_aligned():
+    text = "HEAD\n\n" + "a" * 10000 + "\n\ntail block here"
+    tail = _output_tail(text, max_chars=500)
+    assert len(tail) <= 500
+    assert tail == "tail block here"   # advanced past the mid-block cut to a clean boundary
+
+
+def test_output_tail_returns_whole_when_short():
+    assert _output_tail("short doc", max_chars=8000) == "short doc"
+
+
+def test_continuation_input_stays_bounded(monkeypatch):
+    # THE point of tail-only: as total output grows across many chunks, the fed-back
+    # continuation message must NOT grow with it (else we're back to the context wall).
+    segments = [("blk%d\n\n" % i + "z" * 5000 + "\n\nmore", "length") for i in range(6)]
+    segments.append(("final block.\n", "stop"))
+    fake, calls = _fake_poster(segments)
+    monkeypatch.setattr(llm_client, "_post_with_retries", fake)
+
+    call_openrouter(
+        api_key="k", model="google/gemini-2.5-pro", engine="native",
+        system_instruction="sys", user_prompt="convert",
+        file_data="data:application/pdf;base64,AAAA", filename="doc.pdf",
+    )
+    cont_sizes = [len(msgs[-1]["content"]) for msgs in calls[1:]]
+    assert cont_sizes
+    # every continuation message is bounded (~tail + fixed prompt overhead)…
+    assert max(cont_sizes) < llm_client._TAIL_CHARS + 2000
+    # …and does not creep upward as accumulated output balloons
+    assert max(cont_sizes) - min(cont_sizes) < 2000
