@@ -134,42 +134,14 @@ def _extract_retry_delay(s: str, default: float = 60.0) -> float:
 #
 # We do NOT feed the whole output-so-far back each call — that grows input linearly with
 # page count and caps the doc at ~500 pages (the context window). Instead each continuation
-# gets only a bounded TAIL of the output plus a resume anchor (last heading + the model's own
-# cursor hint), so per-call input stays ~constant. The real ceiling then becomes the PDF
-# itself fitting the context window (~1200 text pages), not the output length.
+# gets only a bounded TAIL of the output plus a deterministic resume anchor (the last
+# heading, regex-extracted), so per-call input stays ~constant. The real ceiling then
+# becomes the PDF itself fitting the context window (~1200 text pages), not output length.
+# (A model-emitted progress cursor was tried and removed: across 6 live docs / 24 truncated
+# chunks it fired 0 times — truncation always cut it off before the end-marker.)
 _MAX_CONTINUATIONS = 40   # tail-only keeps each call cheap, so a high cap is safe; the real
                           # wall is the PDF fitting context. Keep partial + warn if hit.
 _TAIL_CHARS = 8000        # ~2 pages of output fed back as the exact-resume anchor
-
-# Appended to the conversion system prompt so every reply ends with a machine-readable
-# progress marker we can parse and strip. Best-effort: if the model omits it, the
-# deterministic tail + last-heading anchor still locate the resume point.
-_CURSOR_DIRECTIVE = (
-    "\n\nAt the VERY END of your response, on its own final line, emit this progress "
-    "marker and nothing after it:\n"
-    "<!-- pdf2md:cursor next=\"<a few words naming the next section/content in the "
-    "source PDF, or END if the document is complete>\" page=\"<approx source page number "
-    "you reached, if known>\" -->\n"
-    "This marker is tooling metadata; it will be stripped from the output."
-)
-
-_CURSOR_RE = re.compile(r"\n?<!--\s*pdf2md:cursor\b(.*?)-->\s*\Z", re.DOTALL | re.I)
-
-
-def _extract_cursor(text: str) -> tuple:
-    """Strip a trailing ``<!-- pdf2md:cursor … -->`` marker and parse its attrs.
-    Returns (clean_text, cursor) where cursor is {"next": str, "page": str} or None.
-    Only the marker at the very end is touched, so real body comments are left alone."""
-    m = _CURSOR_RE.search(text)
-    if not m:
-        return text, None
-    attrs = m.group(1)
-    cursor = {}
-    for key in ("next", "page"):
-        a = re.search(rf'{key}\s*=\s*"([^"]*)"', attrs, re.I)
-        if a and a.group(1).strip():
-            cursor[key] = a.group(1).strip()
-    return text[:m.start()], (cursor or None)
 
 
 def _last_landmark(text: str) -> str:
@@ -195,14 +167,10 @@ def _output_tail(text: str, max_chars: int = _TAIL_CHARS) -> str:
     return tail                              # the tail END is the real (block-trimmed) anchor
 
 
-def _build_continue_message(landmark: str, tail: str, cursor: dict) -> str:
-    """Assemble the tail-only continuation prompt: coarse anchor (landmark + optional
-    model cursor) for fast location, plus the verbatim tail for the exact resume point."""
+def _build_continue_message(landmark: str, tail: str) -> str:
+    """Assemble the tail-only continuation prompt: coarse anchor (last heading) for fast
+    location, plus the verbatim tail for the exact resume point."""
     where = f"You last completed: «{landmark}».\n" if landmark else ""
-    if cursor and cursor.get("next"):
-        where += f"Next in the source: {cursor['next']}.\n"
-    if cursor and cursor.get("page"):
-        where += f"(You had reached approximately source page {cursor['page']}.)\n"
     return (
         "Continue converting the SAME PDF (still in context) from exactly where you "
         "stopped.\n" + where +
@@ -294,9 +262,8 @@ def call_openrouter(
 
     cap = max_tokens or _model_max_tokens(model)
     # The PDF lives in this base message, re-sent every call (source never sliced).
-    # Append the cursor directive so each reply ends with a strippable progress marker.
     base_messages = [
-        {"role": "system", "content": system_instruction + _CURSOR_DIRECTIVE},
+        {"role": "system", "content": system_instruction},
         {
             "role": "user",
             "content": [
@@ -309,14 +276,14 @@ def call_openrouter(
         },
     ]
 
-    accumulated, merged_usage, prev_safe, cursor = "", {}, None, None
+    accumulated, merged_usage, prev_safe = "", {}, None
     for i in range(_MAX_CONTINUATIONS):
         messages = list(base_messages)
         if accumulated:
             # Tail-only continuation: bounded tail + resume anchor, NOT the whole output,
             # so per-call input stays flat regardless of page count (PDF stays in context).
             messages.append({"role": "user", "content": _build_continue_message(
-                _last_landmark(accumulated), _output_tail(accumulated), cursor)})
+                _last_landmark(accumulated), _output_tail(accumulated))})
         payload = {
             "model": model,
             "messages": messages,
@@ -329,10 +296,7 @@ def call_openrouter(
             api_key=api_key, payload=payload, label=filename, timeout=timeout,
             stream=stream, on_delta=on_delta, allow_truncation=True)
         _merge_usage(merged_usage, usage)
-        # Strip the progress marker before it can land in the document, keep it as the
-        # next call's forward anchor.
-        content, cursor = _extract_cursor(content or "")
-        content = _dedup_seam(accumulated, content)
+        content = _dedup_seam(accumulated, content or "")
         accumulated += content
 
         if not _is_truncated(finish):

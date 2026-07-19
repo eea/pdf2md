@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pdf2md import llm_client  # noqa: E402
 from pdf2md.llm_client import (  # noqa: E402
     _dedup_seam,
-    _extract_cursor,
     _last_landmark,
     _output_tail,
     _trim_to_block_boundary,
@@ -91,13 +90,11 @@ def _fake_poster(segments):
 
 def test_two_truncations_then_stop_concatenates(monkeypatch):
     # segment 1 truncates mid second block; the partial block is discarded and
-    # regenerated whole in segment 2; segment 3 finishes. Segments carry cursor
-    # markers to verify they are stripped and their next-hint flows forward.
+    # regenerated whole in segment 2; segment 3 finishes.
     segments = [
-        ("# Doc\n\nBlock A done.\n\nBlock B was cut halfw"
-         "\n<!-- pdf2md:cursor next=\"Block B and C\" page=\"1\" -->", "length"),
+        ("# Doc\n\nBlock A done.\n\nBlock B was cut halfw", "length"),
         ("Block B in full now.\n\nBlock C done.\n\nBlock D cut", "length"),
-        ("Block D in full now.\n<!-- pdf2md:cursor next=\"END\" -->", "stop"),
+        ("Block D in full now.\n", "stop"),
     ]
     fake, calls = _fake_poster(segments)
     monkeypatch.setattr(llm_client, "_post_with_retries", fake)
@@ -114,8 +111,6 @@ def test_two_truncations_then_stop_concatenates(monkeypatch):
                   "Block D in full now."):
         assert block in text
     assert "halfw" not in text and "Block D cut" not in text
-    # progress markers never leak into the document
-    assert "pdf2md:cursor" not in text
     # cost accrues across all three calls
     assert abs(usage["cost"] - 0.30) < 1e-9
     # the PDF (file part) is resent on every call
@@ -129,7 +124,6 @@ def test_two_truncations_then_stop_concatenates(monkeypatch):
     assert cont["role"] == "user"
     assert not any(m["role"] == "assistant" for m in calls[1])
     assert "Block A done." in cont["content"]        # the tail is fed back
-    assert "Block B and C" in cont["content"]         # cursor next-hint flowed forward
 
 
 def test_single_pass_stop_makes_one_call(monkeypatch):
@@ -158,32 +152,6 @@ def test_cap_keeps_partial_and_does_not_raise(monkeypatch):
     )
     assert len(calls) == llm_client._MAX_CONTINUATIONS
     assert "chunk 0." in text
-
-
-# ── cursor marker parsing ───────────────────────────────────────────────────────
-
-def test_extract_cursor_parses_and_strips():
-    clean, cur = _extract_cursor('body text\n<!-- pdf2md:cursor next="§8 Sampling" page="44" -->')
-    assert clean == "body text"
-    assert cur == {"next": "§8 Sampling", "page": "44"}
-
-
-def test_extract_cursor_none_when_absent():
-    clean, cur = _extract_cursor("just body\n\nmore body")
-    assert cur is None and clean == "just body\n\nmore body"
-
-
-def test_extract_cursor_ignores_body_comments():
-    # a genuine comment mid-body is not the trailing marker → left untouched
-    text = "a\n<!-- keep this -->\n\nb"
-    clean, cur = _extract_cursor(text)
-    assert cur is None and clean == text
-
-
-def test_extract_cursor_partial_attrs():
-    # a truncated/omitted page attr still yields a usable next-hint
-    clean, cur = _extract_cursor('x\n<!-- pdf2md:cursor next="More tables" -->')
-    assert cur == {"next": "More tables"} and clean == "x"
 
 
 # ── deterministic landmark extraction ───────────────────────────────────────────
