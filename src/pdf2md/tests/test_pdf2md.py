@@ -1148,38 +1148,52 @@ class TestNormalizeFrontmatter:
         from pdf2md.resolve import normalize_frontmatter
         out = normalize_frontmatter("Just body, no frontmatter\n")
         assert out.startswith("---\ncategory: uncategorized\n")
-        assert 'subtitle: ""' in out      # required field always emitted
+        assert "subtitle: ''" in out      # required field always emitted
 
     def test_always_emits_subtitle_when_none_supplied(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\ncategory: uncategorized\n---\nBody\n'
         out = normalize_frontmatter(qmd)   # no cover subtitle
-        assert 'subtitle: ""' in out
+        assert "subtitle: ''" in out
 
     def test_nonempty_cover_subtitle_wins(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\n---\nBody\n'
         out = normalize_frontmatter(qmd, cover_fields={"subtitle": "My Subtitle"})
-        assert 'subtitle: "My Subtitle"' in out
-        assert 'subtitle: ""' not in out
+        assert "subtitle: 'My Subtitle'" in out
+        assert "subtitle: ''" not in out
+
+    def test_apostrophe_in_title_escaped(self):
+        """Apostrophes in YAML single-quoted scalars must be doubled."""
+        import pytest
+        yaml = pytest.importorskip("yaml")
+        from pdf2md.resolve import normalize_frontmatter
+        qmd = '---\ntitle: T\n---\nBody\n'
+        out = normalize_frontmatter(qmd, cover_fields={"title": "User's Guide"})
+        # Parse the frontmatter block - must not raise a YAML error
+        fm_text = out.split("---")[1]
+        parsed = yaml.safe_load(fm_text)
+        assert parsed["title"] == "User's Guide"
+        # Verify the raw output has doubled apostrophe in single-quoted scalar
+        assert "User''s Guide" in out
 
     def test_coerces_year_only_date(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\ndate: "2011"\n---\nBody\n'
         out = normalize_frontmatter(qmd)
-        assert 'date: "2011-01-01"' in out
+        assert "date: '2011-01-01'" in out
 
     def test_preserves_full_date(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\ndate: "2019-06-15"\n---\nBody\n'
         out = normalize_frontmatter(qmd)
-        assert 'date: "2019-06-15"' in out
+        assert "date: '2019-06-15'" in out
 
     def test_adds_date_when_missing(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\n---\nBody\n'
         out = normalize_frontmatter(qmd, date="2020-10-01")
-        assert 'date: "2020-10-01"' in out
+        assert "date: '2020-10-01'" in out
 
     def test_keeps_model_date(self):
         from pdf2md.resolve import normalize_frontmatter
@@ -1537,9 +1551,9 @@ class TestNormalizeFrontmatterCoverFields:
         qmd = '---\ntitle: "Converter Guess"\nsubtitle: "Wrong"\ndate: "2020-01-01"\n---\nBody\n'
         cover = {"title": "Real Title", "subtitle": "Real Subtitle", "date": "", "version": "v2"}
         out = normalize_frontmatter(qmd, cover_fields=cover)
-        assert 'title: "Real Title"' in out
-        assert 'subtitle: "Real Subtitle"' in out
-        assert 'version: "v2"' in out
+        assert "title: 'Real Title'" in out
+        assert "subtitle: 'Real Subtitle'" in out
+        assert "version: 'v2'" in out
         # date from cover is empty so converter's date survives
         assert '2020-01-01' in out
 
@@ -1556,7 +1570,7 @@ class TestNormalizeFrontmatterCoverFields:
         cover = {"title": "", "subtitle": "", "date": "2023-06", "version": ""}
         out = normalize_frontmatter(qmd, cover_fields=cover)
         # year-month is coerced to a gate-valid YYYY-MM-DD
-        assert 'date: "2023-06-01"' in out
+        assert "date: '2023-06-01'" in out
 
     def test_no_cover_fields_unchanged_behavior(self):
         from pdf2md.resolve import normalize_frontmatter

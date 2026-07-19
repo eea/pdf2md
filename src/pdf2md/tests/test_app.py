@@ -63,7 +63,8 @@ class TestConvertOne:
         assert r.cover["title"] == "T"
         # cost accumulated across phases (cover 0.01 + detect 0.20 + convert 1.00)
         assert abs(r.cost_usd - 1.21) < 1e-9
-        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00, "rescue": 0.0}
+        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00,
+                                "rescue": 0.0, "repair": 0.0}
 
     def test_verify_warn_sets_warn(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch, verify_status="warn")

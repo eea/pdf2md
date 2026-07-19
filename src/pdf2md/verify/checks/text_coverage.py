@@ -137,7 +137,13 @@ class TextCoverageCheck:
         )
         sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
 
-        qmd_tokens = _ld_split(tokens(qmd_to_plain(ctx.qmd_text)))
+        # Strip the postfix recovery section so it doesn't skew the metric
+        # (recovered content is supplementary, not a match for source text).
+        _pfx_pattern = re.compile(
+            r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*',
+            re.DOTALL)
+        clean_qmd = _pfx_pattern.sub('', ctx.qmd_text)
+        qmd_tokens = _ld_split(tokens(qmd_to_plain(clean_qmd)))
         qmd_shingles = shingles(qmd_tokens)
         qmd_token_set = set(qmd_tokens)
         # token -> sorted positions in the .qmd token stream, for the short-line path

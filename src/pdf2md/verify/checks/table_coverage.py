@@ -35,25 +35,33 @@ def _is_oversized(rows: list) -> bool:
 
 
 def _source_grids(pdf_path) -> list:
-    grids = []
+    """Extract table grids, excluding running-header tables."""
+    from collections import Counter
+
+    grids_raw = []
     doc = fitz.open(str(pdf_path))
+    total_pages = doc.page_count
     try:
-        for pno in range(doc.page_count):
+        for pno in range(total_pages):
             try:
                 for tab in doc[pno].find_tables().tables:
                     rows = tab.extract()
                     if _is_oversized(rows):
-                        continue        # cropped as a figure
+                        continue
                     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
                     if cells:
-                        grids.append(cells)
+                        fp = " ".join(cells[:2])
+                        grids_raw.append((fp, cells))
             except Exception:
                 continue
     finally:
         doc.close()
-    return grids
 
+    fp_counts = Counter(fp for fp, _ in grids_raw)
+    threshold = max(3, total_pages * 0.5)
+    running = {fp for fp, c in fp_counts.items() if c >= threshold}
 
+    return [cells for fp, cells in grids_raw if fp not in running]
 def _html_table_grids(qmd_text: str) -> list:
     """One token-bag per top-level HTML table, nested-table text included. Coverage is
     token-overlap, so per-cell granularity isn't needed, and collapsing nested tables

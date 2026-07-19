@@ -9,7 +9,7 @@ Extracted from [CLMS_documents](https://github.com/MatMatt/CLMS_documents).
 - Maciej Dudek
 - Matteo Mattiuzzi
 
-Copyright © 2026 European Environment Agency. Licensed under EUPL-1.2.
+Copyright © 2026 European Union. Licensed under EUPL-1.2.
 
 ## Quick start
 
@@ -31,7 +31,7 @@ python3 pdf2md.py document.pdf --format gfm    # GitHub-Flavored Markdown
 python3 pdf2md.py document.pdf --format md     # Plain Markdown
 python3 pdf2md.py document.pdf --render        # Also render to PDF via Quarto
 
-# Use a YAML frontmatter template (only with --format qmd)
+# Use a YAML frontmatter template (with --format qmd or gfm)
 python3 pdf2md.py document.pdf --template path/to/template.qmd
 python3 pdf2md.py document.pdf --template https://raw.githubusercontent.com/org/repo/main/template.qmd
 ```
@@ -58,6 +58,40 @@ API key and default model are stored in `~/.pdf2md/`:
 ```bash
 python3 pdf2md.py --setup    # Interactive configuration
 ```
+
+## Model Selection
+
+Not all models work equally well for PDF conversion. Before switching models, run
+the bundled edge-case benchmark to see how a candidate model handles tricky content:
+
+```bash
+python3 pdf2md.py src/pdf2md/tests/fixtures/pdf2md_edgecases.pdf \
+    --out /tmp/benchmark-out/ \
+    --model <model-slug> \
+    --postfix 0
+```
+
+Then check `verify_report.md` — the document is designed to surface failures in:
+
+- Table detection: text-based tables with merged cells, plus rasterized PNG tables
+- Figure extraction: embedded charts, wrapped figures, subfigures
+- Text fidelity: soft hyphens, ligatures, Unicode, intra-word formatting changes
+- Structure: nested lists, definition lists, blockquotes, task lists, two-column layout
+- Scientific content: chemical formulas, subscripts/superscripts, display equations
+- Metadata: YAML frontmatter generation (title detection, date parsing)
+
+`verify=fail` on figure placement. Stick to multimodal models.
+
+## Updating
+
+```bash
+cd pdf2md
+git pull
+```
+
+The editable install (`pip install -e .`) picks up changes automatically — no need to
+re-install unless new dependencies were added. If the pull adds new packages, run
+`pip install -e .` again to install them.
 
 ## License
 

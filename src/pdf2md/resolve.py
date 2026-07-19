@@ -392,10 +392,88 @@ def _coerce_date(val: str) -> str:
     return val
 
 
+def _apply_template_frontmatter(qmd_text: str, template_ref) -> str:
+    """Merge LLM output values into a template YAML structure.
+
+    When --template is used, the LLM often ignores the injected prompt
+    and produces a minimal YAML. This post-processes the output: it reads
+    the template, extracts the LLM's discovered values (title, subtitle,
+    date, description), and writes a merged YAML that keeps the template
+    structure but uses the LLM's values where keys match.
+    """
+    # Ensure YAML block exists
+    fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+    m = fm_re.match(qmd_text.lstrip())
+    if not m:
+        qmd_text = "---\n---\n\n" + qmd_text.lstrip()
+        return qmd_text
+    
+    # template_ref is True (bool) when no actual path available — keep as-is
+    if template_ref is True or not isinstance(template_ref, (str, Path)):
+        return qmd_text
+    
+    tp = str(template_ref)
+    
+    # Fetch template
+    try:
+        if tp.startswith("http://") or tp.startswith("https://"):
+            from urllib.request import urlopen
+            tmpl = urlopen(tp, timeout=10).read().decode("utf-8")
+        else:
+            tmpl = Path(tp).read_text(encoding="utf-8")
+    except Exception:
+        return qmd_text
+    
+    # Extract template YAML
+    mt = re.search(r"^---\s*\n(.*?)\n---", tmpl, re.DOTALL | re.MULTILINE)
+    if not mt:
+        return qmd_text
+    template_lines = mt.group(1).split("\n")
+    
+    # Extract LLM YAML values
+    llm_yaml = m.group(1)
+    llm_vals = {}
+    for line in llm_yaml.split("\n"):
+        line = line.strip()
+        if ":" in line and not line.startswith("#"):
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip().lstrip(chr(34)).rstrip(chr(34)).lstrip(chr(39)).rstrip(chr(39))
+            if v:
+                llm_vals[k] = v
+    
+    # Merge: template structure, LLM values for content keys
+    CONTENT_KEYS = {"title", "subtitle", "date", "description", "author"}
+    merged = []
+    skip_cont = False
+    for line in template_lines:
+        if skip_cont:
+            if line and line[0] in (" ", "	"):
+                continue
+            skip_cont = False
+        s = line.strip()
+        if ":" in s and not s.startswith("#"):
+            k = s.split(":", 1)[0].strip()
+            indent = " " * (len(line) - len(line.lstrip()))
+            if k in llm_vals and k in CONTENT_KEYS:
+                v = llm_vals[k]
+                need_q = " " in v or ":" in v
+                if need_q:
+                    merged.append(f"{indent}{k}: '{v}'")
+                else:
+                    merged.append(f"{indent}{k}: {v}")
+                skip_cont = True
+                continue
+        merged.append(line)
+    
+    body = qmd_text[m.end():]
+    if not body.startswith(chr(10)):
+        body = chr(10) + body
+    return "---\n" + "\n".join(merged) + "\n---" + body
+
 def normalize_frontmatter(
     qmd_text: str, category: str = "uncategorized", date: str = None,
     cover_fields: dict = None,
-    keep_template_fields: bool = False,
+    keep_template_fields = False,  # bool or template path/URL
 ) -> str:
     """Ensure the .qmd frontmatter carries the fields the PR gate requires.
 
@@ -410,23 +488,16 @@ def normalize_frontmatter(
     fm_re = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
     if keep_template_fields:
-        if not fm_re.match(qmd_text.lstrip()):
-            # The model ignored the template and emitted no frontmatter. Prepend a
-            # bare block so the file is still valid, but warn loudly: the required
-            # gate fields (category/date) are absent and verify will flag them.
-            log.warning("Template requested but model produced no frontmatter — "
-                        "output has an empty header (missing category/date)")
-            qmd_text = "---\n---\n\n" + qmd_text.lstrip()
-        return qmd_text
+        return _apply_template_frontmatter(qmd_text, keep_template_fields)
 
     m = fm_re.match(qmd_text.lstrip())
     cat_line = f"category: {category}"
 
     def _set_or_add(fm: str, key: str, value: str) -> str:
-        """Force `key: "value"` in the frontmatter block."""
+        """Force `key: 'value'` in the frontmatter block."""
         if not value:
             return fm
-        quoted = f'"{value}"'
+        quoted = "'" + value.replace("'", "''") + "'"
         pat = re.compile(r"^\s*" + re.escape(key) + r"\s*:.*$", re.MULTILINE)
         if pat.search(fm):
             return pat.sub(f"{key}: {quoted}", fm, count=1)
@@ -450,7 +521,7 @@ def normalize_frontmatter(
             cover_date = cover_fields.get("date", "") if cover_fields else ""
             chosen = cover_date or (date or "")
             if chosen:
-                fm = fm.rstrip() + f'\ndate: "{chosen}"'
+                fm = fm.rstrip() + f"\ndate: '{chosen}'"
                 if not cover_date and chosen == date:
                     log.warning("No date on cover or in converter output — defaulting to %s "
                                 "(operator should correct)", date)
@@ -458,13 +529,13 @@ def normalize_frontmatter(
         dm = re.search(r"^\s*date\s*:\s*(.+)$", fm, re.MULTILINE)
         if dm:
             coerced = _coerce_date(dm.group(1))
-            if coerced != dm.group(1).strip().strip('"'):
+            if coerced != dm.group(1).strip().strip('"').strip("'"):
                 log.info("Coerced date %r → %r", dm.group(1).strip(), coerced)
-            fm = re.sub(r"^\s*date\s*:.*$", f'date: "{coerced}"', fm,
+            fm = re.sub(r"^\s*date\s*:.*$", f"date: '{coerced}'", fm,
                         count=1, flags=re.MULTILINE)
         # subtitle is required by the PR gate; emit an empty one when none supplied
         if not re.search(r"^\s*subtitle\s*:", fm, re.MULTILINE):
-            fm = fm.rstrip() + '\nsubtitle: ""'
+            fm = fm.rstrip() + "\nsubtitle: ''"
         return fm
 
     if not m:
@@ -473,13 +544,15 @@ def normalize_frontmatter(
         cover_date = cover_fields.get("date", "") if cover_fields else ""
         chosen_date = cover_date or (date or "")
         if chosen_date:
-            fields.append(f'date: "{_coerce_date(chosen_date)}"')
+            fields.append(f"date: '{_coerce_date(chosen_date)}'")
         if cover_fields:
             for key in ("title", "version"):
                 if cover_fields.get(key):
-                    fields.append(f'{key}: "{cover_fields[key]}"')
+                    v = cover_fields[key].replace("'", "''")
+                    fields.append(f"{key}: '{v}'")
         # subtitle required by the PR gate — emit it even when empty
-        fields.append(f'subtitle: "{(cover_fields or {}).get("subtitle", "")}"')
+        sub = (cover_fields or {}).get('subtitle', '').replace("'", "''")
+        fields.append(f"subtitle: '{sub}'")
         return f"---\n{chr(10).join(fields)}\n---\n\n{qmd_text.lstrip()}"
 
     body_start = qmd_text.lstrip()[m.end():]

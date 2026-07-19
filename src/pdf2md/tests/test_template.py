@@ -89,9 +89,8 @@ def test_keep_template_fields_preserves_existing_frontmatter():
     assert out == text  # untouched: no forced category/date
 
 
-def test_keep_template_fields_warns_and_prepends_when_missing(caplog):
-    with caplog.at_level(logging.WARNING):
-        out = normalize_frontmatter("just body, no frontmatter\n",
-                                    keep_template_fields=True)
+def test_keep_template_fields_prepends_bare_block_when_missing():
+    # no frontmatter + template mode → a bare block is prepended so the file stays valid
+    out = normalize_frontmatter("just body, no frontmatter\n",
+                                keep_template_fields=True)
     assert out.startswith("---\n---\n\n")
-    assert any("no frontmatter" in r.message for r in caplog.records)

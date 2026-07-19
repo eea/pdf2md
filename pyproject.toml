@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf2md"
-version = "0.1.0"
+version = "0.2.1"
 description = "Convert PDF to Markdown/Quarto .md/.qmd (detect, transcribe, render, verify)"
 readme = "README.md"
 authors = [
-    { name = "Maciej Dudek", email = "Dudek.Maciej@eea.europa.eu" },
-    { name = "Matteo Mattiuzzi", email = "matteo@mattiuzzi.com" }
+    { name = "Maciej Dudek" },
+    { name = "Matteo Mattiuzzi" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -28,3 +28,11 @@ pdf2md = "pdf2md.app_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pdf2md = [
+    "prompt_templates/*.md",
+    "render_assets/**/*",
+    "tests/fixtures/*.pdf",
+    "tests/fixtures/*.png",
+]
