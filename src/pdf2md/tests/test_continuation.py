@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from pdf2md import llm_client  # noqa: E402
 from pdf2md.llm_client import (  # noqa: E402
+    _build_continue_message,
     _dedup_seam,
-    _last_landmark,
+    _heading_outline,
     _output_tail,
     _trim_to_block_boundary,
     call_openrouter,
@@ -154,18 +155,31 @@ def test_cap_keeps_partial_and_does_not_raise(monkeypatch):
     assert "chunk 0." in text
 
 
-# ── deterministic landmark extraction ───────────────────────────────────────────
+# ── progress-map anchor (heading outline + page count) ──────────────────────────
 
-def test_last_landmark_prefers_last_heading():
-    assert _last_landmark("# One\n\ntext\n\n## 7.3 Two\n\nmore") == "7.3 Two"
-
-
-def test_last_landmark_falls_back_to_caption():
-    assert "Table 12" in _last_landmark("no headings here\n\nTable 12: Water quality\n\nrows")
+def test_heading_outline_lists_all_headings_in_order():
+    out = _heading_outline("# One\n\ntext\n\n## 7.3 Two\n\nmore\n\n### Deep\n\nx")
+    assert out == "# One\n## 7.3 Two\n### Deep"
 
 
-def test_last_landmark_empty_when_none():
-    assert _last_landmark("plain prose, no structure at all") == ""
+def test_heading_outline_empty_when_none():
+    assert _heading_outline("plain prose, no structure at all") == ""
+
+
+def test_heading_outline_collapses_when_huge():
+    body = "".join(f"## Section {i}\n\ntext\n\n" for i in range(300))
+    out = _heading_outline(body, max_lines=200)
+    assert "earlier sections omitted" in out
+    assert "## Section 299" in out          # the recent tail is kept
+    assert out.count("\n") <= 200
+
+
+def test_continue_message_carries_progress_and_page_count():
+    msg = _build_continue_message("# Intro\n## Methods", "…tail text…", total_pages=131)
+    assert "131 pages" in msg                       # page-count anchor
+    assert "## Methods" in msg                        # progress outline
+    assert "…tail text…" in msg                       # exact resume anchor
+    assert "NOT finished" in msg or "not conclude" in msg.lower()  # anti-early-stop
 
 
 # ── bounded tail ────────────────────────────────────────────────────────────────

@@ -83,6 +83,12 @@ def convert_placeholdered(
     b64 = base64.b64encode(placeholders_pdf.read_bytes()).decode("ascii")
     file_data = "data:application/pdf;base64," + b64
 
+    try:
+        import fitz
+        total_pages = fitz.open(str(placeholders_pdf)).page_count
+    except Exception:                       # noqa: BLE001 — page count is a hint, not required
+        total_pages = 0
+
     log.info("[Pass 2] Converting %s → .qmd …", placeholders_pdf.name)
     raw, usage = call_openrouter(
         api_key=api_key,
@@ -94,6 +100,7 @@ def convert_placeholdered(
         filename=placeholders_pdf.name,
         timeout=timeout,
         max_tokens=max_tokens,
+        total_pages=total_pages,
         return_usage=True,
         stream=on_delta is not None,
         on_delta=on_delta,

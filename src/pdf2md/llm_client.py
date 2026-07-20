@@ -144,15 +144,17 @@ _MAX_CONTINUATIONS = 40   # tail-only keeps each call cheap, so a high cap is sa
 _TAIL_CHARS = 8000        # ~2 pages of output fed back as the exact-resume anchor
 
 
-def _last_landmark(text: str) -> str:
-    """The last structural landmark in `text` — a markdown heading (preferred) or a
-    'Table N' / 'Figure N' caption — extracted deterministically so the resume anchor
-    never depends on the model self-reporting where it stopped. '' if none found."""
-    heads = re.findall(r"^\s*#{1,6}\s+(.+?)\s*$", text, re.MULTILINE)
-    if heads:
-        return heads[-1].strip()
-    caps = re.findall(r"\b((?:Table|Figure)\s+\d+[.:][^\n]{0,80})", text, re.IGNORECASE)
-    return caps[-1].strip() if caps else ""
+def _heading_outline(text: str, max_lines: int = 200) -> str:
+    """A compact map of what's been converted so far — the emitted headings, in order.
+    Fed back on each continuation so the model keeps its sense of overall progress; the
+    tail alone loses it and the model concludes early (observed: a 131-page doc stopped
+    at p106, dropping the last quarter). Bounded — collapses the head of a huge outline."""
+    heads = re.findall(r"^\s*(#{1,6}\s+.+?)\s*$", text, re.MULTILINE)
+    if not heads:
+        return ""
+    if len(heads) > max_lines:
+        heads = [f"… ({len(heads) - max_lines} earlier sections omitted) …"] + heads[-max_lines:]
+    return "\n".join(heads)
 
 
 def _output_tail(text: str, max_chars: int = _TAIL_CHARS) -> str:
@@ -167,16 +169,22 @@ def _output_tail(text: str, max_chars: int = _TAIL_CHARS) -> str:
     return tail                              # the tail END is the real (block-trimmed) anchor
 
 
-def _build_continue_message(landmark: str, tail: str) -> str:
-    """Assemble the tail-only continuation prompt: coarse anchor (last heading) for fast
-    location, plus the verbatim tail for the exact resume point."""
-    where = f"You last completed: «{landmark}».\n" if landmark else ""
+def _build_continue_message(outline: str, tail: str, total_pages: int = 0) -> str:
+    """Assemble the continuation prompt. Three anchors fight the two failure modes:
+    the heading OUTLINE + known PAGE COUNT give progress awareness (so the model doesn't
+    conclude early), and the verbatim TAIL gives the exact resume point."""
+    pages = (f"The source PDF has {total_pages} pages — keep going until you have "
+             f"converted its LAST page.\n" if total_pages else "")
+    progress = (f"Sections you have ALREADY produced (do not repeat any of these):\n"
+                f"{outline}\n\n" if outline else "")
     return (
-        "Continue converting the SAME PDF (still in context) from exactly where you "
-        "stopped.\n" + where +
-        "The final text you already produced was:\n---\n" + tail + "\n---\n"
+        "You are continuing an in-progress conversion of the SAME PDF (still in context). "
+        "It is NOT finished. Do NOT conclude, summarise, or stop early — if you are unsure "
+        "whether content remains, assume it does and keep converting.\n" + pages + "\n"
+        + progress +
+        "The final text you produced was:\n---\n" + tail + "\n---\n"
         "Continue from immediately AFTER that text. Output ONLY new Markdown — do not "
-        "repeat any of the above, do not restart, do not re-emit the YAML frontmatter."
+        "repeat anything above, do not restart, do not re-emit the YAML frontmatter."
     )
 
 
@@ -244,6 +252,7 @@ def call_openrouter(
     stream: bool = False,
     on_delta=None,
     max_tokens: int = None,
+    total_pages: int = 0,   # source page count; fed to continuations to prevent early stop
 ):
     """POST to OpenRouter chat-completions, return the model's text response.
 
@@ -283,7 +292,7 @@ def call_openrouter(
             # Tail-only continuation: bounded tail + resume anchor, NOT the whole output,
             # so per-call input stays flat regardless of page count (PDF stays in context).
             messages.append({"role": "user", "content": _build_continue_message(
-                _last_landmark(accumulated), _output_tail(accumulated))})
+                _heading_outline(accumulated), _output_tail(accumulated), total_pages)})
         payload = {
             "model": model,
             "messages": messages,
