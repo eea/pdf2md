@@ -358,3 +358,35 @@ class TestWideTableLegibilityCheck:
         assert r.status == "warn"
         assert "6pt" in r.summary and "5pt" in r.summary
         assert r.findings and r.findings[0].severity == "warn"
+
+# ── table_coverage: union matching (converter re-segments tables) ───────────────
+
+from pdf2md.verify.checks.table_coverage import (  # noqa: E402
+    _best_match, _tokens_of, _union_match,
+)
+
+
+def test_union_match_recovers_a_split_table():
+    # the converter split one source table across two .qmd tables; a single best-match
+    # sees only half, the union sees all of it
+    src = ["alpha beta gamma", "delta epsilon zeta"]
+    q1, q2 = ["alpha beta gamma"], ["delta epsilon zeta"]
+    _m, single = _best_match(src, [q1, q2])
+    matched, content, used = _union_match(_tokens_of(src), [_tokens_of(q1), _tokens_of(q2)])
+    assert single == 0.5
+    assert content == 1.0 and used == 2
+    assert matched == _tokens_of(src)
+
+
+def test_union_match_ignores_non_contributing_tables():
+    # unrelated .qmd tables must not be pulled into the union (keeps it bounded,
+    # so "spans a few tables" never degrades into "appears anywhere")
+    src = _tokens_of(["a b c d e f g h i j k l m n o p q r s t"])
+    qsets = [_tokens_of(["a b c d e f g h i j"])] + [_tokens_of(["zz"]) for _ in range(5)]
+    _matched, content, used = _union_match(src, qsets)
+    assert used == 1 and content == 0.5
+
+
+def test_union_match_empty_source_is_covered():
+    matched, content, used = _union_match(set(), [_tokens_of(["x y"])])
+    assert content == 1.0 and used == 0 and matched == set()

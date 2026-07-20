@@ -19,6 +19,8 @@ except ImportError:
 _GLOBAL_MIN = 0.85   # WARN if token-weighted coverage across all tables drops below this
 _CELL_HIT = 0.7      # a table is "thin" below this fraction of its words matched
 _MIN_TOKENS = 12     # ignore find_tables slivers as diagnostics (a 3-word piece isn't a table)
+_UNION_MAX = 4       # a source table may span at most this many .qmd tables
+_UNION_MIN_GAIN = 0.05   # ...and each must add >=5% of its tokens to join the union
 
 
 # Oversized tables (>= these) are cropped as figures, not transcribed, so they must NOT
@@ -123,6 +125,37 @@ def _best_match(src_cells, qmd_grids):
     return best, best_score
 
 
+def _union_match(src_toks: set, qmd_tok_sets: list) -> tuple:
+    """Score a source table against the best-matching SET of .qmd tables.
+
+    The converter legitimately re-segments tables — splitting one source table across
+    several .qmd tables and merging others — so scoring against a single best match
+    counts present content as missing (measured: 91% single-match vs 98% actual on a
+    131-page manual). Greedily add whichever .qmd table contributes the most as-yet
+    unmatched tokens, while it contributes meaningfully. Bounded by _UNION_MAX and
+    _UNION_MIN_GAIN so this stays "spans a few tables", not "appears anywhere".
+    Returns (matched_tokens, coverage, n_tables_used).
+    """
+    if not src_toks:
+        return set(), 1.0, 0
+    remaining, matched, used = set(src_toks), set(), 0
+    for _ in range(_UNION_MAX):
+        best_toks, best_gain = None, 0
+        for q in qmd_tok_sets:
+            gain = len(remaining & q)
+            if gain > best_gain:
+                best_toks, best_gain = q, gain
+        if best_toks is None or best_gain / len(src_toks) < _UNION_MIN_GAIN:
+            break
+        hit = remaining & best_toks
+        matched |= hit
+        remaining -= hit
+        used += 1
+        if not remaining:
+            break
+    return matched, len(matched) / len(src_toks), used
+
+
 @register
 class TableCoverageCheck:
     name = "table_coverage"
@@ -136,19 +169,29 @@ class TableCoverageCheck:
             return CheckResult(self.name, "ok", "no source tables detected")
         qmd_grids = _qmd_grids(ctx.qmd_text)
 
-        # status is driven by token-WEIGHTED coverage, so find_tables fragmenting a
-        # table into low-scoring slivers can't trip a warn when content survived: a big
-        # table losing half its cells tanks the weighted number, a 5-word sliver can't.
-        per_table = []           # (i, score, src_cells, match, n_src_tokens)
-        total_toks = matched_toks = 0
+        # Two numbers, because the converter re-segments tables:
+        #   content — tokens found across the few .qmd tables the source table spans.
+        #             This is cell FIDELITY and drives the status.
+        #   aligned — tokens found in a SINGLE best-matching .qmd table. A structure
+        #             signal: much lower than content means heavy split/merge.
+        # Token-WEIGHTED, so a find_tables sliver can't trip a warn while a big table
+        # losing half its cells does.
+        qmd_tok_sets = [_tokens_of(g) for g in qmd_grids]
+        per_table = []           # (i, content, src_cells, matched_tokens, n_src_tokens)
+        total_toks = content_toks = aligned_toks = 0
         for i, src in enumerate(src_grids, 1):
-            match, score = _best_match(src, qmd_grids)
-            ntoks = len(_tokens_of(src))
+            stoks = _tokens_of(src)
+            ntoks = len(stoks)
+            matched, content, _used = _union_match(stoks, qmd_tok_sets)
+            aligned = max((len(stoks & q) / ntoks for q in qmd_tok_sets), default=0.0) \
+                if ntoks else 1.0
             total_toks += ntoks
-            matched_toks += score * ntoks
-            per_table.append((i, score, src, match, ntoks))
+            content_toks += content * ntoks
+            aligned_toks += aligned * ntoks
+            per_table.append((i, content, src, matched, ntoks))
 
-        weighted = (matched_toks / total_toks) if total_toks else 1.0
+        weighted = (content_toks / total_toks) if total_toks else 1.0
+        aligned_w = (aligned_toks / total_toks) if total_toks else 1.0
         simple_avg = sum(t[1] for t in per_table) / len(per_table)
         status = "warn" if weighted < _GLOBAL_MIN else "ok"
 
@@ -156,27 +199,28 @@ class TableCoverageCheck:
         # tracks the overall verdict: FYI when coverage is fine, the warn detail when not.
         sev = "warn" if status == "warn" else "info"
         findings = []
-        for i, score, src, match, ntoks in per_table:
-            if ntoks < _MIN_TOKENS or score >= _CELL_HIT:
+        for i, content, src, matched, ntoks in per_table:
+            if ntoks < _MIN_TOKENS or content >= _CELL_HIT:
                 continue
-            match_toks = _tokens_of(match or [])
             missing = []
             for c in dict.fromkeys(src):
                 ct = c.split()
-                if ct and sum(t in match_toks for t in ct) / len(ct) < 0.5:
+                if ct and sum(t in matched for t in ct) / len(ct) < 0.5:
                     missing.append(c[:80])
             findings.append(Finding(
-                f"table {i}: {round(100 * score)}% of words matched"
-                + (f"; e.g. missing {missing[:3]}" if missing else " (likely a mis-aligned match)"),
+                f"table {i}: {round(100 * content)}% of words matched"
+                + (f"; e.g. missing {missing[:3]}" if missing else ""),
                 sev, f"table {i}"))
 
         wpct = round(100 * weighted, 1)
+        apct = round(100 * aligned_w, 1)
         avg = round(100 * simple_avg, 1)
         return CheckResult(
             self.name, status,
-            f"{len(src_grids)} source table(s); weighted word coverage {wpct}% "
-            f"(simple avg {avg}%)"
+            f"{len(src_grids)} source table(s); word coverage {wpct}% "
+            f"(simple avg {avg}%; {apct}% single-table aligned)"
             + (f"; {len(findings)} substantial table(s) below {int(_CELL_HIT*100)}%"
                if findings else ""),
             metric=wpct, findings=findings,
+            detail={"content": wpct, "aligned": apct},
         )
