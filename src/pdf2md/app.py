@@ -62,8 +62,13 @@ class FileResult:
     verify_issues: list = field(default_factory=list)  # non-ok checks: {name, status, summary}
     postfixes_applied: list = field(default_factory=list)
     postfix_items: int = 0   # postfix passes that ran
-    text_cov: float = None
+    text_cov: float = None                # final in-place (strict) text coverage %
+    text_cov_before: float = None         # text coverage before post-fixes (for the delta)
+    text_cov_effective: float = None      # text coverage counting recovered appendix
+    postfix_recovered: int = 0            # source gaps the recovery appendix now covers
     table_cov: float = None
+    table_cov_before: float = None        # table coverage before post-fixes
+    postfix_report: Path = None           # before→after diff report path
     cover: dict = None
     qmd: Path = None
     pdf_out: Path = None
@@ -216,6 +221,30 @@ def _metric(results: list, name: str):
         if r.name == name:
             return r.metric
     return None
+
+
+def _write_postfix_report(result: "FileResult", out_dir: Path) -> Path:
+    """Write a before→after diff so the post-conversion fixes' real impact is legible:
+    coverage before vs after (in-place and counting the recovered appendix) + what ran."""
+    def _pct(v):
+        return f"{v}%" if v is not None else "—"
+
+    eff = (f"{result.text_cov_effective}% (+{result.postfix_recovered} recovered)"
+           if result.text_cov_effective is not None else "—")
+    lines = [
+        f"# Post-conversion fix report — {result.stem}",
+        "",
+        "| metric | before | after (in-place) | after (incl. recovered) |",
+        "|--------|-------:|-----------------:|------------------------:|",
+        f"| text  | {_pct(result.text_cov_before)} | {_pct(result.text_cov)} | {eff} |",
+        f"| table | {_pct(result.table_cov_before)} | {_pct(result.table_cov)} | — |",
+        "",
+        "## Fixes applied",
+    ]
+    lines += [f"- 🔧 {p}" for p in result.postfixes_applied] or ["- (none)"]
+    path = out_dir / "postfix_report.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def _count_tables(qmd_path: Path) -> int:
@@ -473,6 +502,9 @@ def convert_one(
         # Phase 4.5 — postfix (surgical fixes driven by verify results)
         t_postfix = _time.perf_counter()
         if postfix_passes > 0 and results:
+            # snapshot pre-fix coverage so the UI/report can show the before→after delta
+            result.text_cov_before = result.text_cov
+            result.table_cov_before = result.table_cov
             postfix_summary = run_postfix(
                 result.qmd, results, out_dir,
                 api_key=api_key, passes=postfix_passes,
@@ -485,6 +517,15 @@ def convert_one(
                 log.info("Repair applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
                 if postfix_summary.get("verify_after"):
                     result.verify_status = postfix_summary["verify_after"]
+                # adopt the post-fix coverage as the final numbers (in-place + effective)
+                ca = postfix_summary.get("coverage_after") or {}
+                if ca.get("text") is not None:
+                    result.text_cov = ca["text"]
+                    result.text_cov_effective = ca.get("text_effective")
+                    result.postfix_recovered = ca.get("text_recovered", 0)
+                if ca.get("table") is not None:
+                    result.table_cov = ca["table"]
+                result.postfix_report = _write_postfix_report(result, out_dir)
             result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
         result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)

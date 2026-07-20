@@ -89,6 +89,35 @@ def _short_line_covered(toks, qmd_tokens, positions) -> bool:
     return False
 
 
+_PFX_RECOVERY_RE = re.compile(
+    r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*', re.DOTALL)
+
+
+def _index(qmd_text: str):
+    """Tokenise a .qmd into the lookup structures the classifier needs."""
+    toks = _ld_split(tokens(qmd_to_plain(qmd_text)))
+    pos = defaultdict(list)
+    for i, t in enumerate(toks):
+        pos[t].append(i)
+    return toks, shingles(toks), set(toks), pos
+
+
+def _classify(stoks, idx) -> str:
+    """One source sentence vs an indexed .qmd → covered | reworded | missing | skip."""
+    qtoks, qsh, qset, qpos = idx
+    if len(stoks) <= _SHORT_MAX_TOKENS:
+        return "covered" if _short_line_covered(stoks, qtoks, qpos) else "missing"
+    sh = shingles(stoks)
+    if not sh:
+        return "skip"
+    if len(sh & qsh) / len(sh) >= _SHINGLE_HIT or _short_line_covered(stoks, qtoks, qpos):
+        return "covered"
+    uniq = set(stoks)
+    if uniq and len(uniq & qset) / len(uniq) >= _REWORD_HIT:
+        return "reworded"
+    return "missing"
+
+
 @register
 class TextCoverageCheck:
     name = "text_coverage"
@@ -137,47 +166,33 @@ class TextCoverageCheck:
         )
         sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
 
-        # Strip the postfix recovery section so it doesn't skew the metric
-        # (recovered content is supplementary, not a match for source text).
-        _pfx_pattern = re.compile(
-            r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*',
-            re.DOTALL)
-        clean_qmd = _pfx_pattern.sub('', ctx.qmd_text)
-        qmd_tokens = _ld_split(tokens(qmd_to_plain(clean_qmd)))
-        qmd_shingles = shingles(qmd_tokens)
-        qmd_token_set = set(qmd_tokens)
-        # token -> sorted positions in the .qmd token stream, for the short-line path
-        positions = defaultdict(list)
-        for i, t in enumerate(qmd_tokens):
-            positions[t].append(i)
+        # STRICT (in-place) coverage: exclude the postfix recovery appendix — recovered
+        # content is supplementary, out of document flow, not a faithful in-place match.
+        clean_qmd = _PFX_RECOVERY_RE.sub('', ctx.qmd_text)
+        strict_idx = _index(clean_qmd)
 
-        # Three outcomes per source sentence:
-        #   covered  — appears verbatim/in-order (shingles) or locally (containment)
-        #   reworded — words nearly all present somewhere, but not in order → not a gap
-        #   missing  — words genuinely absent
+        # Three outcomes per source sentence: covered | reworded | missing.
         missing, reworded = [], []
         for s in sentences:
-            stoks = _ld_split(tokens(s))
-            if len(stoks) <= _SHORT_MAX_TOKENS:
-                # short line: 4-gram shingles are too brittle — use windowed containment
-                if not _short_line_covered(stoks, qmd_tokens, positions):
-                    missing.append(s)
-                continue
-            sh = shingles(stoks)
-            if not sh:
-                continue
-            hit = len(sh & qmd_shingles) / len(sh)
-            if hit >= _SHINGLE_HIT or _short_line_covered(stoks, qmd_tokens, positions):
-                continue                                    # covered
-            uniq = set(stoks)
-            if uniq and len(uniq & qmd_token_set) / len(uniq) >= _REWORD_HIT:
-                reworded.append(s)                          # present but restructured
-            else:
-                missing.append(s)                           # genuinely absent
+            cat = _classify(_ld_split(tokens(s)), strict_idx)
+            if cat == "missing":
+                missing.append(s)
+            elif cat == "reworded":
+                reworded.append(s)
 
         total = len(sentences)
         present = total - len(missing)     # covered + reworded both count as present
         coverage = round(100 * present / total, 1) if total else 100.0
+
+        # EFFECTIVE coverage: does the recovery appendix (excluded above) cover any of the
+        # strict gaps? Re-test only the missing sentences against the FULL .qmd. When there
+        # is no recovery block, effective == strict (recovered_gaps stays 0).
+        recovered_gaps = 0
+        if missing and clean_qmd != ctx.qmd_text:
+            full_idx = _index(ctx.qmd_text)
+            recovered_gaps = sum(1 for m in missing
+                                 if _classify(_ld_split(tokens(m)), full_idx) == "covered")
+        effective = round(100 * (present + recovered_gaps) / total, 1) if total else 100.0
 
         findings = [Finding(f"missing: {m[:120]}", "warn") for m in missing[:_MAX_LISTED]]
         if len(missing) > _MAX_LISTED:
@@ -189,9 +204,12 @@ class TextCoverageCheck:
 
         status = "ok" if not missing else "warn"
         reworded_note = f", {len(reworded)} reworded" if reworded else ""
+        eff_note = (f"; {effective}% incl. {recovered_gaps} recovered"
+                    if recovered_gaps else "")
         return CheckResult(
             self.name, status,
-            f"text coverage {coverage}% ({present}/{total} present; "
-            f"{len(missing)} missing{reworded_note})",
+            f"text coverage {coverage}% in-place ({present}/{total} present; "
+            f"{len(missing)} missing{reworded_note}){eff_note}",
             metric=coverage, findings=findings,
+            detail={"effective": effective, "recovered": recovered_gaps},
         )

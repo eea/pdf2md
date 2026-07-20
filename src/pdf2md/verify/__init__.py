@@ -32,6 +32,7 @@ class CheckResult:
     summary: str               # one-line headline
     metric: float = None       # optional number, e.g. coverage %
     findings: list = field(default_factory=list)
+    detail: dict = None        # optional extras, e.g. {"effective": 99.1, "recovered": 21}
 
 
 def ok(name, summary, metric=None):

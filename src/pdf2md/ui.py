@@ -411,7 +411,15 @@ class RichUI(Events):
             r = results[0]
             t.add_row("document", r.stem)
             if r.text_cov is not None:
-                t.add_row("text", f"[dim]{r.text_cov}% coverage[/]")
+                # in-place (strict) headline, with the effective figure when the recovery
+                # appendix closed some gaps, and the before→after delta when fixes ran
+                cell = f"[dim]{r.text_cov}% in-place[/]"
+                if r.text_cov_effective is not None and r.text_cov_effective > r.text_cov:
+                    cell += (f"   [green]{r.text_cov_effective}% incl. recovered"
+                             f" (+{r.postfix_recovered})[/]")
+                if r.text_cov_before is not None and r.text_cov_before != r.text_cov:
+                    cell += f"   [grey58](was {r.text_cov_before}%)[/]"
+                t.add_row("text", cell)
             if r.verify_status:
                 t.add_row("verify", f"[{_VCOLOR.get(r.verify_status, 'yellow')}]{r.verify_status}[/]")
             for iss in r.verify_issues or []:    # the why, so warn/fail is assessable here

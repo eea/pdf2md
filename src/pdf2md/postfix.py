@@ -71,6 +71,14 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
             results = run_verify(ctx)
             write_report(results, out_dir)
             summary['verify_after'] = overall_status(results)
+            tc = next((r for r in results if r.name == 'text_coverage'), None)
+            tbl = next((r for r in results if r.name == 'table_coverage'), None)
+            summary['coverage_after'] = {
+                'text': tc.metric if tc else None,
+                'text_effective': (tc.detail or {}).get('effective') if tc else None,
+                'text_recovered': (tc.detail or {}).get('recovered', 0) if tc else 0,
+                'table': tbl.metric if tbl else None,
+            }
         except Exception as e:
             log.warning('Re-verify after postfix failed: %s', e)
 
