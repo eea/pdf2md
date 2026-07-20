@@ -93,6 +93,36 @@ _PFX_RECOVERY_RE = re.compile(
     r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*', re.DOTALL)
 
 
+def _table_regions(pdf_path) -> dict:
+    """page -> [table bbox, …] via PyMuPDF find_tables.
+
+    Table cells are measured by table_coverage, which tolerates the converter
+    re-segmenting a row into cells. Scoring them again as prose double-counts them
+    and punishes that legitimate re-segmentation: a row like "484 small/ 471 medium/
+    482 large" split across cells fails the local-window check and reads as missing
+    even though every value is present. So prose scoring skips table regions.
+    """
+    regions = defaultdict(list)
+    try:
+        import fitz
+    except ImportError:
+        return regions
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:                       # noqa: BLE001 — exclusion is best-effort
+        return regions
+    try:
+        for pno in range(doc.page_count):
+            try:
+                for t in doc[pno].find_tables().tables:
+                    regions[pno].append(tuple(t.bbox))
+            except Exception:               # noqa: BLE001 — one bad page must not abort
+                continue
+    finally:
+        doc.close()
+    return regions
+
+
 def _index(qmd_text: str):
     """Tokenise a .qmd into the lookup structures the classifier needs."""
     toks = _ld_split(tokens(qmd_to_plain(qmd_text)))
@@ -132,6 +162,10 @@ class TextCoverageCheck:
         # figure-internal text
         for f in ctx.figures:
             exclude[f["page"]].append(tuple(f["bbox"]))
+
+        # table cells — scored by table_coverage, not double-counted here
+        for pno, boxes in _table_regions(ctx.original_pdf).items():
+            exclude[pno].extend(boxes)
 
         # running header/footer chrome via the shared region detector
         is_cover = (ctx.detections or {}).get("cover", {}).get("is_cover", False)
