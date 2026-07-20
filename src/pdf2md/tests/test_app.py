@@ -203,6 +203,33 @@ class TestBudget:
         assert "batch budget" in next(r.error for r in results if r.stem == "b")
 
 
+class TestLargeDocWarning:
+    def _est(self, text_chars, pages):
+        return {"expected_usd": 1.0, "low_usd": 0.5, "high_usd": 2.0, "pages": pages,
+                "candidate_pages": 0, "text_chars": text_chars,
+                "breakdown": {"cover": 0.0, "detect": 0.0, "convert": 1.0}, "calibrated": True}
+
+    def test_warns_when_text_exceeds_context_budget(self, tmp_path, monkeypatch, caplog):
+        import logging
+        _stub_phases(monkeypatch)
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        # 4M chars ≈ 1M tokens of text > 0.7 * 1M window → warn
+        with caplog.at_level(logging.WARNING):
+            app.convert_one(pdf, tmp_path / "out", api_key="k",
+                            estimate=self._est(text_chars=4_000_000, pages=1400))
+        assert any("very large" in r.message and "context window" in r.message
+                   for r in caplog.records)
+
+    def test_no_warning_for_normal_doc(self, tmp_path, monkeypatch, caplog):
+        import logging
+        _stub_phases(monkeypatch)
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        with caplog.at_level(logging.WARNING):
+            app.convert_one(pdf, tmp_path / "out", api_key="k",
+                            estimate=self._est(text_chars=120_000, pages=40))
+        assert not any("very large" in r.message for r in caplog.records)
+
+
 class TestScaffolding:
     def test_ensure_scaffolding_creates_project(self, tmp_path):
         out_root = tmp_path / "out"

@@ -38,6 +38,13 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 # Validated best cost/quality for table-heavy docs (MODEL_EVALUATION.md); override with --model.
 DEFAULT_MODEL = "google/gemini-2.5-flash"
 
+# Pre-flight large-doc guard. With tail-only output continuation the binding wall is the
+# source PDF fitting the model's context window (its text footprint ≈ text_chars/4 tokens),
+# not the output length. Tied to gemini-2.5-flash's ~1M-token window; conservative so we
+# warn with headroom before the ~1200-page hard wall. Warn only — no split fallback.
+_CONTEXT_WINDOW_TOKENS = 1_000_000
+_LARGE_DOC_TOKENS = int(0.7 * _CONTEXT_WINDOW_TOKENS)
+
 
 @dataclass
 class FileResult:
@@ -351,6 +358,16 @@ def convert_one(
                  pdf.name, fmt_eur(estimate["expected_usd"]),
                  fmt_eur(estimate["low_usd"]), fmt_eur(estimate["high_usd"]),
                  estimate.get("pages", 0), estimate.get("candidate_pages", 0))
+        # Pre-flight: a document whose text won't fit the context window may convert
+        # incompletely (verify's text_coverage will flag the gap). Warn upfront; the
+        # only real fix past the ceiling is splitting the source into sections.
+        est_doc_tokens = estimate.get("text_chars", 0) / 4
+        if est_doc_tokens > _LARGE_DOC_TOKENS:
+            log.warning(
+                "%s is very large (~%d pages, ~%dk tokens of text) — it may exceed the "
+                "model's context window and convert incompletely. If the output looks "
+                "truncated, split the source into sections and convert each.",
+                pdf.name, estimate.get("pages", 0), int(est_doc_tokens / 1000))
         if (max_cost_per_file is not None and not allow_over_budget
                 and estimate["expected_usd"] > max_cost_per_file):
             result.status = "skip"
