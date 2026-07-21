@@ -261,6 +261,90 @@ def _recover_code_blocks(qmd_path, out_dir):
     return len(new_blocks)
 
 
+def _safe_boundary(text, pos):
+    """First blank-line boundary at/after `pos` that is not inside a code fence, so an
+    insert never lands mid-table or mid-fence. None when no safe boundary remains."""
+    while True:
+        nl = text.find('\n\n', pos)
+        if nl == -1:
+            return None
+        cand = nl + 2
+        if text.count('```', 0, cand) % 2 == 0:
+            return cand
+        pos = cand
+
+
+_ANCHOR_WINDOW = 20000   # chars; how far apart two hits can be and still be "the same place"
+
+
+def _bracketed_insertion_point(qmd_text, page_lines, pno, look=6):
+    """Where does missing page `pno` belong? Immediately after the nearest EARLIER page
+    whose text actually survived into the .qmd.
+
+    The gap page cannot anchor itself — its text is the text that went missing — so we
+    walk backwards to the closest page that did survive. `after` (the next surviving
+    page forward) is used only as a sanity bound: if the two disagree, the anchor is
+    unreliable and we decline rather than guess.
+    """
+    before = None
+    for p in range(pno - 1, max(-1, pno - look - 1), -1):
+        before = _insertion_point(qmd_text, page_lines.get(p, []))
+        if before is not None:
+            break
+    if before is None:
+        return None
+    for p in range(pno + 1, pno + look + 1):
+        after = _insertion_point(qmd_text, page_lines.get(p, []))
+        if after is not None:
+            # a later page must sit after the gap; if it doesn't, we've mis-anchored
+            return before if after >= before else None
+    return before
+
+
+def _insertion_point(qmd_text, anchor_lines):
+    """Where does a source page's content belong in the .qmd? Where that page's
+    surviving lines CLUSTER — content-anchored, so it does not depend on headings the
+    converter may have reworded. Clustering (not the last hit) matters: a single
+    coincidental match elsewhere would otherwise drag the insert to the wrong part of
+    the document. None when nothing survived to anchor on.
+    """
+    hay = qmd_text.lower()
+    hits = []
+    for ln in anchor_lines:
+        s = ' '.join(ln.split())
+        if len(s) < 40:
+            continue
+        i = hay.find(s[:60].lower())
+        if i != -1:
+            hits.append(i + len(s[:60]))
+    if not hits:
+        return None
+    # pick the densest cluster, then insert after its last member
+    best_hit, best_n = hits[0], 0
+    for h in hits:
+        n = sum(1 for x in hits if abs(x - h) <= _ANCHOR_WINDOW)
+        if n > best_n:
+            best_n, best_hit = n, h
+    cluster_end = max(x for x in hits if abs(x - best_hit) <= _ANCHOR_WINDOW)
+    return _safe_boundary(qmd_text, cluster_end)
+
+
+def _drop_already_present(recovered, qmd_text):
+    """Keep only paragraphs not already in the .qmd, so re-insertion never duplicates."""
+    from .verify.textutil import qmd_to_plain, shingles, tokens
+    qsh = shingles(tokens(qmd_to_plain(qmd_text)))
+    keep = []
+    for para in recovered.split('\n\n'):
+        st = tokens(para)
+        if len(st) < 8:
+            continue
+        sh = shingles(st)
+        if sh and len(sh & qsh) / len(sh) >= 0.5:
+            continue
+        keep.append(para.strip())
+    return '\n\n'.join(keep)
+
+
 def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
     import fitz
     from .verify.textutil import normalize, pdf_lines, split_sentences, tokens
@@ -305,58 +389,85 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
     if not worst:
         return 0, 0, 0.0
 
-    repair_pages = [p for p, _ in worst]
+    # ascending page order so earlier inserts don't invalidate later anchors
+    repair_pages = sorted(p for p, _ in worst)
 
-    # Extract text from worst pages
+    # Anchor only on lines unique in the source. Running headers/footers repeat on
+    # every page, and str.find returns their FIRST hit, which would drag every insert
+    # to the top of the document (observed).
+    line_freq = Counter(normalize(t) for _, t in lines)
+    page_lines = defaultdict(list)
+    for pno, txt in lines:
+        if line_freq[normalize(txt)] == 1:
+            page_lines[pno].append(txt)
+
     doc = fitz.open(str(source_pdf))
-    page_texts = []
-    for pno in repair_pages:
-        if pno < doc.page_count:
-            text = doc[pno].get_text()
-            page_texts.append('--- Page {} ---\n{}'.format(pno + 1, text[:2000]))
-    doc.close()
-
-    context_text = '\n\n'.join(page_texts)
-    prompt = (
-        'Below is text extracted from pages of a technical document '
-        'that was partially lost during conversion. Extract and list every specific '
-        'technical detail: URLs, parameter values, accuracy percentages, file naming '
-        'conventions, version numbers, abbreviations with expansions, and reference '
-        'numbers. Format each as a bullet point. Only include details that are '
-        'clearly present in the source text below. Do not invent or guess anything.\n\n'
-        '{}'.format(context_text)
-    )
-
     try:
-        try:
-            response, llm_usage = _post_with_retries(
-                api_key=api_key,
-                payload={'model': _REPAIR_MODEL, 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 4096},
-                label='postfix-repair', timeout=120,
+        llm_cost = 0.0
+        plans = []
+        repaired = 0
+        n_items = 0
+        for pno in repair_pages:
+            if pno >= doc.page_count:
+                continue
+            page_text = doc[pno].get_text()[:2000]
+            if not page_text.strip():
+                continue
+            # Recover the PROSE (not a bullet digest) so it can be put back in flow.
+            prompt = (
+                'Below is the raw text of page {} of a technical document. Some of its '
+                'body prose was lost during automated conversion. Reproduce that body '
+                'prose as clean Markdown, faithfully and in full. Do not summarise, do '
+                'not add commentary or headings, and do not invent anything. Omit page '
+                'headers/footers, figure labels and table contents. Output only the '
+                'Markdown prose.\n\n{}'.format(pno + 1, page_text)
             )
-        except RuntimeError as e:
-            if 'truncat' in str(e).lower() or 'output-token' in str(e).lower():
-                log.warning('Postfix repair truncated: %s', e)
-                return 0, 0, 0.0
-            raise
-        llm_cost = (llm_usage or {}).get('cost', 0.0)
-        if not response:
-            return 0, 0, 0.0
+            try:
+                response, llm_usage = _post_with_retries(
+                    api_key=api_key,
+                    payload={'model': _REPAIR_MODEL,
+                             'messages': [{'role': 'user', 'content': prompt}],
+                             'max_tokens': 4096},
+                    label='postfix-repair-p{}'.format(pno + 1), timeout=120,
+                )
+            except RuntimeError as e:
+                log.warning('Postfix repair p%d failed: %s', pno + 1, e)
+                continue
+            llm_cost += (llm_usage or {}).get('cost', 0.0)
+            if not response:
+                continue
 
-        pages_str = ', '.join(str(p+1) for p in repair_pages)
-        qmd_text += '\n\n'
-        qmd_text += '<!-- postfix: missing-text recovery -->\n\n'
-        qmd_text += '## Recovered Technical Details\n\n'
-        qmd_text += '> The following details were present in the source document '
-        qmd_text += 'but partially lost during automated conversion. '
-        qmd_text += 'Recovered from pages: {}.\n\n'.format(pages_str)
-        qmd_text += response + '\n'
+            recovered = _drop_already_present(response.strip(), qmd_text)
+            if not recovered:
+                continue
+            # Plan only — every position is resolved against the ORIGINAL text. Editing
+            # as we go made each insert anchor onto the previous one and chained them
+            # all to the end of the document.
+            plans.append((_bracketed_insertion_point(qmd_text, page_lines, pno),
+                          pno, recovered))
 
-        qmd_path.write_text(qmd_text)
-        log.info('postfix: recovered missing text from %d page(s) via %s',
-                 len(repair_pages), _REPAIR_MODEL)
-        n_items = len([l for l in response.split(chr(10)) if l.strip().startswith("*")])
-        return len(repair_pages), n_items, llm_cost
-    except Exception as e:
+        # Apply back-to-front so earlier offsets stay valid.
+        for at, pno, recovered in sorted(
+                plans, key=lambda t: (t[0] if t[0] is not None else len(qmd_text)),
+                reverse=True):
+            block = ('<!-- postfix: recovered in place (source p{}) -->\n\n{}\n\n'
+                     .format(pno + 1, recovered))
+            if at is None:
+                # no trustworthy anchor — append rather than guess a location
+                qmd_text = qmd_text.rstrip() + '\n\n' + block
+            else:
+                qmd_text = qmd_text[:at] + block + qmd_text[at:]
+            repaired += 1
+            n_items += len([p for p in recovered.split('\n\n') if p.strip()])
+
+        if not repaired:
+            return 0, 0, llm_cost
+        qmd_path.write_text(qmd_text, encoding='utf-8')
+        log.info('postfix: re-inserted prose from %d page(s) in place via %s',
+                 repaired, _REPAIR_MODEL)
+        return repaired, n_items, llm_cost
+    except Exception as e:                  # noqa: BLE001 — repair must never abort
         log.warning('Missing-text repair failed: %s', e)
         return 0, 0, 0.0
+    finally:
+        doc.close()
