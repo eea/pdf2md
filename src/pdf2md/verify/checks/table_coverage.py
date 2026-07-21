@@ -5,7 +5,9 @@ token-bag level, per table, reporting per-table coverage. Catches dropped tables
 rows, or cells.
 """
 
+import math
 import re
+from collections import Counter
 
 from .. import CheckResult, Finding, register
 from ..textutil import normalize, top_level_html_tables
@@ -125,7 +127,35 @@ def _best_match(src_cells, qmd_grids):
     return best, best_score
 
 
-def _union_match(src_toks: set, qmd_tok_sets: list) -> tuple:
+def _token_weights(qmd_tok_sets: list) -> dict:
+    """IDF-style token weights. A token occurring in many .qmd tables proves nothing —
+    bare numbers ('475') and units ('small', '%') recur everywhere, so a table that never
+    converted can still collect them from unrelated tables and score as covered
+    (measured: 13 pages of missing tables still scored 97.5%). Rare tokens are the real
+    evidence a specific table survived.
+    """
+    df = Counter()
+    for s in qmd_tok_sets:
+        for t in s:
+            df[t] += 1
+    n = max(1, len(qmd_tok_sets))
+    # A token absent from every .qmd table is maximally rare, so it must carry the
+    # HIGHEST weight — it is the strongest evidence a table did not convert. Returning
+    # it as the default matters: weighting it 1.0 while present tokens scored 2-4
+    # inflated coverage instead of exposing gaps.
+    return {t: math.log(1 + n / (1 + c)) for t, c in df.items()}, math.log(1 + n)
+
+
+def _w(tok, weights, default):
+    return default if weights is None else weights.get(tok, default)
+
+
+def _weigh(toks, weights, default):
+    return sum(_w(t, weights, default) for t in toks)
+
+
+def _union_match(src_toks: set, qmd_tok_sets: list, weights: dict = None,
+                 wdefault: float = 1.0) -> tuple:
     """Score a source table against the best-matching SET of .qmd tables.
 
     The converter legitimately re-segments tables — splitting one source table across
@@ -138,14 +168,15 @@ def _union_match(src_toks: set, qmd_tok_sets: list) -> tuple:
     """
     if not src_toks:
         return set(), 1.0, 0
+    total_w = _weigh(src_toks, weights, wdefault) or 1.0
     remaining, matched, used = set(src_toks), set(), 0
     for _ in range(_UNION_MAX):
-        best_toks, best_gain = None, 0
+        best_toks, best_gain = None, 0.0
         for q in qmd_tok_sets:
-            gain = len(remaining & q)
+            gain = _weigh(remaining & q, weights, wdefault)
             if gain > best_gain:
                 best_toks, best_gain = q, gain
-        if best_toks is None or best_gain / len(src_toks) < _UNION_MIN_GAIN:
+        if best_toks is None or best_gain / total_w < _UNION_MIN_GAIN:
             break
         hit = remaining & best_toks
         matched |= hit
@@ -153,7 +184,7 @@ def _union_match(src_toks: set, qmd_tok_sets: list) -> tuple:
         used += 1
         if not remaining:
             break
-    return matched, len(matched) / len(src_toks), used
+    return matched, _weigh(matched, weights, wdefault) / total_w, used
 
 
 @register
@@ -177,14 +208,16 @@ class TableCoverageCheck:
         # Token-WEIGHTED, so a find_tables sliver can't trip a warn while a big table
         # losing half its cells does.
         qmd_tok_sets = [_tokens_of(g) for g in qmd_grids]
+        weights, wdefault = _token_weights(qmd_tok_sets)
         per_table = []           # (i, content, src_cells, matched_tokens, n_src_tokens)
         total_toks = content_toks = aligned_toks = 0
         for i, src in enumerate(src_grids, 1):
             stoks = _tokens_of(src)
             ntoks = len(stoks)
-            matched, content, _used = _union_match(stoks, qmd_tok_sets)
-            aligned = max((len(stoks & q) / ntoks for q in qmd_tok_sets), default=0.0) \
-                if ntoks else 1.0
+            matched, content, _used = _union_match(stoks, qmd_tok_sets, weights, wdefault)
+            wt = _weigh(stoks, weights, wdefault) or 1.0
+            aligned = max((_weigh(stoks & q, weights, wdefault) / wt for q in qmd_tok_sets),
+                          default=0.0) if ntoks else 1.0
             total_toks += ntoks
             content_toks += content * ntoks
             aligned_toks += aligned * ntoks
