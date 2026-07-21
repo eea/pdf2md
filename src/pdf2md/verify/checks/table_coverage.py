@@ -39,16 +39,32 @@ def _is_oversized(rows: list) -> bool:
 
 
 def _source_grids(pdf_path) -> list:
-    """Extract table grids, excluding running-header tables."""
-    from collections import Counter
+    """Extract table grids, excluding running header/footer chrome.
+
+    Chrome is stripped before conversion, so it must not be scored here — otherwise the
+    page footer, which find_tables reports as a table on EVERY page, reads as missing
+    content we removed on purpose (measured: 29 of 43 "tables" in one ATBD were footers,
+    dragging table coverage from ~97% to 87.8%). The fingerprint heuristic below cannot
+    catch them, because the page number makes every footer unique.
+    """
+    from ..textutil import _rect_center_in
+
+    try:
+        from ...marginchrome import detect_running_chrome
+        chrome = detect_running_chrome(pdf_path)
+    except Exception:                       # noqa: BLE001 — exclusion is best-effort
+        chrome = {}
 
     grids_raw = []
     doc = fitz.open(str(pdf_path))
     total_pages = doc.page_count
     try:
         for pno in range(total_pages):
+            boxes = chrome.get(pno, [])
             try:
                 for tab in doc[pno].find_tables().tables:
+                    if boxes and _rect_center_in(tab.bbox, boxes):
+                        continue
                     rows = tab.extract()
                     if _is_oversized(rows):
                         continue
