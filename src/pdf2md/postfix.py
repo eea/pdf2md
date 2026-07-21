@@ -50,6 +50,15 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
             summary['postfixes_applied'].append(
                 'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
 
+    # Pass 1.8: hyperlink recovery (deterministic, no LLM). The href lives in a PDF
+    # annotation the model never sees, so this is the only way those links can survive.
+    link_check = verify_by_name.get('link_preservation')
+    if link_check and link_check.status in ('warn', 'fail'):
+        n_in, n_list = _recover_links(qmd_path, out_dir)
+        if n_in or n_list:
+            summary['postfixes_applied'].append(
+                'links: {} restored inline, {} listed'.format(n_in, n_list))
+
     # Pass 2: missing text rescue
     text_check = verify_by_name.get('text_coverage')
     if text_check and text_check.status in ('warn', 'fail') and api_key:
@@ -375,6 +384,90 @@ def _grid_to_markdown(rows):
         if i == 0:
             out.append('|' + '---|' * width)
     return '\n'.join(out)
+
+
+_LINK_ANCHOR_MIN = 10        # shorter anchor text is too ambiguous to link safely
+
+
+def _safe_to_inline(text, pos):
+    """True when `pos` is in ordinary prose — not inside a code fence, an HTML table,
+    or an existing markdown link, where injecting a link would corrupt the markup."""
+    before = text[:pos]
+    if before.count('```') % 2:
+        return False
+    if before.count('<table') > before.count('</table'):
+        return False
+    tail = text[max(0, pos - 2):pos]
+    return '[' not in tail
+
+
+def _recover_links(qmd_path, out_dir):
+    """Restore hyperlink targets the converter never saw.
+
+    A PDF keeps the href in a link ANNOTATION, not in the page text, so the model cannot
+    reproduce it — measured across 6 documents: not one URL reached the .qmd that was not
+    already visible as text. We hold them exactly, so re-attach them: inline when the
+    anchor text occurs exactly once (provably unambiguous), otherwise in a 'Source links'
+    list so no citation is lost. Returns (n_inlined, n_listed).
+    """
+    try:
+        import fitz
+    except ImportError:
+        return 0, 0
+    stem = qmd_path.stem
+    source_pdf = out_dir / '{}.source.pdf'.format(stem)
+    if not source_pdf.exists():
+        return 0, 0
+
+    qmd = qmd_path.read_text(encoding='utf-8')
+    despaced = re.sub(r'\s+', '', qmd.lower())
+
+    pairs, seen = [], set()
+    doc = fitz.open(str(source_pdf))
+    try:
+        for pno in range(doc.page_count):
+            page = doc[pno]
+            for l in page.get_links():
+                uri = (l.get('uri') or '').strip()
+                if not uri or uri in seen:
+                    continue
+                seen.add(uri)
+                if re.sub(r'\s+', '', uri.rstrip('/').lower()) in despaced:
+                    continue            # already present, nothing to restore
+                anchor = ' '.join(page.get_textbox(l['from']).split())
+                anchor = anchor.strip(' .,;:)（(')   # keep punctuation outside the link
+                pairs.append((uri, anchor))
+    finally:
+        doc.close()
+    if not pairs:
+        return 0, 0
+
+    inlined, listed = 0, []
+    for uri, anchor in pairs:
+        # a truncated URL as its own anchor is not prose — list it rather than guess
+        usable = (len(anchor) >= _LINK_ANCHOR_MIN
+                  and not anchor.lower().startswith(('http', 'www.', 'mailto:')))
+        if usable and qmd.count(anchor) == 1:
+            pos = qmd.find(anchor)
+            if _safe_to_inline(qmd, pos):
+                qmd = qmd[:pos] + '[{}]({})'.format(anchor, uri) + qmd[pos + len(anchor):]
+                inlined += 1
+                continue
+        listed.append((uri, anchor))
+
+    if listed:
+        def _label(a, u):
+            # a truncated copy of the URL is not a useful label — show the URL alone
+            if not a or a.lower().startswith(('http', 'www.', 'mailto:')):
+                return ''
+            return '{} — '.format(a)
+
+        rows = '\n'.join('- {}{}'.format(_label(a, u), u) for u, a in listed)
+        qmd = (qmd.rstrip() + '\n\n<!-- postfix: source links recovered from PDF '
+               'annotations -->\n\n## Source links\n\n' + rows + '\n')
+    qmd_path.write_text(qmd, encoding='utf-8')
+    log.info('postfix: restored %d link(s) inline, listed %d', inlined, len(listed))
+    return inlined, len(listed)
 
 
 _TABLE_LLM_MIN_KEEP = 0.98   # LLM rendering is used only if it keeps ~all source values

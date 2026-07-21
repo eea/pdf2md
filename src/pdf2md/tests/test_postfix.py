@@ -162,3 +162,33 @@ def test_grid_to_markdown_escapes_pipes_and_newlines():
 def test_grid_to_markdown_copies_values_verbatim():
     md = _grid_to_markdown([["No. of samples", "1438"], ["size classes", "475 small"]])
     assert "1438" in md and "475 small" in md
+
+
+# ── hyperlink recovery ──────────────────────────────────────────────────────────
+
+from pdf2md.postfix import _safe_to_inline  # noqa: E402
+
+
+def test_safe_to_inline_in_plain_prose():
+    t = "Some prose mentioning the Convention here.\n"
+    assert _safe_to_inline(t, t.index("Convention"))
+
+
+def test_not_safe_inside_a_code_fence():
+    t = "intro\n\n```\ncode Convention here\n```\n"
+    assert not _safe_to_inline(t, t.index("Convention"))
+
+
+def test_not_safe_inside_an_html_table():
+    t = "intro\n\n<table><tr><td>Convention</td></tr></table>\n"
+    assert not _safe_to_inline(t, t.index("Convention"))
+
+
+def test_safe_again_after_table_closes():
+    t = "<table><tr><td>x</td></tr></table>\n\nProse Convention follows.\n"
+    assert _safe_to_inline(t, t.index("Convention"))
+
+
+def test_not_safe_inside_an_existing_link():
+    t = "see [Convention](http://x) for details"
+    assert not _safe_to_inline(t, t.index("Convention"))
