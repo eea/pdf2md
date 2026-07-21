@@ -93,6 +93,24 @@ _PFX_RECOVERY_RE = re.compile(
     r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*', re.DOTALL)
 
 
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[•·▪◦‣∙*+-]|o)\s+(?=\S)", re.IGNORECASE)
+_SECTION_NO_RE = re.compile(r"^\s*\d+(?:\.\d+)+\.?\s+(?=\D)")
+
+
+def _strip_structural_markers(line: str) -> str:
+    """Drop leading list bullets and source section numbers before comparing.
+
+    Neither is content. The PDF renders list bullets as a literal 'o' (a Word-export
+    artifact) while the converter emits a markdown bullet, and source numbering like
+    '3.3.2.2.2' is dropped because Quarto numbers headings itself. Compared as words,
+    both make identical content read as missing.
+
+    The section-number pattern requires at least one dot, so a line opening with a bare
+    year ('2018 Land cover…') keeps its number.
+    """
+    return _SECTION_NO_RE.sub("", _LIST_MARKER_RE.sub("", line, count=1), count=1)
+
+
 def _table_regions(pdf_path) -> dict:
     """page -> [table bbox, …] via PyMuPDF find_tables.
 
@@ -196,7 +214,8 @@ class TextCoverageCheck:
             )
 
         source_text = "\n".join(
-            txt for _, txt in lines if not _ignored(normalize(txt))
+            _strip_structural_markers(txt) for _, txt in lines
+            if not _ignored(normalize(txt))
         )
         sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
 

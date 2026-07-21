@@ -83,3 +83,33 @@ def test_effective_recovers_gap_via_appendix():
     effective = _tc_index(body + appendix)
     assert _classify(_st(sentence), strict) == "missing"
     assert _classify(_st(sentence), effective) == "covered"
+
+
+# ── structural markers are notation, not content ────────────────────────────────
+
+from pdf2md.verify.checks.text_coverage import _strip_structural_markers  # noqa: E402
+
+
+def test_strips_pdf_letter_o_bullet():
+    # Word exports render list bullets as a literal 'o'; the converter emits a markdown
+    # bullet. Same meaning, so the 'o' must not count as a missing word.
+    assert _strip_structural_markers("o 21: pure needle leaved >75 %") == "21: pure needle leaved >75 %"
+
+
+def test_strips_symbol_and_dash_bullets():
+    assert _strip_structural_markers("• bullet item here") == "bullet item here"
+    assert _strip_structural_markers("- dash item here") == "dash item here"
+
+
+def test_strips_source_section_numbering():
+    # Quarto numbers headings itself, so the source's numbering is dropped by design
+    assert _strip_structural_markers("3.3.2.2.2 Workflow") == "Workflow"
+
+
+def test_keeps_a_leading_year():
+    # requires a dotted number, so real data opening with a year is untouched
+    assert _strip_structural_markers("2018 Land cover map") == "2018 Land cover map"
+
+
+def test_keeps_ordinary_prose_starting_with_o():
+    assert _strip_structural_markers("output of the process") == "output of the process"
