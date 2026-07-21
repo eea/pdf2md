@@ -135,3 +135,30 @@ def test_insertion_point_skips_ambiguous_anchors():
     at = _insertion_point(qmd, [
         "Trailing body paragraph that follows the duplicated heading text."])
     assert at is not None and at > len(toc)
+
+
+# ── deterministic table recovery ────────────────────────────────────────────────
+
+from pdf2md.postfix import _grid_to_markdown  # noqa: E402
+
+
+def test_grid_to_markdown_renders_header_and_rows():
+    md = _grid_to_markdown([["a", "b"], ["1", "2"]])
+    assert md.splitlines() == ["| a | b |", "|---|---|", "| 1 | 2 |"]
+
+
+def test_grid_to_markdown_pads_ragged_rows():
+    # find_tables emits ragged rows for merged cells; every row must keep the grid width
+    md = _grid_to_markdown([["a", "b", "c"], ["1"]])
+    assert all(l.count("|") == 4 for l in md.splitlines())
+
+
+def test_grid_to_markdown_escapes_pipes_and_newlines():
+    md = _grid_to_markdown([["x|y", "p\nq"], ["1", "2"]])
+    assert r"x\|y" in md          # a literal pipe must not break the grid
+    assert "p q" in md and "\n" not in md.split("|---")[0].strip("\n")
+
+
+def test_grid_to_markdown_copies_values_verbatim():
+    md = _grid_to_markdown([["No. of samples", "1438"], ["size classes", "475 small"]])
+    assert "1438" in md and "475 small" in md

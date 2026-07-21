@@ -41,6 +41,15 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
             summary['postfixes_applied'].append(
                 'code_blocks: recovered {} code block(s) from source PDF'.format(recovered))
 
+    # Pass 1.7: missing-table recovery (deterministic, no LLM). Not gated on the check's
+    # status: whole tables can be absent while the aggregate still reads ok, because a
+    # missing table's boilerplate is supplied by its siblings.
+    if table_check:
+        n_tbl = _recover_missing_tables(qmd_path, out_dir)
+        if n_tbl:
+            summary['postfixes_applied'].append(
+                'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
+
     # Pass 2: missing text rescue
     text_check = verify_by_name.get('text_coverage')
     if text_check and text_check.status in ('warn', 'fail') and api_key:
@@ -347,6 +356,104 @@ def _drop_already_present(recovered, qmd_text):
             continue
         keep.append(para.strip())
     return '\n\n'.join(keep)
+
+
+_TABLE_ABSENT_MIN = 0.5    # recover when this share of a table's distinctive values is gone
+_TABLE_MIN_DISTINCTIVE = 4  # ignore tables with too little unique data to judge
+_TABLE_MIN_ROWS = 2
+_TABLE_MIN_COLS = 2
+
+
+def _grid_to_markdown(rows):
+    """Render extracted source cells as a Markdown grid. Values are copied verbatim."""
+    width = max(len(r) for r in rows)
+    out = []
+    for i, r in enumerate(rows):
+        cells = [(c or '').replace('\n', ' ').replace('|', '\\|').strip() for c in r]
+        cells += [''] * (width - len(cells))
+        out.append('| ' + ' | '.join(cells) + ' |')
+        if i == 0:
+            out.append('|' + '---|' * width)
+    return '\n'.join(out)
+
+
+def _recover_missing_tables(qmd_path, out_dir):
+    """Re-emit source tables whose data never reached the .qmd.
+
+    Fully deterministic: the grid comes straight from PyMuPDF find_tables, so the values
+    are exact — no LLM, no paraphrase, no non-determinism. Detection uses each table's
+    DISTINCTIVE values (tokens rare in the source itself). Shared boilerplate ('small',
+    '%', column headers) proves nothing, because sibling tables supply it — which is how
+    13 pages of missing tables still scored 77-85% on token-bag matching.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return 0
+    from .verify.checks.table_coverage import _qmd_grids, _tokens_of
+    from .verify.textutil import normalize
+
+    stem = qmd_path.stem
+    source_pdf = out_dir / '{}.source.pdf'.format(stem)
+    if not source_pdf.exists():
+        return 0
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+
+    qtoks = set()
+    for g in _qmd_grids(qmd_text):
+        qtoks |= _tokens_of(g)
+
+    doc = fitz.open(str(source_pdf))
+    try:
+        tables = []
+        for pno in range(doc.page_count):
+            try:
+                for t in doc[pno].find_tables().tables:
+                    rows = [r for r in t.extract() if any(c for c in r)]
+                    if rows:
+                        tables.append((pno, rows))
+            except Exception:               # noqa: BLE001 — one bad page must not abort
+                continue
+    finally:
+        doc.close()
+
+    def toks_of(rows):
+        out = set()
+        for r in rows:
+            for c in r:
+                if c:
+                    out |= set(normalize(c).split())
+        return out
+
+    src_df = Counter()
+    for _p, rows in tables:
+        for t in toks_of(rows):
+            src_df[t] += 1
+
+    lines = pdf_lines_cached = None
+    added = 0
+    blocks = []
+    for pno, rows in tables:
+        if len(rows) < _TABLE_MIN_ROWS or max(len(r) for r in rows) < _TABLE_MIN_COLS:
+            continue                        # degenerate segmentation — not a real grid
+        distinctive = {t for t in toks_of(rows) if src_df[t] <= 2}
+        if len(distinctive) < _TABLE_MIN_DISTINCTIVE:
+            continue
+        absent = distinctive - qtoks
+        if len(absent) / len(distinctive) < _TABLE_ABSENT_MIN:
+            continue
+        blocks.append((pno, _grid_to_markdown(rows)))
+        added += 1
+
+    if not blocks:
+        return 0
+    parts = [qmd_text.rstrip()]
+    for pno, md in blocks:
+        parts.append('<!-- postfix: table recovered from source p{} -->\n\n{}'
+                     .format(pno + 1, md))
+    qmd_path.write_text('\n\n'.join(parts) + '\n', encoding='utf-8')
+    log.info('postfix: re-emitted %d missing table(s) from the source PDF', added)
+    return added
 
 
 _WINDOW_RE = re.compile(r'<<<PAGE\s+(\d+)>>>')
