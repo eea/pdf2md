@@ -314,9 +314,13 @@ def _insertion_point(qmd_text, anchor_lines):
         s = ' '.join(ln.split())
         if len(s) < 40:
             continue
-        i = hay.find(s[:60].lower())
-        if i != -1:
-            hits.append(i + len(s[:60]))
+        probe = s[:60].lower()
+        i = hay.find(probe)
+        # the probe must be UNIQUE in the .qmd: a heading also appears in the table of
+        # contents, and running chrome appears on every page — matching either pins the
+        # insert to the top of the document (observed).
+        if i != -1 and hay.find(probe, i + 1) == -1:
+            hits.append(i + len(probe))
     if not hits:
         return None
     # pick the densest cluster, then insert after its last member
@@ -343,6 +347,57 @@ def _drop_already_present(recovered, qmd_text):
             continue
         keep.append(para.strip())
     return '\n\n'.join(keep)
+
+
+_WINDOW_RE = re.compile(r'<<<PAGE\s+(\d+)>>>')
+
+
+def _convert_window(api_key, doc, pno, span=1):
+    """Convert pages pno-span … pno+span in ONE call. Returns ({page_idx: markdown}, cost).
+
+    Two reasons for the window rather than the bare page:
+      * sentences spanning a page break convert coherently;
+      * the neighbours give us a splice key. Matching the MODEL'S rendering of a
+        neighbouring page against the .qmd works far better than matching raw PDF text,
+        because the .qmd is itself model-rendered — raw lines differ by joined line
+        breaks, normalised punctuation and markdown escaping, so they rarely match.
+    """
+    pages = [p for p in range(pno - span, pno + span + 1) if 0 <= p < doc.page_count]
+    if not pages:
+        return {}, 0.0
+    body = '\n\n'.join('<<<PAGE {}>>>\n{}'.format(p + 1, doc[p].get_text()[:2200])
+                       for p in pages)
+    prompt = (
+        'Below are consecutive pages of a technical document, each introduced by a '
+        '<<<PAGE n>>> marker. Convert the BODY PROSE of each page to clean Markdown.\n'
+        'Reproduce it faithfully and in full: do not summarise, do not add commentary '
+        'or headings of your own, and do not invent anything. Omit page headers and '
+        'footers, figure labels, and table contents.\n'
+        'Emit the same <<<PAGE n>>> markers, each followed by that page\'s prose.\n\n'
+        + body
+    )
+    try:
+        response, usage = _post_with_retries(
+            api_key=api_key,
+            payload={'model': _REPAIR_MODEL,
+                     'messages': [{'role': 'user', 'content': prompt}],
+                     'max_tokens': 8192},
+            label='postfix-window-p{}'.format(pno + 1), timeout=180,
+        )
+    except RuntimeError as e:
+        log.warning('Postfix window p%d failed: %s', pno + 1, e)
+        return {}, 0.0
+    cost = (usage or {}).get('cost', 0.0)
+    if not response:
+        return {}, cost
+    chunks = _WINDOW_RE.split(response)
+    out = {}
+    for i in range(1, len(chunks) - 1, 2):
+        try:
+            out[int(chunks[i]) - 1] = chunks[i + 1].strip()
+        except ValueError:
+            continue
+    return out, cost
 
 
 def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
@@ -410,41 +465,25 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
         for pno in repair_pages:
             if pno >= doc.page_count:
                 continue
-            page_text = doc[pno].get_text()[:2000]
-            if not page_text.strip():
+            if not doc[pno].get_text().strip():
                 continue
-            # Recover the PROSE (not a bullet digest) so it can be put back in flow.
-            prompt = (
-                'Below is the raw text of page {} of a technical document. Some of its '
-                'body prose was lost during automated conversion. Reproduce that body '
-                'prose as clean Markdown, faithfully and in full. Do not summarise, do '
-                'not add commentary or headings, and do not invent anything. Omit page '
-                'headers/footers, figure labels and table contents. Output only the '
-                'Markdown prose.\n\n{}'.format(pno + 1, page_text)
-            )
-            try:
-                response, llm_usage = _post_with_retries(
-                    api_key=api_key,
-                    payload={'model': _REPAIR_MODEL,
-                             'messages': [{'role': 'user', 'content': prompt}],
-                             'max_tokens': 4096},
-                    label='postfix-repair-p{}'.format(pno + 1), timeout=120,
-                )
-            except RuntimeError as e:
-                log.warning('Postfix repair p%d failed: %s', pno + 1, e)
-                continue
-            llm_cost += (llm_usage or {}).get('cost', 0.0)
-            if not response:
-                continue
-
-            recovered = _drop_already_present(response.strip(), qmd_text)
+            window, cost = _convert_window(api_key, doc, pno)
+            llm_cost += cost
+            recovered = _drop_already_present(window.get(pno, '').strip(), qmd_text)
             if not recovered:
                 continue
-            # Plan only — every position is resolved against the ORIGINAL text. Editing
-            # as we go made each insert anchor onto the previous one and chained them
-            # all to the end of the document.
-            plans.append((_bracketed_insertion_point(qmd_text, page_lines, pno),
-                          pno, recovered))
+
+            # Anchor on the model's OWN rendering of the preceding page — it matches the
+            # (model-rendered) .qmd far better than raw PDF text. Fall back to raw-text
+            # bracketing, then to appending, rather than guessing a location.
+            neighbour = [l.strip() for l in window.get(pno - 1, '').splitlines()
+                         if len(l.strip()) >= 40]
+            at = _insertion_point(qmd_text, neighbour) if neighbour else None
+            if at is None:
+                at = _bracketed_insertion_point(qmd_text, page_lines, pno)
+            # Plan only — positions resolve against the ORIGINAL text. Editing as we go
+            # made each insert anchor onto the previous one and chain to the end.
+            plans.append((at, pno, recovered))
 
         # Apply back-to-front so earlier offsets stay valid.
         for at, pno, recovered in sorted(

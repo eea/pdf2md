@@ -91,3 +91,47 @@ def test_drop_already_present_keeps_novel_prose():
 
 def test_drop_already_present_skips_tiny_fragments():
     assert _drop_already_present("too short", QMD) == ""
+
+
+# ── window recovery: page-marker parsing ────────────────────────────────────────
+
+from pdf2md.postfix import _WINDOW_RE  # noqa: E402
+
+
+def _parse_window(response):
+    chunks = _WINDOW_RE.split(response)
+    out = {}
+    for i in range(1, len(chunks) - 1, 2):
+        out[int(chunks[i]) - 1] = chunks[i + 1].strip()
+    return out
+
+
+def test_window_markers_split_pages():
+    out = _parse_window(
+        "<<<PAGE 83>>>\nProse of page eighty three.\n\n"
+        "<<<PAGE 84>>>\nProse of page eighty four.\n\n"
+        "<<<PAGE 85>>>\nProse of page eighty five.")
+    assert sorted(out) == [82, 83, 84]
+    assert out[83] == "Prose of page eighty four."
+
+
+def test_window_tolerates_preamble_and_spacing():
+    out = _parse_window("Here you go:\n<<<PAGE  7>>>\n  Seven prose.  \n<<<PAGE 8>>>\nEight prose.")
+    assert out[6] == "Seven prose." and out[7] == "Eight prose."
+
+
+def test_insertion_point_skips_ambiguous_anchors():
+    # regression: a heading also present in the table of contents matched the TOC copy
+    # and pinned inserts to the top of the document. Ambiguous probes must be skipped.
+    toc = "## Contents\n\nMethodological approach and sampling design overview\n\n"
+    body = ("Filler body paragraph with sufficient length to be a real block.\n\n"
+            "Methodological approach and sampling design overview\n\n"
+            "Trailing body paragraph that follows the duplicated heading text.\n\n")
+    qmd = toc + body
+    # the duplicated line alone is ambiguous -> no anchor at all
+    assert _insertion_point(qmd, [
+        "Methodological approach and sampling design overview"]) is None
+    # a unique line still anchors fine
+    at = _insertion_point(qmd, [
+        "Trailing body paragraph that follows the duplicated heading text."])
+    assert at is not None and at > len(toc)
