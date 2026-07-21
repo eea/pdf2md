@@ -45,7 +45,7 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
     # status: whole tables can be absent while the aggregate still reads ok, because a
     # missing table's boilerplate is supplied by its siblings.
     if table_check:
-        n_tbl = _recover_missing_tables(qmd_path, out_dir)
+        n_tbl = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
         if n_tbl:
             summary['postfixes_applied'].append(
                 'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
@@ -377,7 +377,63 @@ def _grid_to_markdown(rows):
     return '\n'.join(out)
 
 
-def _recover_missing_tables(qmd_path, out_dir):
+_TABLE_LLM_MIN_KEEP = 0.98   # LLM rendering is used only if it keeps ~all source values
+
+
+def _table_values(rows, normalize):
+    """Every word token in a table's cells — the ground truth a rendering must preserve."""
+    out = set()
+    for r in rows:
+        for c in r:
+            if c:
+                out |= set(normalize(c).split())
+    return out
+
+
+def _llm_table_markdown(api_key, doc, pno, rows, normalize):
+    """Re-convert a table region for STRUCTURE (merged cells, real header, caption), then
+    verify it against the deterministic cell values.
+
+    The model's known failure mode is silently dropping data — which is what caused these
+    gaps in the first place. find_tables gives the exact values for free, so we can take
+    the model's better structure without trusting its completeness: if any value is lost,
+    the caller keeps the plain deterministic grid instead. Returns (markdown, cost) with
+    markdown None when verification fails.
+    """
+    prompt = (
+        'Below is the text of page {} of a technical document containing a table.\n'
+        'Convert THE TABLE to a clean Markdown table. Preserve every value exactly as '
+        'written. Include the table caption if one is present, as a line above the '
+        'table. Join cell text that the extraction split across lines, and do not emit '
+        'empty filler columns. Do not summarise, do not omit any row or value, and do '
+        'not add commentary.\nOutput only the caption line (if any) and the table.\n\n{}'
+        .format(pno + 1, doc[pno].get_text()[:3000])
+    )
+    try:
+        response, usage = _post_with_retries(
+            api_key=api_key,
+            payload={'model': _REPAIR_MODEL,
+                     'messages': [{'role': 'user', 'content': prompt}],
+                     'max_tokens': 4096},
+            label='postfix-table-p{}'.format(pno + 1), timeout=120,
+        )
+    except RuntimeError as e:
+        log.warning('Table re-conversion p%d failed: %s', pno + 1, e)
+        return None, 0.0
+    cost = (usage or {}).get('cost', 0.0)
+    if not response:
+        return None, cost
+    need = _table_values(rows, normalize)
+    got = set(normalize(response).split())
+    kept = len(need & got) / len(need) if need else 1.0
+    if kept < _TABLE_LLM_MIN_KEEP:
+        log.info('postfix: p%d LLM table kept only %.0f%% of values — using exact grid',
+                 pno + 1, 100 * kept)
+        return None, cost
+    return response.strip(), cost
+
+
+def _recover_missing_tables(qmd_path, out_dir, api_key=None):
     """Re-emit source tables whose data never reached the .qmd.
 
     Fully deterministic: the grid comes straight from PyMuPDF find_tables, so the values
@@ -430,9 +486,9 @@ def _recover_missing_tables(qmd_path, out_dir):
         for t in toks_of(rows):
             src_df[t] += 1
 
-    lines = pdf_lines_cached = None
     added = 0
     blocks = []
+    llm_cost = [0.0]
     for pno, rows in tables:
         if len(rows) < _TABLE_MIN_ROWS or max(len(r) for r in rows) < _TABLE_MIN_COLS:
             continue                        # degenerate segmentation — not a real grid
@@ -442,15 +498,27 @@ def _recover_missing_tables(qmd_path, out_dir):
         absent = distinctive - qtoks
         if len(absent) / len(distinctive) < _TABLE_ABSENT_MIN:
             continue
-        blocks.append((pno, _grid_to_markdown(rows)))
+        md, src_label = None, 'exact grid'
+        if api_key:
+            doc2 = fitz.open(str(source_pdf))
+            try:
+                md, c = _llm_table_markdown(api_key, doc2, pno, rows, normalize)
+                llm_cost[0] += c
+            finally:
+                doc2.close()
+            if md:
+                src_label = 'structured'
+        if not md:
+            md = _grid_to_markdown(rows)
+        blocks.append((pno, md, src_label))
         added += 1
 
     if not blocks:
         return 0
     parts = [qmd_text.rstrip()]
-    for pno, md in blocks:
-        parts.append('<!-- postfix: table recovered from source p{} -->\n\n{}'
-                     .format(pno + 1, md))
+    for pno, md, src_label in blocks:
+        parts.append('<!-- postfix: table recovered from source p{} ({}) -->\n\n{}'
+                     .format(pno + 1, src_label, md))
     qmd_path.write_text('\n\n'.join(parts) + '\n', encoding='utf-8')
     log.info('postfix: re-emitted %d missing table(s) from the source PDF', added)
     return added
