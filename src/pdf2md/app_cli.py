@@ -96,6 +96,23 @@ def resolve_key() -> str:
     return ""
 
 
+def describe_key_sources() -> str:
+    """Explain where we looked for a key and what we found, for the no-key error."""
+    parts = []
+    env = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not env:
+        parts.append("OPENROUTER_API_KEY is not exported in this shell")
+    elif not env.startswith("sk-or-"):
+        parts.append(f"OPENROUTER_API_KEY is set but doesn't look like an OpenRouter "
+                     f"key (starts with {env[:6]!r}, expected 'sk-or-')")
+    kf = os.environ.get("OPENROUTER_API_KEY_FILE", "")
+    if kf and not Path(kf).exists():
+        parts.append(f"OPENROUTER_API_KEY_FILE points to a missing file ({kf})")
+    if not KEY_FILE.exists():
+        parts.append(f"no saved key at {KEY_FILE}")
+    return "; ".join(parts) or "key sources look fine"
+
+
 def resolve_model(args_model=None):
     """Resolve model: CLI arg -> env var -> config file -> default."""
     if args_model:
@@ -363,11 +380,13 @@ def main() -> int:
 
     api_key = resolve_key()
     if not api_key:
-        log.warning("No API key configured — starting interactive setup.")
+        log.warning("No usable API key found: %s.", describe_key_sources())
+        log.warning("Starting interactive setup — or export OPENROUTER_API_KEY and re-run.")
         run_setup()
         api_key = resolve_key()
         if not api_key:
-            log.error("No API key provided. Set OPENROUTER_API_KEY or run 'pdf2md --setup'.")
+            log.error("No API key provided (%s). Set OPENROUTER_API_KEY or run "
+                      "'pdf2md --setup'.", describe_key_sources())
             return 1
     model = resolve_model(args.model)
 
