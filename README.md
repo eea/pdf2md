@@ -1,20 +1,15 @@
 # pdf2md
 
-Standalone multi-format PDF converter — detect figures and tables, then convert to Quarto `.qmd`, Markdown `.md`, or GitHub-Flavored Markdown `.gfm`.
-
-Extracted from [CLMS_documents](https://github.com/MatMatt/CLMS_documents).
-
-## Authors
-
-- Maciej Dudek
-- Matteo Mattiuzzi
-
-Copyright © 2026 European Union. Licensed under EUPL-1.2.
+pdf2md converts PDF documents into editable Markdown. It is aimed at technical
+documents, reports and manuals: text, tables, figures and structure are carried
+over, and each conversion is checked against the original. The conversion
+itself is done by an LLM. The main output format is Quarto `.qmd`; plain `.md`
+and GitHub-Flavored `.gfm` are also supported.
 
 ## Quick start
 
 ```bash
-# Install
+# Install (editable, so a git pull is enough to update later)
 pip install -e .
 
 # One-time setup (API key + default model)
@@ -36,22 +31,39 @@ python3 pdf2md.py document.pdf --template path/to/template.qmd
 python3 pdf2md.py document.pdf --template https://raw.githubusercontent.com/org/repo/main/template.qmd
 ```
 
-When --template is used, the template's YAML frontmatter block is injected into the
-conversion prompt. The LLM fills in document-specific values (title, date, etc.)
-while preserving the template's field set, order, and structure. This ensures
-every converted document starts with a consistent, pre-defined header.
+With `--template`, the YAML frontmatter from the template is injected into the
+conversion prompt. The LLM fills in the document-specific values (title, date
+and so on) but keeps the field set and order from the template, so all
+converted documents end up with the same header layout.
 
-## Pipeline
+## How it works
 
-1. **Phase 1 — Detect:** Extract figures/tables, strip chrome, detect cover metadata
-2. **Phase 2 — Convert:** LLM transforms the placeholdered PDF to structured markdown
-3. **Phase 2.5 — Rescue:** Deterministically resolve leftover figure tokens + LLM-driven insertion of unreferenced figures
-4. **Phase 3 — Tablefix:** Deterministic table width, caption, and orientation fixes
-5. **Phase 4 — Verify:** Content-fidelity check (text coverage, figure placement, table coverage)
+A PDF becomes Markdown in four phases. The text goes through the LLM, the
+images go around it.
+
+<img src="docs/pipeline.svg" alt="How pdf2md works" width="840">
+
+Figures are cropped out of the PDF before conversion and replaced with numbered
+`[FIG_n]` boxes. The LLM only transcribes text and carries these tokens
+through; afterwards the original images are put back where the tokens are.
+Tables get the opposite treatment: they are never cropped, so the model can
+transcribe their content. At the end of a run, a set of checks compares the
+result with the source document and restores missing tables or links without
+another LLM call.
+
+## Output files
+
+Each converted document produces:
+
+- `<stem>.qmd` — the converted document (or `.md`/`.gfm`, see `--format`)
+- `<stem>-media/` — figures extracted from the source PDF
+- `verify_report.md` — results of the fidelity checks, worth a look before trusting the output
+- `postfix_report.md` — coverage before and after the automatic fixes
 
 ## Configuration
 
 API key and default model are stored in `~/.pdf2md/`:
+
 - `key` — OpenRouter API key (mode 600)
 - `config.json` — model selection + auto-cached model limits from OpenRouter API
 
@@ -80,9 +92,9 @@ Then check `verify_report.md` — the document is designed to surface failures i
 - Scientific content: chemical formulas, subscripts/superscripts, display equations
 - Metadata: YAML frontmatter generation (title detection, date parsing)
 
-`verify=fail` on figure placement. Stick to multimodal models.
+Text-only models fail the figure placement check, so stick to multimodal models.
 
-### Known model pitfalls
+## Known model pitfalls
 
 The tool checks the chosen model against OpenRouter's metadata before spending
 anything (file input support, context window vs. document size) and prints a
@@ -98,17 +110,11 @@ anything (file input support, context window vs. document size) and prints a
   can spend thousands of completion tokens on hidden reasoning and return little
   or no text at modest `max_tokens`. The error message says so when it happens.
 
-## Updating
+## Authors & license
 
-```bash
-cd pdf2md
-git pull
-```
+pdf2md was extracted from [CLMS_documents](https://github.com/MatMatt/CLMS_documents).
 
-The editable install (`pip install -e .`) picks up changes automatically — no need to
-re-install unless new dependencies were added. If the pull adds new packages, run
-`pip install -e .` again to install them.
+- Maciej Dudek
+- Matteo Mattiuzzi
 
-## License
-
-EUPL-1.2 — see [LICENSE](LICENSE).
+Copyright © 2026 European Union. Licensed under [EUPL-1.2](LICENSE).

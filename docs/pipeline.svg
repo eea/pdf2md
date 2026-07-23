@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="diagram" xmlns="http://www.w3.org/2000/svg" viewBox="0 100 920 1590" role="img" aria-label="pdf2md pipeline with sub-steps: prepare, convert, repair, verify; images bypass the LLM through a media lane; outputs a .qmd and a verify report">
+  <style>
+    #diagram {
+      --bg:#FBFBF9; --card:#FFFFFF; --stroke:#D9DCE1; --ink:#22272E; --muted:#6B7480; --tint:#EFF2F8;
+      --accent:#2D6CDF; --amber:#B7821E; --amber-soft:#FBF4E3; --amber-stroke:#E3C78C;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      #diagram {
+        --bg:#14161A; --card:#1C1F26; --stroke:#303540; --ink:#E7E9ED; --muted:#99A1AC; --tint:#1A1F29;
+        --accent:#6CA1F0; --amber:#D9A24A; --amber-soft:#241F14; --amber-stroke:#5C4A22;
+      }
+    }
+    #diagram .bg { fill: var(--bg); }
+    #diagram .phase { fill: var(--tint); }
+    #diagram .step { fill: var(--card); stroke: var(--stroke); stroke-width: 1; }
+    #diagram .title { fill: var(--ink); font-size: 22px; font-weight: 700; letter-spacing: -0.2px; }
+    #diagram .sub { fill: var(--muted); font-size: 13px; }
+    #diagram .eyebrow { fill: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
+    #diagram .cardtitle { fill: var(--ink); font-size: 16px; font-weight: 650; }
+    #diagram .stepname { fill: var(--ink); font-size: 13.5px; font-weight: 650; }
+    #diagram .b { fill: var(--ink); font-size: 13px; }
+    #diagram .why { fill: var(--muted); font-size: 12px; font-style: italic; }
+    #diagram .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; fill: var(--muted); }
+    #diagram .tok { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; fill: var(--amber); }
+    #diagram .spine { stroke: #8A94A0; stroke-width: 1.5; fill: none; }
+    #diagram .lane { fill: var(--amber-soft); stroke: var(--amber-stroke); stroke-width: 1; stroke-dasharray: 5 4; }
+    #diagram .laneline { stroke: #C9963F; stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+    #diagram .lanelabel { fill: var(--amber); font-size: 11px; font-weight: 700; letter-spacing: 1.6px; }
+    #diagram .lanetext { fill: var(--muted); font-size: 12px; }
+    #diagram .lanetag { fill: var(--amber); font-size: 11px; font-weight: 600; }
+    #diagram .thumb { fill: var(--card); stroke: var(--amber-stroke); stroke-width: 1; }
+    #diagram .thumbart { stroke: var(--amber); stroke-width: 1.2; fill: none; }
+    #diagram .chip { fill: var(--card); stroke: var(--stroke); stroke-width: 1; }
+    #diagram .doc { stroke: var(--muted); stroke-width: 1.3; fill: none; }
+    #diagram .pagestack { fill: var(--bg); stroke: var(--stroke); stroke-width: 1; }
+    #diagram .llmchip { fill: var(--card); stroke: var(--accent); stroke-width: 1.2; }
+    #diagram .llmtext { fill: var(--accent); font-size: 12px; font-weight: 650; }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8A94A0"/>
+    </marker>
+    <marker id="ahAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#C9963F"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="100" width="920" height="1590"/>
+
+  <!-- input chip -->
+  <rect class="chip" x="40" y="110" width="216" height="42" rx="21"/>
+  <path class="doc" d="M62 121 h9 l5 5 v14 h-14 z M71 121 v5 h5"/>
+  <text class="mono" x="86" y="135" style="fill:var(--ink)">document.pdf</text>
+
+  <line class="spine" x1="145" y1="152" x2="145" y2="176" marker-end="url(#ah)"/>
+
+  <!-- ═══ PHASE 1 ═══ -->
+  <rect class="phase" x="40" y="180" width="530" height="514" rx="12"/>
+  <text class="eyebrow" x="64" y="208">PHASE 1</text>
+  <text class="cardtitle" x="64" y="230">Prepare the pages</text>
+
+  <rect class="step" x="64" y="248" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="270">Strip chrome</text>
+  <text class="b" x="84" y="290">Remove repeating headers &amp; footers from every page</text>
+  <text class="why" x="84" y="308">page furniture would otherwise leak into the transcribed text</text>
+
+  <line class="spine" x1="145" y1="322" x2="145" y2="342" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="346" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="368">Gate pages</text>
+  <text class="b" x="84" y="388">Sort pages: candidate or skip, using local signals only</text>
+  <text class="why" x="84" y="406">embedded images or big vector clusters, milliseconds per page — no LLM yet</text>
+
+  <line class="spine" x1="145" y1="420" x2="145" y2="440" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="444" width="482" height="112" rx="8"/>
+  <text class="stepname" x="84" y="466">Detect figures — page by page</text>
+  <g>
+    <rect class="pagestack" x="88" y="478" width="26" height="34" rx="3"/>
+    <rect class="pagestack" x="96" y="484" width="26" height="34" rx="3"/>
+    <rect class="pagestack" x="104" y="490" width="26" height="34" rx="3"/>
+    <path class="doc" d="M110 500 h14 M110 508 h14 M110 516 h9"/>
+    <line class="spine" x1="138" y1="507" x2="244" y2="507" marker-end="url(#ah)"/>
+    <rect class="llmchip" x="250" y="492" width="98" height="30" rx="15"/>
+    <text class="llmtext" x="299" y="511" text-anchor="middle">vision LLM</text>
+    <line class="spine" x1="352" y1="507" x2="390" y2="507" marker-end="url(#ah)"/>
+    <text class="why" x="396" y="511">figure bounding boxes</text>
+  </g>
+  <text class="why" x="84" y="540">one request per page, in parallel — figures only, tables deliberately excluded</text>
+
+  <line class="spine" x1="145" y1="556" x2="145" y2="576" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="580" width="482" height="94" rx="8"/>
+  <text class="stepname" x="84" y="602">Crop &amp; stamp</text>
+  <text class="b" x="84" y="622">Cut each figure out to a PNG; stamp a <tspan class="tok">[FIG_n]</tspan> box in its place</text>
+  <text class="why" x="84" y="640">tables are never cropped — their text must survive for transcription</text>
+  <text class="why" x="84" y="658">the conversion LLM will see the box, not the image</text>
+
+  <line class="spine" x1="145" y1="694" x2="145" y2="728" marker-end="url(#ah)"/>
+  <text class="mono" x="158" y="716">placeholders.pdf</text>
+
+  <!-- ═══ PHASE 2 ═══ -->
+  <rect class="phase" x="40" y="732" width="530" height="138" rx="12"/>
+  <text class="eyebrow" x="64" y="760">PHASE 2</text>
+  <text class="cardtitle" x="64" y="782">Convert with the LLM</text>
+  <text class="b" x="64" y="810">The LLM reads the placeholdered PDF and writes structured markdown</text>
+  <text class="why" x="64" y="828">unlike detection, one whole-document request — continued if output runs long</text>
+  <text class="why" x="64" y="846"><tspan class="tok">[FIG_n]</tspan> tokens ride through untouched — the model can't output images anyway</text>
+
+  <line class="spine" x1="145" y1="870" x2="145" y2="904" marker-end="url(#ah)"/>
+  <text class="mono" x="158" y="892">draft .qmd</text>
+
+  <!-- ═══ PHASES 2.5–3 ═══ -->
+  <rect class="phase" x="40" y="908" width="530" height="358" rx="12"/>
+  <text class="eyebrow" x="64" y="936">PHASES 2.5 – 3</text>
+  <text class="cardtitle" x="64" y="958">Repair &amp; reassemble</text>
+
+  <rect class="step" x="64" y="976" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="998">Reinsert the images</text>
+  <text class="b" x="84" y="1018">Swap every <tspan class="tok">[FIG_n]</tspan> token for its cropped PNG</text>
+  <text class="why" x="84" y="1036">← the originals return from the media lane, pixel-perfect</text>
+
+  <line class="spine" x1="145" y1="1050" x2="145" y2="1070" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="1074" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="1096">Rescue strays</text>
+  <text class="b" x="84" y="1116">Resolve leftover tokens, place figures the text never referenced</text>
+  <text class="why" x="84" y="1134">nothing detected in Phase 1 is allowed to vanish</text>
+
+  <line class="spine" x1="145" y1="1148" x2="145" y2="1168" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="1172" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="1194">Fix tables</text>
+  <text class="b" x="84" y="1214">Normalize widths, captions, orientation — plain code, no LLM</text>
+  <text class="why" x="84" y="1232">LLM output is good at content, sloppy at table geometry</text>
+
+  <line class="spine" x1="145" y1="1266" x2="145" y2="1300" marker-end="url(#ah)"/>
+
+  <!-- ═══ PHASE 4 ═══ -->
+  <rect class="phase" x="40" y="1304" width="530" height="260" rx="12"/>
+  <text class="eyebrow" x="64" y="1332">PHASE 4</text>
+  <text class="cardtitle" x="64" y="1354">Verify fidelity</text>
+
+  <rect class="step" x="64" y="1372" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="1394">Diff against the source</text>
+  <text class="b" x="84" y="1414">Twelve checks compare the result to the original PDF</text>
+  <text class="why" x="84" y="1432">text coverage · tables · figures · footnotes · links · math · headings…</text>
+
+  <line class="spine" x1="145" y1="1446" x2="145" y2="1466" marker-end="url(#ah)"/>
+
+  <rect class="step" x="64" y="1470" width="482" height="74" rx="8"/>
+  <text class="stepname" x="84" y="1492">Recover what's missing</text>
+  <text class="b" x="84" y="1512">Missing tables and hyperlinks are restored deterministically</text>
+  <text class="why" x="84" y="1530">no second LLM pass — recovery must not introduce new errors</text>
+
+  <line class="spine" x1="145" y1="1564" x2="145" y2="1592" marker-end="url(#ah)"/>
+  <line class="spine" x1="460" y1="1564" x2="460" y2="1586" marker-end="url(#ah)"/>
+
+  <!-- outputs: the document + the honesty report -->
+  <rect class="chip" x="40" y="1596" width="340" height="46" rx="23"/>
+  <text class="mono" x="66" y="1625" style="fill:var(--ink)">.qmd</text>
+  <text class="sub" x="112" y="1625">+ optional Quarto render to PDF</text>
+
+  <rect class="chip" x="400" y="1590" width="290" height="58" rx="12"/>
+  <text class="mono" x="424" y="1614" style="fill:var(--ink)">verify_report.md</text>
+  <text class="sub" x="424" y="1634">what to double-check, what was recovered</text>
+
+  <!-- media lane -->
+  <rect class="lane" x="620" y="180" width="260" height="470" rx="10"/>
+  <text class="lanelabel" x="644" y="212">MEDIA LANE</text>
+  <text class="lanetext" x="644" y="232">images bypass the LLM</text>
+
+  <g>
+    <rect class="thumb" x="644" y="252" width="90" height="56" rx="6"/>
+    <path class="thumbart" d="M652 298 l18 -18 l12 12 l10 -8 l14 14"/>
+    <circle class="thumbart" cx="716" cy="266" r="5"/>
+    <text class="mono" x="746" y="284">img-9c41….png</text>
+    <rect class="thumb" x="644" y="322" width="90" height="56" rx="6"/>
+    <path class="thumbart" d="M652 368 l14 -20 l14 14 l12 -10 l12 16"/>
+    <circle class="thumbart" cx="712" cy="336" r="5"/>
+    <text class="mono" x="746" y="354">img-b07d….png</text>
+    <rect class="thumb" x="644" y="392" width="90" height="56" rx="6"/>
+    <path class="thumbart" d="M652 438 l16 -16 l12 10 l12 -14 l12 20"/>
+    <circle class="thumbart" cx="718" cy="406" r="5"/>
+    <text class="mono" x="746" y="424">img-52ee….png</text>
+  </g>
+
+  <text class="lanetext" x="644" y="486">Cropped figures wait here,</text>
+  <text class="lanetext" x="644" y="504">lossless, while the text</text>
+  <text class="lanetext" x="644" y="522">visits the model.</text>
+  <text class="mono" x="644" y="560">&lt;stem&gt;-media/</text>
+
+  <!-- crops out of crop&stamp into the lane -->
+  <line class="laneline" x1="550" y1="620" x2="614" y2="620" marker-end="url(#ahAmber)"/>
+  <text class="lanetag" x="566" y="612">crops</text>
+
+  <!-- originals rejoin at repair -->
+  <path class="laneline" d="M750 650 V 1013 H 552" marker-end="url(#ahAmber)"/>
+  <text class="lanetag" x="600" y="1005">originals return</text>
+</svg>
