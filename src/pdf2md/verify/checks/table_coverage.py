@@ -71,17 +71,18 @@ def _source_grids(pdf_path) -> list:
                     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
                     if cells:
                         fp = " ".join(cells[:2])
-                        grids_raw.append((fp, cells))
+                        grids_raw.append((fp, pno, cells))
             except Exception:
                 continue
     finally:
         doc.close()
 
-    fp_counts = Counter(fp for fp, _ in grids_raw)
+    fp_counts = Counter(fp for fp, _pno, _ in grids_raw)
     threshold = max(3, total_pages * 0.5)
     running = {fp for fp, c in fp_counts.items() if c >= threshold}
 
-    return [cells for fp, cells in grids_raw if fp not in running]
+    # (page, cells) pairs, so findings can point at the source page
+    return [(pno, cells) for fp, pno, cells in grids_raw if fp not in running]
 def _html_table_grids(qmd_text: str) -> list:
     """One token-bag per top-level HTML table, nested-table text included. Coverage is
     token-overlap, so per-cell granularity isn't needed, and collapsing nested tables
@@ -225,9 +226,9 @@ class TableCoverageCheck:
         # losing half its cells does.
         qmd_tok_sets = [_tokens_of(g) for g in qmd_grids]
         weights, wdefault = _token_weights(qmd_tok_sets)
-        per_table = []           # (i, content, src_cells, matched_tokens, n_src_tokens)
+        per_table = []           # (i, page, content, src_cells, matched_tokens, n_src_tokens)
         total_toks = content_toks = aligned_toks = 0
-        for i, src in enumerate(src_grids, 1):
+        for i, (pno, src) in enumerate(src_grids, 1):
             stoks = _tokens_of(src)
             ntoks = len(stoks)
             matched, content, _used = _union_match(stoks, qmd_tok_sets, weights, wdefault)
@@ -237,20 +238,22 @@ class TableCoverageCheck:
             total_toks += ntoks
             content_toks += content * ntoks
             aligned_toks += aligned * ntoks
-            per_table.append((i, content, src, matched, ntoks))
+            per_table.append((i, pno, content, src, matched, ntoks))
 
         weighted = (content_toks / total_toks) if total_toks else 1.0
         aligned_w = (aligned_toks / total_toks) if total_toks else 1.0
-        simple_avg = sum(t[1] for t in per_table) / len(per_table)
+        simple_avg = sum(t[2] for t in per_table) / len(per_table)
         status = "warn" if weighted < _GLOBAL_MIN else "ok"
 
         # diagnostics for substantial-but-thin tables only (slivers filtered). Severity
         # tracks the overall verdict: FYI when coverage is fine, the warn detail when not.
         sev = "warn" if status == "warn" else "info"
         findings = []
-        for i, content, src, matched, ntoks in per_table:
+        thin = []
+        for i, pno, content, src, matched, ntoks in per_table:
             if ntoks < _MIN_TOKENS or content >= _CELL_HIT:
                 continue
+            thin.append({"table": i, "page": pno + 1, "pct": round(100 * content)})
             missing = []
             for c in dict.fromkeys(src):
                 ct = c.split()
@@ -259,7 +262,7 @@ class TableCoverageCheck:
             findings.append(Finding(
                 f"table {i}: {round(100 * content)}% of words matched"
                 + (f"; e.g. missing {missing[:3]}" if missing else ""),
-                sev, f"table {i}"))
+                sev, f"table {i}, p{pno + 1}"))
 
         wpct = round(100 * weighted, 1)
         apct = round(100 * aligned_w, 1)
@@ -271,5 +274,6 @@ class TableCoverageCheck:
             + (f"; {len(findings)} substantial table(s) below {int(_CELL_HIT*100)}%"
                if findings else ""),
             metric=wpct, findings=findings,
-            detail={"content": wpct, "aligned": apct},
+            detail={"content": wpct, "aligned": apct, "thin": thin,
+                    "n_tables": len(src_grids)},
         )

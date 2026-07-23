@@ -76,12 +76,12 @@ class MathPresenceCheck:
         if qmd < src / 2:
             findings.append(Finding(
                 f"source has ~{src} equation region(s) but the .qmd has only {qmd} "
-                f"math block(s) — equations may have been dropped or rendered as prose",
+                f"math block(s) - equations may have been dropped or rendered as prose",
                 "warn", "math"))
         elif qmd > src * 2:
             findings.append(Finding(
                 f"the .qmd has {qmd} math block(s) for ~{src} source equation region(s) "
-                f"— possible over-detection", "info", "math"))
+                f"- possible over-detection", "info", "math"))
 
         status = "warn" if any(f.severity == "warn" for f in findings) else "ok"
         summary = f"~{src} source equation region(s); {qmd} math block(s) in the .qmd"

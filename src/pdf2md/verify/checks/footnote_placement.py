@@ -61,28 +61,31 @@ _QMD_DEF = re.compile(r"^\[\^([^\]\s]+)\]:", re.MULTILINE)
 
 
 @lru_cache(maxsize=8)
-def _source_footnote_count(pdf_str: str, mtime: float) -> int:
-    """Number of footnote reference marks in the source PDF text, filtering out
-    the affiliation superscripts of the title block, chemical/math superscript
-    runs, and equation-heavy lines that are not prose footnotes."""
-    total = 0
-    for idx, (_, line) in enumerate(pdf_lines(pdf_str)):
+def _source_footnote_count(pdf_str: str, mtime: float) -> tuple:
+    """Footnote reference marks in the source PDF: (count, pages carrying them).
+    Filters out the affiliation superscripts of the title block, chemical/math
+    superscript runs, and equation-heavy lines that are not prose footnotes."""
+    total, pages = 0, []
+    for idx, (pno, line) in enumerate(pdf_lines(pdf_str)):
         if idx < _TITLE_BLOCK_LINES:
             continue                       # title page / author-affiliation block
         if _math_heavy(line):
             continue                       # equations, chemical formulae
-        total += _line_footnote_marks(line)
-        total += len(_CARET_REF.findall(line))
-    return total
+        n = _line_footnote_marks(line) + len(_CARET_REF.findall(line))
+        if n:
+            total += n
+            if pno + 1 not in pages:
+                pages.append(pno + 1)
+    return total, tuple(pages)
 
 
-def _try_source_count(ctx) -> int:
+def _try_source_count(ctx) -> tuple:
     if not (ctx.original_pdf and ctx.original_pdf.exists()):
-        return 0
+        return 0, ()
     try:
         return _source_footnote_count(str(ctx.original_pdf), ctx.original_pdf.stat().st_mtime)
     except Exception:
-        return 0
+        return 0, ()
 
 
 @register
@@ -92,7 +95,7 @@ class FootnotePlacementCheck:
     def applicable(self, ctx) -> bool:
         if not ctx.qmd_text:
             return False
-        return bool(_QMD_REF.search(ctx.qmd_text)) or _try_source_count(ctx) > 0
+        return bool(_QMD_REF.search(ctx.qmd_text)) or _try_source_count(ctx)[0] > 0
 
     def run(self, ctx) -> CheckResult:
         ref_ids = _QMD_REF.findall(ctx.qmd_text)
@@ -102,7 +105,7 @@ class FootnotePlacementCheck:
         resolved = sorted(ref_set & def_ids)
         dangling = sorted(ref_set - def_ids)        # markers with no definition
         orphaned = sorted(def_ids - ref_set)        # definitions nothing points at
-        src_count = _try_source_count(ctx)
+        src_count, src_pages = _try_source_count(ctx)
 
         findings = []
         for fid in dangling:
@@ -120,11 +123,18 @@ class FootnotePlacementCheck:
                 f"has {len(ref_ids)} footnote marker(s)", "warn", "footnotes"))
 
         status = "warn" if findings else "ok"
-        summary = (f"{len(resolved)}/{len(ref_set)} footnote reference(s) resolved"
-                   + (f", {len(dangling)} dangling" if dangling else "")
-                   + (f", {len(orphaned)} orphaned definition(s)" if orphaned else ""))
+        if not ref_set and findings:
+            # "0/0 resolved" reads as fine when it means the opposite: the source has
+            # footnote marks and none survived
+            summary = (f"source has ~{src_count} footnote mark(s); none survived "
+                       f"into the .qmd")
+        else:
+            summary = (f"{len(resolved)}/{len(ref_set)} footnote reference(s) resolved"
+                       + (f", {len(dangling)} dangling" if dangling else "")
+                       + (f", {len(orphaned)} orphaned definition(s)" if orphaned else ""))
         return CheckResult(
             self.name, status, summary,
             metric=f"{len(resolved)}/{len(ref_set)} resolved" if ref_set else None,
             findings=findings,
+            detail={"src_count": src_count, "src_pages": list(src_pages)},
         )

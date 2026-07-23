@@ -30,9 +30,10 @@ def _span_is_mono(span: dict) -> bool:
 
 
 @lru_cache(maxsize=8)
-def _source_code_pages(pdf_str: str, mtime: float) -> int:
-    """Count of source pages carrying a run of monospaced text."""
+def _source_code_pages(pdf_str: str, mtime: float) -> tuple:
+    """(count, page numbers) of source pages carrying a run of monospaced text."""
     pages = 0
+    page_nos = []
     doc = fitz.open(pdf_str)
     try:
         for pno in range(doc.page_count):
@@ -44,18 +45,19 @@ def _source_code_pages(pdf_str: str, mtime: float) -> int:
                             mono += 1
             if mono >= _MONO_SPANS_MIN:
                 pages += 1
+                page_nos.append(pno + 1)
     finally:
         doc.close()
-    return pages
+    return pages, tuple(page_nos)
 
 
-def _try_source_code(ctx) -> int:
+def _try_source_code(ctx) -> tuple:
     if not (_FITZ_AVAILABLE and ctx.original_pdf and ctx.original_pdf.exists()):
-        return 0
+        return 0, ()
     try:
         return _source_code_pages(str(ctx.original_pdf), ctx.original_pdf.stat().st_mtime)
     except Exception:
-        return 0
+        return 0, ()
 
 
 def _qmd_code_blocks(qmd_text: str) -> int:
@@ -78,10 +80,10 @@ class CodeBlockPresenceCheck:
     name = "code_block_presence"
 
     def applicable(self, ctx) -> bool:
-        return bool(ctx.qmd_text) and _try_source_code(ctx) > 0
+        return bool(ctx.qmd_text) and _try_source_code(ctx)[0] > 0
 
     def run(self, ctx) -> CheckResult:
-        src = _try_source_code(ctx)
+        src, src_pages = _try_source_code(ctx)
         qmd = _qmd_code_blocks(ctx.qmd_text)
         preserved = min(src, qmd)
 
@@ -89,12 +91,12 @@ class CodeBlockPresenceCheck:
         if qmd < src / 2:
             findings.append(Finding(
                 f"source has ~{src} page(s) of monospaced/code text but the .qmd has "
-                f"only {qmd} fenced code block(s) — code listings may have been lost",
+                f"only {qmd} fenced code block(s) - code listings may have been lost",
                 "warn", "code"))
         elif qmd > src * 2:
             findings.append(Finding(
                 f"the .qmd has {qmd} fenced code block(s) for ~{src} monospaced source "
-                f"page(s) — possible over-detection", "info", "code"))
+                f"page(s) - possible over-detection", "info", "code"))
 
         status = "warn" if any(f.severity == "warn" for f in findings) else "ok"
         summary = f"~{src} monospaced source page(s); {qmd} fenced code block(s) in the .qmd"
@@ -102,4 +104,5 @@ class CodeBlockPresenceCheck:
             self.name, status, summary,
             metric=f"{preserved}/{src} code blocks preserved",
             findings=findings,
+            detail={"src_pages": list(src_pages), "qmd_blocks": qmd},
         )

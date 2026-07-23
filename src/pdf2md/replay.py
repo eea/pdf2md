@@ -35,10 +35,17 @@ def _parse_verify_report(path: Path) -> dict:
         return out
     text = path.read_text(encoding="utf-8")
     import re
+    # current format: one machine-readable comment near the top
+    mc = re.search(r"<!-- verify: overall=(\w+)((?:\s+[\w_]+=[-\d.]+)*)\s*-->", text)
+    if mc:
+        out["status"] = mc.group(1)
+        for name, val in re.findall(r"([\w_]+)=([-\d.]+)", mc.group(2)):
+            out["metrics"][name] = float(val)
+        return out
+    # older reports: parse the section headers
     m = re.search(r"\*\*Overall:\s*(\w+)\*\*", text)
     if m:
         out["status"] = m.group(1).lower()
-    # "## <icon> <name> — <status>" with a "_metric: <float>_" somewhere in the block
     for hm in re.finditer(r"^##\s+\S+\s+(\w+)\s+—.*?(?=^##|\Z)", text, re.S | re.M):
         block = hm.group(0)
         name = hm.group(1)

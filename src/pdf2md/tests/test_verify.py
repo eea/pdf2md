@@ -174,7 +174,7 @@ class TestTableCoverage:
         from pdf2md.verify.checks import table_coverage as tc
         present = [f"word{i}" for i in range(40)]
         absent = [f"absent{i}" for i in range(40)]      # a whole big table missing
-        monkeypatch.setattr(tc, "_source_grids", lambda p: [present, absent])
+        monkeypatch.setattr(tc, "_source_grids", lambda p: [(0, present), (4, absent)])
         r = tc.TableCoverageCheck().run(self._ctx(tmp_path, self._qmd_with_words(present)))
         assert r.status == "warn"          # weighted ~50% < 85%
         assert r.metric < 85
@@ -190,7 +190,7 @@ class TestTableCoverage:
         from pdf2md.verify.checks import table_coverage as tc
         present = [f"word{i}" for i in range(40)]
         fragment = ["x", "y", "z"]                       # a find_tables sliver (3 tokens)
-        monkeypatch.setattr(tc, "_source_grids", lambda p: [present, fragment])
+        monkeypatch.setattr(tc, "_source_grids", lambda p: [(0, present), (1, fragment)])
         r = tc.TableCoverageCheck().run(self._ctx(tmp_path, self._qmd_with_words(present)))
         assert r.status == "ok"            # weighted ~93% ≥ 85%; sliver can't trip it
         assert r.findings == []            # fragment filtered out of diagnostics (< _MIN_TOKENS)
@@ -282,6 +282,37 @@ def test_write_report(tmp_path):
     assert p.exists() and (tmp_path / "verify.json").exists()
     data = json.loads((tmp_path / "verify.json").read_text())
     assert data["overall"] == "warn" and len(data["checks"]) == 2
+
+
+def test_write_report_format(tmp_path):
+    results = [
+        CheckResult("text_coverage", "warn", "96.5% of source text found", metric=0.965,
+                    detail={"effective": 0.992, "recovered": 10, "missing_count": 16,
+                            "reworded_count": 4, "total": 500, "present": 480,
+                            "clusters": [{"pages": (84, 86), "count": 9,
+                                          "samples": ["Some missing sentence here."],
+                                          "qmd_heading": "Annex 2"}],
+                            "scattered": 7}),
+        CheckResult("table_coverage", "ok", "tables fine", metric=0.98,
+                    detail={"n_tables": 12, "thin": []}),
+        CheckResult("figure_placement", "ok", "80/86 figures placed"),
+    ]
+    meta = {"stem": "doc", "pages": 131, "model": "google/gemini-2.5-flash",
+            "date": "23 Jul 2026", "postfixes": ["tables: re-emitted 2 missing table(s)"]}
+    p = write_report(results, tmp_path, meta=meta)
+    text = p.read_text()
+    # machine-readable line replay depends on
+    assert "<!-- verify: overall=warn" in text and "text_coverage=0.965" in text
+    # no em/en dashes anywhere in generated output
+    assert "—" not in text and "–" not in text
+    # exactly one horizontal separator
+    assert text.count("\n---\n") == 1
+    # verdict icon, issue section, passed table
+    assert "\U0001F7E1" in text and "Annex 2" in text and "figure_placement" not in text
+    # replay can parse it back
+    from pdf2md.replay import _parse_verify_report
+    parsed = _parse_verify_report(p)
+    assert parsed["status"] == "warn" and parsed["metrics"]["text_coverage"] == 0.965
 
 
 # ── HTML-table awareness (complex tables emitted as raw HTML) ─────────────────

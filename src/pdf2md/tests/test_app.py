@@ -36,7 +36,7 @@ def _stub_phases(monkeypatch, *, verify_status="ok", phase2_raises=False, render
             (out_dir / f"{stem}.pdf").write_bytes(b"%PDF-1.4\n")
         return render_ok, "render log"
 
-    def fake_verify(out_dir, stem):
+    def fake_verify(out_dir, stem, meta=None):
         return [
             CheckResult("figure_placement", "ok", "2/2"),
             CheckResult("text_coverage", verify_status, "coverage", metric=97.3),

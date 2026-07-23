@@ -18,7 +18,7 @@ _CODE_MIN_CHARS = 12             # ignore groups smaller than this (stray inline
 _CODE_PROBE_MIN = 8              # min probe length before an in-.qmd presence check counts
 
 
-def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
+def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, meta=None):
     summary = {'postfixes_applied': [], 'cost_usd': 0.0}
     if passes <= 0 or not verify_results:
         return summary
@@ -87,7 +87,9 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1):
                 rendered_pdf=None,
             )
             results = run_verify(ctx)
-            write_report(results, out_dir)
+            report_meta = dict(meta or {})
+            report_meta["postfixes"] = summary["postfixes_applied"]
+            write_report(results, out_dir, meta=report_meta)
             summary['verify_after'] = overall_status(results)
             tc = next((r for r in results if r.name == 'text_coverage'), None)
             tbl = next((r for r in results if r.name == 'table_coverage'), None)

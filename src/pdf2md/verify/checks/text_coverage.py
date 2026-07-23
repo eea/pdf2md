@@ -97,6 +97,52 @@ _LIST_MARKER_RE = re.compile(r"^\s*(?:[•·▪◦‣∙*+-]|o)\s+(?=\S)", re.IG
 _SECTION_NO_RE = re.compile(r"^\s*\d+(?:\.\d+)+\.?\s+(?=\D)")
 
 
+_CLUSTER_GAP = 2      # pages this close belong to the same cluster
+_CLUSTER_MIN = 3      # smaller groups stay in the scattered remainder
+
+
+def _cluster_by_page(located, qmd_text, lines):
+    """Group (page, sentence) misses into page-range clusters for the report.
+
+    Each cluster carries up to two sample sentences and, where it can be worked
+    out, the .qmd heading the content belongs under: we look for a surviving
+    source line from the same pages inside the .qmd and take the heading above
+    it. When nothing nearby survived the heading stays None and the report
+    falls back to the page reference alone.
+    """
+    paged = sorted((p, m) for p, m in located if p is not None)
+    clusters, cur = [], None
+    for p, m in paged:
+        if cur and p - cur["pages"][1] <= _CLUSTER_GAP:
+            cur["pages"][1] = p
+            cur["items"].append(m)
+        else:
+            cur = {"pages": [p, p], "items": [m]}
+            clusters.append(cur)
+    out = []
+    hay = qmd_text.lower()
+    for c in clusters:
+        if len(c["items"]) < _CLUSTER_MIN:
+            continue
+        heading = None
+        page_texts = [t for pg, t in lines if c["pages"][0] <= pg + 1 <= c["pages"][1]]
+        for t in page_texts:
+            probe = " ".join(t.split())[:60].lower()
+            if len(probe) < 40:
+                continue
+            i = hay.find(probe)
+            if i != -1 and hay.find(probe, i + 1) == -1:
+                heads = re.findall(r"^#{1,6}\s+(.+?)\s*$", qmd_text[:i], re.MULTILINE)
+                if heads:
+                    heading = heads[-1].strip()
+                break
+        out.append({"pages": tuple(c["pages"]), "count": len(c["items"]),
+                    "samples": [m[:150] for m in c["items"][:2]], "qmd_heading": heading})
+    out.sort(key=lambda c: -c["count"])
+    scattered = len(paged) - sum(c["count"] for c in out)
+    return {"clusters": out, "scattered": max(scattered, 0)}
+
+
 def _strip_structural_markers(line: str) -> str:
     """Drop leading list bullets and source section numbers before comparing.
 
@@ -247,11 +293,33 @@ class TextCoverageCheck:
                                  if _classify(_ld_split(tokens(m)), full_idx) == "covered")
         effective = round(100 * (present + recovered_gaps) / total, 1) if total else 100.0
 
-        findings = [Finding(f"missing: {m[:120]}", "warn") for m in missing[:_MAX_LISTED]]
+        # map each flagged sentence back to a source page so the reader can find it
+        norm_lines = [(pg, normalize(txt)) for pg, txt in lines]
+
+        def _page_of(sent):
+            key = normalize(sent)[:40]
+            if not key:
+                return None
+            for pg, nl in norm_lines:
+                if key in nl or (len(nl) >= 15 and nl in normalize(sent)):
+                    return f"~page {pg + 1}"
+            return None
+
+        # cluster the missing sentences by source page, so the report can say
+        # "pages 87-90 (~18 sentences)" instead of listing forty fragments
+        located = []
+        for m in missing:
+            loc = _page_of(m)
+            located.append((int(loc.rsplit(" ", 1)[1]) if loc else None, m))
+        clusters = _cluster_by_page(located, ctx.qmd_text, lines)
+
+        findings = [Finding(f"missing: {m[:120]}", "warn", _page_of(m))
+                    for m in missing[:_MAX_LISTED]]
         if len(missing) > _MAX_LISTED:
             findings.append(Finding(f"… and {len(missing) - _MAX_LISTED} more missing", "info"))
         for m in reworded[:_MAX_LISTED]:
-            findings.append(Finding(f"reworded (present, not verbatim): {m[:110]}", "info"))
+            findings.append(Finding(f"reworded (present, not verbatim): {m[:110]}",
+                                    "info", _page_of(m)))
         if len(reworded) > _MAX_LISTED:
             findings.append(Finding(f"… and {len(reworded) - _MAX_LISTED} more reworded", "info"))
 
@@ -264,5 +332,7 @@ class TextCoverageCheck:
             f"text coverage {coverage}% in-place ({present}/{total} present; "
             f"{len(missing)} missing{reworded_note}){eff_note}",
             metric=coverage, findings=findings,
-            detail={"effective": effective, "recovered": recovered_gaps},
+            detail={"effective": effective, "recovered": recovered_gaps,
+                    "missing_count": len(missing), "reworded_count": len(reworded),
+                    "total": total, "present": present, **clusters},
         )

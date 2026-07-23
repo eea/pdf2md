@@ -68,6 +68,6 @@ class StructuralCountsCheck:
         # a target the .qmd is expected to match. table_coverage owns real fidelity.
         src_desc = f"~{src_tables} source region(s)" if src_tables >= 0 else "source ?"
         summary = (f"figures {qmd_figs}/{det_figs}; "
-                   f"tables {qmd_tables} in .qmd ({src_desc}, rough — see table_coverage)")
+                   f"tables {qmd_tables} in .qmd ({src_desc}, rough - see table_coverage)")
         status = "warn" if findings else "ok"
         return CheckResult(self.name, status, summary, findings=findings)
