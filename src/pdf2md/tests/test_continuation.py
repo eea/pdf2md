@@ -214,3 +214,58 @@ def test_continuation_input_stays_bounded(monkeypatch):
     assert max(cont_sizes) < llm_client._TAIL_CHARS + 2000
     # …and does not creep upward as accumulated output balloons
     assert max(cont_sizes) - min(cont_sizes) < 2000
+
+
+# ── runaway repetition guard ─────────────────────────────────────────────────────
+
+from pdf2md.llm_client import _excise_loops, _loop_cut  # noqa: E402
+
+
+def test_loop_cut_finds_active_line_loop():
+    head = "# Doc\n\nReal paragraph one here.\n\nReal paragraph two here.\n\n"
+    loop = "\n".join(["<td>-</td>"] * 300)
+    cut = _loop_cut(head + loop)
+    assert cut is not None
+    # keeps at most one unit past the loop start
+    assert len(head) <= cut <= len(head) + len("<td>-</td>\n") + 1
+
+
+def test_loop_cut_finds_single_line_dash_loop():
+    # regression: a real runaway was one giant line of dashes, no newlines at all
+    head = "intro paragraph text.\n"
+    cut = _loop_cut(head + "---|" * 2000)
+    assert cut is not None and cut <= len(head) + 8
+
+
+def test_loop_cut_none_on_normal_text():
+    text = "# Doc\n\n" + "\n\n".join(f"Distinct paragraph number {i}." for i in range(120))
+    assert _loop_cut(text) is None
+
+
+def test_loop_cut_tolerates_legitimate_small_repeats():
+    text = ("x" * 900) + "\n\n" + "\n".join(["<td>-</td>"] * 8) + "\n\nafter " + "y" * 900
+    assert _loop_cut(text) is None
+
+
+def test_excise_removes_recovered_midfile_loop_keeps_tail():
+    # a loop that self-terminated: run of identical lines followed by good content
+    head = "before content.\n"
+    loop = "\n".join(["<td>-</td>"] * 200) + "\n"
+    tail = "after content that must survive.\n"
+    cleaned, removed = _excise_loops(head + loop + tail)
+    assert removed > 0
+    assert "after content that must survive." in cleaned
+    assert cleaned.count("<td>-</td>") == 1          # one unit kept
+
+
+def test_excise_shrinks_intra_line_loop():
+    ln = "start " + "---|" * 5000
+    cleaned, removed = _excise_loops("a\n" + ln + "\nb")
+    assert removed > 10000
+    assert "a\n" in cleaned and "\nb" in cleaned
+
+
+def test_excise_leaves_normal_text_untouched():
+    text = "# Doc\n\n" + "\n\n".join(f"Paragraph {i} with content." for i in range(50))
+    cleaned, removed = _excise_loops(text)
+    assert removed == 0 and cleaned == text

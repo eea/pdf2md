@@ -27,6 +27,9 @@ MAX_ATTEMPTS = 4
 
 # HTTP status codes / strings that trigger specific handling
 _TRANSIENT_STATUSES = {502, 503, 529}
+# finish reasons where the model refused rather than failed, so retrying won't help.
+# Gemini reports copyright blocking as RECITATION, others say content_filter.
+_BLOCKED_FINISH = ("recitation", "content_filter", "safety", "prohibited_content", "blocklist")
 _TRANSIENT_STRINGS = ("overloaded", "unavailable", "bad gateway", "service unavailable")
 _CONTEXT_STRINGS = ("maximum context", "too many tokens", "context length", "context window")
 
@@ -188,6 +191,92 @@ def _build_continue_message(outline: str, tail: str, total_pages: int = 0) -> st
     )
 
 
+_MAX_REPEAT_RUN = 30        # identical consecutive lines; real docs stay under ~10
+_MAX_CHARS_PER_PAGE = 6000  # sanity bound, real docs run ~2300 chars/page
+_LOOP_WINDOW = 2000
+_LOOP_MAX_PERIOD = 600
+_LOOP_MAX_CUTS = 3          # resume attempts after cutting a loop
+
+
+def _loop_cut(text: str):
+    """Detect a repetition loop at the end of `text`.
+
+    The model occasionally gets stuck repeating a short pattern (a table cell, a run
+    of dashes) until the token cap kicks in, which leaves the loop at the end of the
+    chunk. Works on characters rather than lines because the pattern often contains
+    no newline at all. Returns the offset just past the first copy of the repeating
+    unit (so a legit first instance survives), or None.
+    """
+    n = len(text)
+    window = min(n, _LOOP_WINDOW)
+    if window < 800:
+        return None
+    w = text[-window:]
+    if not w.strip():
+        return None
+    for p in range(1, _LOOP_MAX_PERIOD + 1):
+        if window - p < window // 2:
+            break
+        if w[p:] == w[:-p]:
+            j = n - window
+            while j > 0 and text[j - 1] == text[j - 1 + p]:
+                j -= 1
+            return j + p
+    return None
+
+
+def _excise_loops(text: str):
+    """Strip repetition loops anywhere in `text`, keeping one copy of each unit.
+
+    Needed on top of _loop_cut because the model can also recover mid-generation,
+    leaving the loop buried between stretches of good output. Returns
+    (cleaned_text, chars_removed).
+    """
+    removed = 0
+    # multi-line runs: keep a single line of any run past _MAX_REPEAT_RUN
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        s = lines[i].strip()
+        j = i
+        while j + 1 < len(lines) and lines[j + 1].strip() == s:
+            j += 1
+        if s and (j - i + 1) >= _MAX_REPEAT_RUN:
+            out.append(lines[i])
+            removed += sum(len(lines[k]) + 1 for k in range(i + 1, j + 1))
+        else:
+            out.extend(lines[i:j + 1])
+        i = j + 1
+    text = "\n".join(out)
+
+    # intra-line loops: a short unit repeated massively inside one enormous line
+    def _shrink(m):
+        nonlocal removed
+        removed += len(m.group(0)) - len(m.group(1))
+        return m.group(1)
+
+    cleaned = []
+    for ln in text.split("\n"):
+        if len(ln) > 4000:
+            ln = re.sub(r"(.{2,60}?)(?:\1){30,}", _shrink, ln)
+        cleaned.append(ln)
+    return "\n".join(cleaned), removed
+
+
+def _save_runaway(text: str, filename: str) -> str:
+    """Dump looping output to a temp file so the failure can be inspected later."""
+    try:
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".runaway.txt", delete=False,
+            prefix=Path(filename).stem + "-")
+        f.write(text[-100_000:])
+        f.close()
+        return f.name
+    except Exception:                       # noqa: BLE001 — diagnostics are best-effort
+        return ""
+
+
 def _is_truncated(finish) -> bool:
     """Did the model hit its output-token ceiling? ('length' via OpenRouter, 'MAX_TOKENS' native.)"""
     return bool(finish and str(finish).lower() in ("length", "max_tokens"))
@@ -252,6 +341,7 @@ def call_openrouter(
     stream: bool = False,
     on_delta=None,
     max_tokens: int = None,
+    temperature: float = None,   # None = provider default; 0 = greedy (least random)
     total_pages: int = 0,   # source page count; fed to continuations to prevent early stop
 ):
     """POST to OpenRouter chat-completions, return the model's text response.
@@ -286,6 +376,7 @@ def call_openrouter(
     ]
 
     accumulated, merged_usage, prev_safe = "", {}, None
+    loop_cuts = 0
     for i in range(_MAX_CONTINUATIONS):
         messages = list(base_messages)
         if accumulated:
@@ -299,6 +390,8 @@ def call_openrouter(
             "max_tokens": cap,
             "plugins": [{"id": "file-parser", "pdf": {"engine": engine}}],
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         if stream:
             payload["stream"] = True
         content, usage, finish = _post_with_retries(
@@ -306,7 +399,36 @@ def call_openrouter(
             stream=stream, on_delta=on_delta, allow_truncation=True)
         _merge_usage(merged_usage, usage)
         content = _dedup_seam(accumulated, content or "")
+        prev_len = len(accumulated)
         accumulated += content
+
+        # Repetition guard: cut an active loop and let the next continuation resume
+        # past it (a retry usually escapes). The seam dedup can't help here — the
+        # loop happens inside a single generation, not at the seam.
+        cut = _loop_cut(accumulated)
+        if cut is not None:
+            loop_cuts += 1
+            dump = _save_runaway(accumulated, filename)
+            log.error("Repetition loop in %s — cut %d char(s), resuming (%d/%d)%s",
+                      filename, len(accumulated) - cut, loop_cuts, _LOOP_MAX_CUTS,
+                      "; dump: " + dump if dump else "")
+            accumulated = accumulated[:cut].rstrip() + "\n"
+            if loop_cuts >= _LOOP_MAX_CUTS:
+                break
+            continue
+        if total_pages and len(accumulated) > total_pages * _MAX_CHARS_PER_PAGE:
+            dump = _save_runaway(accumulated, filename)
+            log.error("Output for %s hit the size cap (%d chars, ~%d pages); stopping%s",
+                      filename, len(accumulated), total_pages,
+                      "; dump: " + dump if dump else "")
+            if prev_len > 0:
+                accumulated = accumulated[:prev_len].rstrip() + "\n"
+            else:
+                # first chunk already over the cap: keep a prefix, not nothing
+                keep = total_pages * (_MAX_CHARS_PER_PAGE // 2)
+                safe, _c = _trim_to_block_boundary(accumulated[:keep])
+                accumulated = safe or accumulated[:keep]
+            break
 
         if not _is_truncated(finish):
             break
@@ -325,6 +447,10 @@ def call_openrouter(
                 "incomplete; verify text_coverage will flag missing content.",
                 _MAX_CONTINUATIONS, filename)
 
+    # final sweep for loops the model recovered from on its own
+    accumulated, excised = _excise_loops(accumulated)
+    if excised:
+        log.warning("Excised %d char(s) of repetition loops from %s", excised, filename)
     return (accumulated, merged_usage) if return_usage else accumulated
 
 
@@ -559,10 +685,31 @@ def _post_with_retries(*, api_key: str, payload: dict, label: str, timeout: int,
                     content = (choice.get("message") or {}).get("content")
                     finish = choice.get("finish_reason") or choice.get("native_finish_reason")
                 _log_usage(usage, label)
+                # guardrail refusal (Gemini: RECITATION) — the model won't reproduce
+                # this document, so don't burn retries on it
+                if finish and str(finish).lower() in _BLOCKED_FINISH:
+                    raise RuntimeError(
+                        f"{label}: generation blocked by the model's content guardrails "
+                        f"(finish_reason={finish}). This typically means copyright/"
+                        f"recitation protection refused to reproduce the document — "
+                        f"common for published PDFs on some models. Use a model without "
+                        f"recitation blocking, e.g. google/gemini-2.5-flash."
+                    )
                 # Truncation (hit output-token ceiling): conversion passes
                 # allow_truncation to continue across calls; detect/postfix have small
                 # bounded outputs, so a truncated JSON/patch there is a real error.
                 if _is_truncated(finish) and not allow_truncation:
+                    spent = (usage or {}).get("completion_tokens", 0)
+                    if not (content or "").strip() and spent > 500:
+                        # whole budget spent on hidden reasoning (or guardrails ate
+                        # the text); a retry would do the same
+                        raise RuntimeError(
+                            f"{label}: the model consumed {spent} completion tokens but "
+                            f"returned no text. Its reasoning may have exhausted the "
+                            f"budget, or content/copyright guardrails suppressed the "
+                            f"output. Try a non-reasoning model such as "
+                            f"google/gemini-2.5-flash."
+                        )
                     raise RuntimeError(
                         f"Output truncated for {label}: the model hit its output-token "
                         f"limit (finish_reason={finish}) and returned an incomplete "
@@ -574,11 +721,20 @@ def _post_with_retries(*, api_key: str, payload: dict, label: str, timeout: int,
                 # Empty 200: thinking models (e.g. gemini-2.5-pro) intermittently
                 # return no content. A stream yielding zero content tokens is the
                 # same failure; retry.
+                spent = (usage or {}).get("completion_tokens", 0)
                 log.warning(
-                    "[attempt %d/%d] Empty 200 response (finish_reason=%s) — retrying",
-                    attempt, MAX_ATTEMPTS, finish,
+                    "[attempt %d/%d] Empty 200 response (finish_reason=%s, "
+                    "completion_tokens=%s) — retrying",
+                    attempt, MAX_ATTEMPTS, finish, spent,
                 )
-                last_exc = RuntimeError(f"empty response (finish_reason={finish})")
+                hint = ""
+                if spent and spent > 500:
+                    # tokens billed but nothing came back — reasoning burn or guardrails
+                    hint = (f" The model consumed {spent} completion tokens yet returned "
+                            f"no text — its reasoning may have exhausted the budget, or "
+                            f"content/copyright guardrails suppressed the output. Try a "
+                            f"non-reasoning model such as google/gemini-2.5-flash.")
+                last_exc = RuntimeError(f"empty response (finish_reason={finish}).{hint}")
                 time.sleep(3 * attempt)
                 continue
 
