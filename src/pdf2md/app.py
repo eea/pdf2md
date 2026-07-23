@@ -18,6 +18,7 @@ from pathlib import Path
 from .cost import fmt_eur
 from .cover import DEFAULT_COVER_MODEL
 from .estimate import estimate_file, load_calibration
+from .llm_client import check_model_fit
 from .phase1 import run_phase1
 from .phase2 import run_phase2
 from .postfix import run_postfix
@@ -92,6 +93,7 @@ class Events:
     # per file
     def file_start(self, pdf, index, total): ...
     def estimate_done(self, est): ...
+    def model_notes(self, notes): ...
     def file_done(self, result): ...
     # phase 1
     def chrome_done(self, report): ...
@@ -397,6 +399,20 @@ def convert_one(
                 "model's context window and convert incompletely. If the output looks "
                 "truncated, split the source into sections and convert each.",
                 pdf.name, estimate.get("pages", 0), int(est_doc_tokens / 1000))
+
+        # pre-flight model check: tell the user upfront instead of failing mid-run
+        notes = check_model_fit(model, estimate.get("pages", 0))
+        if notes:
+            events.model_notes(notes)
+            for n in notes:
+                (log.error if n["level"] == "error" else
+                 log.warning if n["level"] == "warn" else log.info)("%s", n["msg"])
+            blockers = [n["msg"] for n in notes if n["level"] == "error"]
+            if blockers:
+                result.status = "skip"
+                result.error = blockers[0]
+                events.file_done(result)
+                return result
         if (max_cost_per_file is not None and not allow_over_budget
                 and estimate["expected_usd"] > max_cost_per_file):
             result.status = "skip"

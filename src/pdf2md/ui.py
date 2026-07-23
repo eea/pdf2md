@@ -220,6 +220,17 @@ class RichUI(Events):
         self._set_phase("Removing headers/footers…")
         self._refresh()
 
+    def model_notes(self, notes):
+        """Print a small box above the live area with the pre-flight model warnings."""
+        if not notes:
+            return
+        icon = {"error": "[red]✗[/]", "warn": "[yellow]⚠[/]", "info": "[cyan]ℹ[/]"}
+        body = "\n".join(f"{icon.get(n['level'], '·')} {n['msg']}" for n in notes)
+        worst = ("red" if any(n["level"] == "error" for n in notes)
+                 else "yellow" if any(n["level"] == "warn" for n in notes) else "cyan")
+        self.con.print(Panel(Text.from_markup(body), title="model check",
+                             title_align="left", border_style=worst, padding=(0, 1)))
+
     def chrome_done(self, report):
         self._setup.append(f"[green]✔[/] headers [dim]({report.get('images_removed', 0)})[/]")
         self._set_phase("Reading cover page…")

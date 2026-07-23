@@ -82,6 +82,22 @@ Then check `verify_report.md` — the document is designed to surface failures i
 
 `verify=fail` on figure placement. Stick to multimodal models.
 
+### Known model pitfalls
+
+The tool checks the chosen model against OpenRouter's metadata before spending
+anything (file input support, context window vs. document size) and prints a
+`model check` box when something won't work. Two pitfalls it can only warn about:
+
+- **Copyright / recitation guardrails.** Some models (seen with gemini-pro
+  variants) refuse to reproduce text from published documents. The failure is
+  confusing: no clear error, just near-zero coverage or empty responses while
+  tokens are still billed. If a strong model produces inexplicably bad coverage
+  on a published PDF, suspect this first and switch models —
+  `google/gemini-2.5-flash` has not shown this behaviour.
+- **Reasoning models burning the budget.** Thinking models (gemini-pro, gpt-5)
+  can spend thousands of completion tokens on hidden reasoning and return little
+  or no text at modest `max_tokens`. The error message says so when it happens.
+
 ## Updating
 
 ```bash

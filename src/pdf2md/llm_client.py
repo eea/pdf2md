@@ -504,6 +504,12 @@ def _fetch_openrouter_limits(api_key: str = "") -> dict:
         max_tok = tp.get("max_completion_tokens")
         if max_tok:
             limits[m["id"]] = max_tok
+        # capability metadata for the pre-flight model check
+        meta = limits.setdefault("_meta", {})
+        meta[m["id"]] = {
+            "modalities": (m.get("architecture") or {}).get("input_modalities") or [],
+            "context_length": m.get("context_length"),
+        }
 
     # Persist into config.json under model_limits key
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -520,6 +526,50 @@ def _fetch_openrouter_limits(api_key: str = "") -> dict:
         pass
 
     return limits
+
+
+# rough tokens per source page, for context-fit estimates (measured ~800 on our docs)
+_TOKENS_PER_PAGE = 800
+_GUARDRAIL_NOTE_PAGES = 100   # long published docs: show the copyright-guardrail note
+
+
+def check_model_fit(model: str, pages: int = 0, limits: dict = None) -> list:
+    """Sanity-check --model against the cached OpenRouter metadata, before any spend.
+
+    Returns a list of {"level": "error"|"warn"|"info", "msg": ...} for the CLI/UI to
+    show. `limits` is injectable for tests.
+    """
+    notes = []
+    if limits is None:
+        limits = _fetch_openrouter_limits()
+    meta = (limits.get("_meta") or {}).get(model)
+
+    if meta is not None:
+        mods = meta.get("modalities") or []
+        if mods and "file" not in mods:
+            notes.append({"level": "error", "msg": (
+                f"{model} does not accept file input (supports: {', '.join(mods)}) — "
+                f"it cannot read PDFs. Use a file-capable model such as "
+                f"google/gemini-2.5-flash.")})
+        ctx = meta.get("context_length")
+        if ctx and pages and pages * _TOKENS_PER_PAGE > ctx * 0.9:
+            notes.append({"level": "error", "msg": (
+                f"~{pages} pages (~{pages * _TOKENS_PER_PAGE // 1000}k tokens) will not "
+                f"fit {model}'s {ctx // 1000}k-token context window — the document is "
+                f"too long for this model.")})
+
+    # provider quirks the metadata doesn't expose
+    if model.startswith("anthropic/") and pages > 100:
+        notes.append({"level": "warn", "msg": (
+            f"Anthropic models reject PDFs over 100 pages (this one has {pages}) — "
+            f"the conversion will likely fail.")})
+    if pages > _GUARDRAIL_NOTE_PAGES:
+        notes.append({"level": "info", "msg": (
+            "Long published documents can trip copyright/recitation guardrails on some "
+            "models (seen with gemini-pro variants): coverage collapses with no clear "
+            "error. If that happens, switch models — google/gemini-2.5-flash has not "
+            "shown this behaviour.")})
+    return notes
 
 
 def _model_max_tokens(model: str) -> int:
