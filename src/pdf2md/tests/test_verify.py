@@ -116,6 +116,68 @@ class TestFigurePlacementCheck:
         msgs = " ".join(f.message for f in r.findings)
         assert "FIG_2" in msgs and "FIG_9" in msgs
 
+    def test_no_detections_falls_back_to_media_dir(self, tmp_path):
+        # detections.json gone (cleaned-up / improve-only rerun): crops on disk
+        # are the inventory — no "unknown crop" spam, no misleading "0/0" summary
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        (tmp_path / "img-a.png").write_bytes(b"x")
+        qmd = "![cap](dir-media/img-a.png)\n"
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, []))
+        assert r.status == "ok"
+        assert "no detection inventory" in r.summary and "1 image reference" in r.summary
+
+    def test_no_detections_missing_file_still_warns(self, tmp_path):
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        qmd = "![cap](dir-media/img-gone.png)\n"
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, []))
+        assert r.status == "warn"
+        assert any("img-gone.png" in f.message for f in r.findings)
+
+
+# ── footnote_placement mark counting ─────────────────────────────────────────────
+
+class TestFootnoteMarkCounting:
+    def test_unit_superscripts_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("6,002,168 km² (covering the EEA-38 + UK)") == 0
+        assert _line_footnote_marks("Sealed: 0 m² and 90,000km² grouped") == 0
+        assert _line_footnote_marks("a volume of 3 m³ was measured") == 0
+
+    def test_real_footnote_mark_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("the nomenclature³ was applied") == 1
+        assert _line_footnote_marks("see the guidance¹ and annex") == 1
+
+    def test_exponent_on_symbol_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("with a R² higher than 0.9") == 0
+        assert _line_footnote_marks("(σ⁰) of wet snow in comparison") == 0
+
+    def test_math_caret_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _CARET_REF
+        assert not _CARET_REF.findall("(floor(B/2^7) %% 2 == 0)")
+        assert _CARET_REF.findall("as noted^1 in the manual")
+
+
+# ── math_presence line classification ────────────────────────────────────────────
+
+class TestMathLineClassification:
+    def test_real_equation_counts(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        assert _line_is_math("σ = √(∑ w² σ²)")
+        assert _line_is_math("x = ∫ f(t) dt + ε")
+        assert _line_is_math("$$\\sigma = 1$$")
+
+    def test_error_bar_prose_not_math(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        # accuracy prose with ± glyphs — reads as math on a raw symbol count
+        assert not _line_is_math("89.9% (± 1.90%) in Italy-Malta, 89.9% (± 1.50%) in Portugal")
+
+    def test_table_row_with_set_notation_not_math(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        assert not _line_is_math("| Broadleaved trees | Water ∪ Biotic ∪ Abiotic | NO |")
+        assert not _line_is_math("<td>Water ∪ Biotic ∪ Abiotic</td>")
+
 
 # ── structural_counts (qmd table counter) ────────────────────────────────────────
 
@@ -282,6 +344,37 @@ def test_write_report(tmp_path):
     assert p.exists() and (tmp_path / "verify.json").exists()
     data = json.loads((tmp_path / "verify.json").read_text())
     assert data["overall"] == "warn" and len(data["checks"]) == 2
+
+
+def test_report_folds_before_after_repair_delta(tmp_path):
+    # the single verify report must carry the before→after coverage inline
+    # (no separate postfix_report.md) and print the FINAL numbers
+    results = [
+        CheckResult("text_coverage", "warn", "…", metric=99.2,
+                    detail={"missing_count": 5, "total": 354}),
+        CheckResult("table_coverage", "ok", "…", metric=95.9, detail={"n_tables": 8}),
+    ]
+    meta = {"stem": "d", "postfixes": ["missing_text: 8 items recovered from 6 pages"],
+            "text_cov_before": 98.6, "table_cov_before": 95.1}
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    assert "text 98.6% → 99.2%" in text and "tables 95.1% → 95.9%" in text
+    assert "already include automatic repairs" in text
+    assert "postfix_report.md" not in text          # no pointer to a second file
+    assert not (tmp_path / "postfix_report.md").exists()
+
+
+def test_write_report_header_costs(tmp_path):
+    results = [CheckResult("a", "ok", "fine")]
+    meta = {"stem": "doc", "pages": 131, "model": "m", "date": "23 Jul 2026",
+            "cost_convert": 4.59, "cost_repair": 0.22}
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    header = text.splitlines()[2]
+    assert "conversion" in header and "repair" in header
+    assert "131 pages" in header
+    # repair bit is dropped when nothing was repaired
+    meta.pop("cost_repair")
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    assert "conversion" in text.splitlines()[2] and "repair" not in text.splitlines()[2]
 
 
 def test_write_report_format(tmp_path):

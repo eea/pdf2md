@@ -18,7 +18,14 @@ _SUPER_DIGITS = set("⁰¹²³⁴⁵⁶⁷⁸⁹")
 _SUPER_OTHER = set("⁺⁻⁼⁽⁾ⁿⁱᵃᵇᶜᵈᵉ")
 _SUB_CHARS = set("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ")
 _SUPERSUB = _SUPER_DIGITS | _SUPER_OTHER | _SUB_CHARS
-_CARET_REF = re.compile(r"\^\d+")
+# caret form ^1 — but not math exponentiation (2^7, (x)^2): no digit/paren before
+_CARET_REF = re.compile(r"(?<![\d)])\^\d+")
+# area/volume units — km², m³ etc. read as lone superscript digits but are never
+# footnote marks (observed: a units-heavy report scored "~11 footnote marks", all km²/m²)
+_UNIT_SUPER = re.compile(r"(?<![a-zA-Z])[kcdm]?m[²³]")
+# a superscript on a single-letter symbol (R², σ⁰, x²) is an exponent: real footnote
+# marks attach to multi-letter words ("nomenclature³")
+_SINGLE_LETTER_BEFORE = re.compile(r"(?:^|[^\w])[A-Za-zα-ωΑ-Ω]$")
 
 # lines above this index are the title page / author-affiliation block, where
 # superscripts mark affiliations (¹²) rather than footnotes
@@ -40,6 +47,7 @@ def _line_footnote_marks(line: str) -> int:
     """Count lone superscript digits in a line. A superscript that is part of a
     contiguous super/subscript run (affiliation ¹², chemical ²²⁷₉₀) is skipped;
     only an isolated superscript digit reads as a real footnote reference."""
+    line = _UNIT_SUPER.sub("", line)      # km², m³ … are units, not footnotes
     n, i, count = len(line), 0, 0
     while i < n:
         if line[i] in _SUPERSUB:
@@ -47,7 +55,8 @@ def _line_footnote_marks(line: str) -> int:
             while j < n and line[j] in _SUPERSUB:
                 j += 1
             run = line[i:j]
-            if len(run) == 1 and run in _SUPER_DIGITS:
+            if (len(run) == 1 and run in _SUPER_DIGITS
+                    and not _SINGLE_LETTER_BEFORE.search(line[:i])):
                 count += 1
             i = j
         else:

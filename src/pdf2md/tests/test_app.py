@@ -230,20 +230,6 @@ class TestLargeDocWarning:
         assert not any("very large" in r.message for r in caplog.records)
 
 
-class TestPostfixReport:
-    def test_write_postfix_report_shows_before_after_and_effective(self, tmp_path):
-        r = app.FileResult(pdf=tmp_path / "d.pdf", stem="d", out_dir=tmp_path,
-                           text_cov_before=96.6, text_cov=96.5, text_cov_effective=98.2,
-                           postfix_recovered=12, table_cov_before=90.0, table_cov=91.0,
-                           postfixes_applied=["missing_text: 12 items recovered from 5 pages"])
-        p = app._write_postfix_report(r, tmp_path)
-        txt = p.read_text()
-        assert p.name == "postfix_report.md"
-        assert "96.6%" in txt and "96.5%" in txt              # before, after in-place
-        assert "98.2% (+12 recovered)" in txt                  # effective
-        assert "🔧 missing_text: 12 items recovered" in txt    # fix log
-
-
 class TestScaffolding:
     def test_ensure_scaffolding_creates_project(self, tmp_path):
         out_root = tmp_path / "out"

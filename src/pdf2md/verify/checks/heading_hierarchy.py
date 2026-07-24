@@ -49,7 +49,13 @@ def _try_source_titles(ctx) -> tuple:
 
 def _qmd_headings(qmd_text: str) -> list:
     body = _FRONTMATTER_RE.sub("", qmd_text, count=1)
-    return [normalize(m.group(2)) for m in _HEADING_RE.finditer(body) if normalize(m.group(2))]
+    out = []
+    for m in _HEADING_RE.finditer(body):
+        # drop Quarto anchor attrs ("Scope {#sec-1-2}") — they'd pollute matching
+        t = normalize(re.sub(r"\{[^}]*\}", " ", m.group(2)))
+        if t:
+            out.append(t)
+    return out
 
 
 def _fuzzy(text: str) -> str:

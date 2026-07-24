@@ -13,8 +13,9 @@ log = logging.getLogger(__name__)
 
 # body figure: ![caption](FIG_3)
 _FIG_IMG_RE = re.compile(r"!\[(.+?)\]\s*\.?\s*\(\s*(FIG_(\d+))[^)]*\)")
-# figure inside a raw-HTML table cell: <img src="FIG_3" …>
-_FIG_HTML_RE = re.compile(r'(<img\b[^>]*\bsrc\s*=\s*["\'])\s*(FIG_(\d+))\s*(["\'])', re.IGNORECASE)
+# figure inside a raw-HTML table cell: <img src="FIG_3" …> (whole tag captured, so
+# an unresolvable token can be replaced by a marker instead of a broken <img>)
+_FIG_HTML_RE = re.compile(r'(<img\b[^>]*\bsrc\s*=\s*["\'])\s*(FIG_(\d+))\s*(["\'][^>]*/?>)', re.IGNORECASE)
 
 
 def _rel(file_name: str, qmd_path: Path, media_dirname: str) -> str:
@@ -55,8 +56,10 @@ def resolve_fig_tokens(body: str, figures: list, qmd_path: Path, media_dirname: 
             resolved.append(token)
             return f"{prefix}{_rel(fig['file'], qmd_path, media_dirname)}{suffix}"
         hallucinated.append(token)
-        log.warning("Converter referenced %s (in HTML) with no matching detection", token)
-        return f'{prefix}{token}-NOT-FOUND{suffix}'
+        log.warning("Converter referenced %s (in HTML) with no matching detection; "
+                    "tag replaced by a marker", token)
+        # a broken <img src=…> renders as a dead image box; a text marker doesn't
+        return f"*⚠ figure not found ({token})*"
 
     new_body = _FIG_IMG_RE.sub(_sub, body)
     new_body = _FIG_HTML_RE.sub(_sub_html, new_body)
@@ -95,6 +98,137 @@ def resolve_fig_tokens(body: str, figures: list, qmd_path: Path, media_dirname: 
         len(resolved), len(hallucinated), len(unreferenced),
     )
     return new_body, report
+
+
+# ── Adoption of model-found images ──────────────────────────────────────────────
+# The converter sees rasters detection never stamped (tiny colour swatches inside
+# tables, icons) and continues the FIG numbering for them. Those invented tokens
+# mark where a real image belongs, so before treating them as hallucinations we
+# try to crop the matching undetected raster and adopt it as a regular figure.
+
+_ANY_FIG_RE = re.compile(r"FIG_(\d+)")
+_MIN_ADOPT_PT = 3.0        # ignore sub-3pt slivers (rules, underline artifacts)
+_MAX_ADOPT_FILL_PT = 150   # vector fills above this are shading/backgrounds, not swatches
+_ADOPT_DPI = 200
+
+
+def _plain_context(body: str, pos: int, span: int = 200) -> str:
+    """Plain lowercase text preceding pos: tags/markdown stripped, whitespace folded."""
+    chunk = body[max(0, pos - span):pos]
+    chunk = re.sub(r"<[^>]+>", " ", chunk)
+    chunk = re.sub(r"[|!\[\]()*#`>-]", " ", chunk)
+    return " ".join(chunk.lower().split())
+
+
+def adopt_unstamped_figures(body: str, figures: list, source_pdf: Path,
+                            media_dir: Path) -> int:
+    """Crop images the converter referenced beyond the detected set and add them
+    to `figures` (mutated in place) so the normal resolver places them.
+
+    Per stray token: locate its source page (context text match, falling back to
+    the nearest detected token's page), then hand out that page's undetected
+    rasters in reading order. Unmatched tokens are left for the marker path.
+    Returns the number of figures adopted."""
+    known = {f.get("fig_id") for f in figures}
+    strays = []                     # (first position, fig_id) in document order
+    seen = set()
+    for m in _ANY_FIG_RE.finditer(body):
+        fid = m.group(0)
+        if fid not in known and fid not in seen:
+            seen.add(fid)
+            strays.append((m.start(), fid))
+    if not strays or not source_pdf or not source_pdf.exists():
+        return 0
+
+    try:
+        import fitz
+    except ImportError:
+        return 0
+    import hashlib
+
+    page_of_known = {f["fig_id"]: f.get("page") for f in figures
+                     if f.get("fig_id") and f.get("page") is not None}
+    doc = fitz.open(str(source_pdf))
+    try:
+        page_texts = {}
+
+        def _page_text(pno):
+            if pno not in page_texts:
+                page_texts[pno] = " ".join(doc[pno].get_text().lower().split())
+            return page_texts[pno]
+
+        def _locate(pos: int):
+            ctx = _plain_context(body, pos)[-60:]
+            if len(ctx) >= 20:
+                for pno in range(doc.page_count):
+                    if ctx in _page_text(pno):
+                        return pno
+            # fallback: page of the nearest preceding detected token
+            for m in reversed(list(_ANY_FIG_RE.finditer(body, 0, pos))):
+                p = page_of_known.get(m.group(0))
+                if p is not None:
+                    return p
+            return None
+
+        # strays grouped per located page, document order preserved
+        by_page = {}
+        for pos, fid in strays:
+            pno = _locate(pos)
+            if pno is not None and 0 <= pno < doc.page_count:
+                by_page.setdefault(pno, []).append(fid)
+
+        adopted = 0
+        for pno, fids in by_page.items():
+            page = doc[pno]
+            detected = [fitz.Rect(f["bbox"]) for f in figures
+                        if f.get("page") == pno and f.get("bbox")]
+
+            def _free(r):
+                center = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+                return not any(d.contains(center) for d in detected)
+
+            candidates = []
+            for img in page.get_images(full=True):
+                try:
+                    rects = page.get_image_rects(img[0])
+                except Exception:           # noqa: BLE001 — one bad xref is not fatal
+                    continue
+                candidates += [fitz.Rect(r) for r in rects
+                               if r.width >= _MIN_ADOPT_PT and r.height >= _MIN_ADOPT_PT
+                               and _free(r)]
+            # colour swatches in tables are usually vector FILLS, not rasters
+            # (observed: 394 fills vs 4 rasters on a palette page). Small fills
+            # only — a big vector figure would have been detected and stamped.
+            for dr in page.get_drawings():
+                if "f" not in dr["type"]:
+                    continue
+                r = fitz.Rect(dr["rect"])
+                if not (_MIN_ADOPT_PT <= r.width <= _MAX_ADOPT_FILL_PT
+                        and _MIN_ADOPT_PT <= r.height <= _MAX_ADOPT_FILL_PT):
+                    continue
+                if not _free(r):
+                    continue
+                center = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+                if any(c.contains(center) for c in candidates):
+                    continue                # nested/duplicate fill of the same cell
+                candidates.append(r)
+            candidates.sort(key=lambda r: (round(r.y0), r.x0))
+            for fid, rect in zip(fids, candidates):
+                mat = fitz.Matrix(_ADOPT_DPI / 72, _ADOPT_DPI / 72)
+                png = page.get_pixmap(matrix=mat, clip=rect).tobytes("png")
+                name = f"img-{hashlib.md5(png).hexdigest()}.png"
+                media_dir.mkdir(parents=True, exist_ok=True)
+                (media_dir / name).write_bytes(png)
+                figures.append({"fig_id": fid, "file": name, "page": pno,
+                                "bbox": list(rect), "rtype": "figure",
+                                "origin": "adopted-from-model"})
+                adopted += 1
+        if adopted:
+            log.info("Adopted %d model-referenced image(s) detection missed "
+                     "(%d stray token(s) total)", adopted, len(strays))
+        return adopted
+    finally:
+        doc.close()
 
 
 # Zero/none border declaration in the forms the model emits, dropped from inline

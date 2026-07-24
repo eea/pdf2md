@@ -195,6 +195,13 @@ def run_phase1(
     others = [r for r in regions if r.rtype != "figure"]
 
     inject_placeholders(working_pdf, figures, placeholders_pdf)
+    size_mb = placeholders_pdf.stat().st_size / 1e6
+    if size_mb > 20:
+        log.warning(
+            "placeholders.pdf is still %.0f MB after figure redaction (~%.0f MB as "
+            "base64) — the conversion upload may be rejected. Large undetected "
+            "rasters (full-page maps, backgrounds) are the usual cause.",
+            size_mb, size_mb * 1.37)
     write_sidecar(sidecar, figures, others, cover=cover_block)
 
     summary = {

@@ -450,7 +450,14 @@ class RichUI(Events):
         t.add_row("figures", f"[green]{sum(r.figures for r in results)} placed[/]")
         t.add_row("tables", f"[green]{n_tbl}[/]"
                   + (f"   [dim]{cov}% word coverage[/]" if cov is not None else ""))
-        t.add_row("cost", f"[b]{fmt_eur(self._cost)}[/]")
+        # "repair" (main pipeline) and "postfix" (improve-only) are the same phase
+        repair = sum((r.phase_cost or {}).get("repair", 0.0)
+                     + (r.phase_cost or {}).get("postfix", 0.0) for r in results)
+        cost_cell = f"[b]{fmt_eur(self._cost)}[/]"
+        if repair:
+            cost_cell += (f"   [dim]conversion {fmt_eur(self._cost - repair)}"
+                          f" + repair {fmt_eur(repair)}[/]")
+        t.add_row("cost", cost_cell)
 
         attention = [r for r in results if r.status in ("warn", "fail", "skip")]
         if batch and attention:

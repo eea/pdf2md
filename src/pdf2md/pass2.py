@@ -14,6 +14,7 @@ from pathlib import Path
 from .llm_client import call_openrouter
 from .prompt import build_user_prompt, inject_template_frontmatter, parse_prompt_file
 from .resolve import (
+    adopt_unstamped_figures,
     close_unbalanced_fences,
     drop_empty_table_rows,
     fix_invalid_entities,
@@ -111,7 +112,16 @@ def convert_placeholdered(
     if fence_closed:
         log.warning("[Pass 2] Converter left a fenced block unterminated — appended a closing ``` "
                     "(an unclosed ```{=html} table renders as plain text)")
+    # the model references images detection never stamped (e.g. colour swatches
+    # in tables) by inventing FIG numbers past the detected range — crop and
+    # adopt those before resolution so they place like any detected figure
+    run_dir = out_qmd.parent
+    stem = placeholders_pdf.name[: -len(".placeholders.pdf")]
+    crop_src = next((p for p in (run_dir / f"{stem}.working.pdf",
+                                 run_dir / f"{stem}.source.pdf") if p.exists()), None)
+    adopted = adopt_unstamped_figures(text, figures, crop_src, run_dir / media_dirname)
     text, fig_report = resolve_fig_tokens(text, figures, out_qmd, media_dirname)
+    fig_report["adopted"] = adopted
     text, n_folded = fold_figure_captions(text)
     if n_folded:
         log.info("[Pass 2] Folded %d stray 'Figure N:' caption line(s) back into the "

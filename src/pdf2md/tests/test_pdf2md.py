@@ -1098,6 +1098,62 @@ class TestResolveFigTokens:
         assert "<!--" in out and out.rstrip().endswith("-->")
         assert "⚠" not in out                      # no visible warning marker
 
+    def test_unresolvable_html_img_becomes_marker_not_broken_tag(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        body = '| cell <img src="FIG_9" alt="Palette sample"> | 33 |\n'
+        out, rep = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert "<img" not in out                   # whole tag replaced
+        assert "figure not found (FIG_9)" in out
+        assert rep["hallucinated"] == ["FIG_9"]
+
+    def test_resolvable_html_img_keeps_tag(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        body = '| cell <img src="FIG_1" alt="Palette sample"> | 33 |\n'
+        out, _ = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert '<img src="doc-media/img-aaa.png" alt="Palette sample">' in out
+
+
+class TestAdoptUnstampedFigures:
+    def _pdf_with_images(self, path):
+        """One page: some body text plus two small embedded rasters."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 100), "Shrubland palette row with a colour swatch")
+        # build a tiny png to embed
+        pm = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 12, 12))
+        pm.clear_with(90)
+        png = pm.tobytes("png")
+        page.insert_image(fitz.Rect(200, 200, 220, 220), stream=png)   # detected
+        page.insert_image(fitz.Rect(200, 300, 220, 320), stream=png)   # undetected
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def test_adopts_undetected_raster_for_stray_token(self, tmp_path):
+        from pdf2md.resolve import adopt_unstamped_figures, resolve_fig_tokens
+        pdf = self._pdf_with_images(tmp_path / "d.pdf")
+        media = tmp_path / "doc-media"
+        figures = [{"fig_id": "FIG_1", "file": "img-aaa.png", "page": 0,
+                    "bbox": [200, 200, 220, 220]}]
+        body = ('Shrubland palette row with a colour swatch '
+                '<img src="FIG_1" alt="a"> then <img src="FIG_2" alt="b">\n')
+        n = adopt_unstamped_figures(body, figures, pdf, media)
+        assert n == 1
+        assert figures[-1]["fig_id"] == "FIG_2" and figures[-1]["origin"] == "adopted-from-model"
+        assert (media / figures[-1]["file"]).exists()
+        out, rep = resolve_fig_tokens(body, figures, tmp_path / "doc.qmd", "doc-media")
+        assert "FIG_2" not in out and rep["hallucinated"] == []
+
+    def test_no_candidate_leaves_token_for_marker_path(self, tmp_path):
+        from pdf2md.resolve import adopt_unstamped_figures
+        import fitz
+        doc = fitz.open(); doc.new_page(); doc.save(str(tmp_path / "empty.pdf")); doc.close()
+        figures = []
+        n = adopt_unstamped_figures("![x](FIG_3)", figures, tmp_path / "empty.pdf",
+                                    tmp_path / "m")
+        assert n == 0 and figures == []
+
 
 class TestNeutralizeBodyThematicBreaks:
     def test_converts_body_rule_block_keeps_frontmatter(self):

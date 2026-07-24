@@ -69,7 +69,6 @@ class FileResult:
     postfix_recovered: int = 0            # source gaps the recovery appendix now covers
     table_cov: float = None
     table_cov_before: float = None        # table coverage before post-fixes
-    postfix_report: Path = None           # before→after diff report path
     cover: dict = None
     qmd: Path = None
     pdf_out: Path = None
@@ -196,7 +195,7 @@ def _render(out_dir: Path, stem: str) -> tuple:
         return False, "render timed out (300s)"
 
 
-def _run_verify(out_dir: Path, stem: str) -> list:
+def _run_verify(out_dir: Path, stem: str, meta: dict = None) -> list:
     detections_path = out_dir / "detections.json"
     detections = json.loads(detections_path.read_text()) if detections_path.exists() else {"figures": []}
     qmd_path = out_dir / f"{stem}.qmd"
@@ -214,7 +213,7 @@ def _run_verify(out_dir: Path, stem: str) -> list:
         rendered_pdf=rendered if rendered.exists() else None,
     )
     results = run_verify(ctx)
-    write_report(results, out_dir)
+    write_report(results, out_dir, meta=meta)
     return results
 
 
@@ -223,30 +222,6 @@ def _metric(results: list, name: str):
         if r.name == name:
             return r.metric
     return None
-
-
-def _write_postfix_report(result: "FileResult", out_dir: Path) -> Path:
-    """Write a before→after diff so the post-conversion fixes' real impact is legible:
-    coverage before vs after (in-place and counting the recovered appendix) + what ran."""
-    def _pct(v):
-        return f"{v}%" if v is not None else "—"
-
-    eff = (f"{result.text_cov_effective}% (+{result.postfix_recovered} recovered)"
-           if result.text_cov_effective is not None else "—")
-    lines = [
-        f"# Post-conversion fix report — {result.stem}",
-        "",
-        "| metric | before | after (in-place) | after (incl. recovered) |",
-        "|--------|-------:|-----------------:|------------------------:|",
-        f"| text  | {_pct(result.text_cov_before)} | {_pct(result.text_cov)} | {eff} |",
-        f"| table | {_pct(result.table_cov_before)} | {_pct(result.table_cov)} | — |",
-        "",
-        "## Fixes applied",
-    ]
-    lines += [f"- 🔧 {p}" for p in result.postfixes_applied] or ["- (none)"]
-    path = out_dir / "postfix_report.md"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return path
 
 
 def _count_tables(qmd_path: Path) -> int:
@@ -263,9 +238,10 @@ def _count_tables(qmd_path: Path) -> int:
 
 
 def _cleanup_artifacts(out_dir: Path) -> None:
-    """Remove intermediate files, keeping only the final outputs and the
-    result.json (needed for dry-run replay)."""
-    for pattern in ["*.working.pdf", "*.placeholders.pdf", "detections.json",
+    """Remove intermediate files, keeping only the final outputs, result.json
+    (needed for dry-run replay) and detections.json (the figure inventory —
+    verify/improve-only reruns and replay need it)."""
+    for pattern in ["*.working.pdf", "*.placeholders.pdf",
                      "phase1.json", "verify.json"]:
         for f in out_dir.glob(pattern):
             try:
@@ -338,8 +314,11 @@ def convert_one(
         if det_path.exists():
             import json as _json
             detections = _json.loads(det_path.read_text())
+        # no conversion in this run, so no conversion cost — repair cost is added
+        # to the report by run_postfix itself
+        report_meta = {"stem": stem, "date": _time.strftime("%d %b %Y")}
         events.verify_start()
-        results = _run_verify(out_dir, stem)
+        results = _run_verify(out_dir, stem, meta=report_meta)
         result.verify_status = overall_status(results)
         events.verify_done(result.verify_status)
         result.text_cov = _metric(results, "text_coverage")
@@ -350,7 +329,7 @@ def convert_one(
         if postfix_passes > 0 and results:
             postfix_summary = run_postfix(
                 result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes,
+                api_key=api_key, passes=postfix_passes, meta=report_meta,
             )
             result.phase_cost["postfix"] = postfix_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
@@ -503,9 +482,12 @@ def convert_one(
         # Phase 4 — verify
         results = []
         t_verify = _time.perf_counter()
+        report_meta = {"stem": stem, "date": _time.strftime("%d %b %Y"),
+                       "pages": (estimate or {}).get("pages"), "model": model,
+                       "cost_convert": round(sum(result.phase_cost.values()), 4)}
         if do_verify and format == "qmd":
             events.verify_start()
-            results = _run_verify(out_dir, stem)
+            results = _run_verify(out_dir, stem, meta=report_meta)
             result.verify_status = overall_status(results)
             events.verify_done(result.verify_status)
             result.text_cov = _metric(results, "text_coverage")
@@ -518,12 +500,15 @@ def convert_one(
         # Phase 4.5 — postfix (surgical fixes driven by verify results)
         t_postfix = _time.perf_counter()
         if postfix_passes > 0 and results:
-            # snapshot pre-fix coverage so the UI/report can show the before→after delta
+            # snapshot pre-fix coverage so the single report can show the before→after
+            # delta inline (the numbers it prints are the post-repair final state)
             result.text_cov_before = result.text_cov
             result.table_cov_before = result.table_cov
+            report_meta["text_cov_before"] = result.text_cov
+            report_meta["table_cov_before"] = result.table_cov
             postfix_summary = run_postfix(
                 result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes,
+                api_key=api_key, passes=postfix_passes, meta=report_meta,
             )
             result.phase_cost["repair"] = postfix_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
@@ -541,7 +526,6 @@ def convert_one(
                     result.postfix_recovered = ca.get("text_recovered", 0)
                 if ca.get("table") is not None:
                     result.table_cov = ca["table"]
-                result.postfix_report = _write_postfix_report(result, out_dir)
             result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
         result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)

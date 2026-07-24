@@ -7,7 +7,6 @@ from .llm_client import _post_with_retries
 
 _MIN_TABLE_PCT = 0.70
 _MIN_FRAGMENT_LEN = 8
-_MAX_REPAIR_PAGES = 5
 _REPAIR_MODEL = 'google/gemini-2.5-flash'
 
 # code-block recovery tuning
@@ -45,7 +44,8 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # status: whole tables can be absent while the aggregate still reads ok, because a
     # missing table's boilerplate is supplied by its siblings.
     if table_check:
-        n_tbl = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
+        n_tbl, tbl_cost = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
+        summary['cost_usd'] += tbl_cost
         if n_tbl:
             summary['postfixes_applied'].append(
                 'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
@@ -59,15 +59,23 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'links: {} restored inline, {} listed'.format(n_in, n_list))
 
+    # Pass 1.9: heading restore (deterministic, no LLM)
+    head_check = verify_by_name.get('heading_hierarchy')
+    if head_check and head_check.status in ('warn', 'fail'):
+        n_head = _postfix_headings(qmd_path, out_dir)
+        if n_head:
+            summary['postfixes_applied'].append(
+                'headings: restored {} missing heading(s) from source outline'.format(n_head))
+
     # Pass 2: missing text rescue
     text_check = verify_by_name.get('text_coverage')
     if text_check and text_check.status in ('warn', 'fail') and api_key:
         rescued, items, repair_cost = _postfix_missing_text(qmd_path, out_dir, api_key, text_check)
+        summary['cost_usd'] += repair_cost   # calls are billed even when nothing lands
         if rescued:
             summary['postfixes_applied'].append(
                 'missing_text: {} items recovered from {} pages'.format(items, rescued))
             summary['items_recovered'] = items
-            summary['cost_usd'] += repair_cost
 
     # Re-verify
     if summary['postfixes_applied']:
@@ -89,6 +97,7 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             results = run_verify(ctx)
             report_meta = dict(meta or {})
             report_meta["postfixes"] = summary["postfixes_applied"]
+            report_meta["cost_repair"] = summary["cost_usd"]
             write_report(results, out_dir, meta=report_meta)
             summary['verify_after'] = overall_status(results)
             tc = next((r for r in results if r.name == 'text_coverage'), None)
@@ -369,6 +378,27 @@ def _drop_already_present(recovered, qmd_text):
     return '\n\n'.join(keep)
 
 
+# a line repeating on this many source pages is running chrome, not content
+_CHROME_LINE_MIN_PAGES = 5
+
+
+def _strip_chrome_lines(recovered, line_freq):
+    """Drop running headers/footers and bare page numbers from recovered page text.
+
+    The page re-convert sees the raw page incl. its chrome; without this, every
+    repaired page re-inserts the document title line and page number (observed:
+    17× the running header after a 31-page repair)."""
+    from .verify.textutil import normalize
+    keep = []
+    for ln in recovered.splitlines():
+        n = normalize(ln)
+        if n and (line_freq.get(n, 0) >= _CHROME_LINE_MIN_PAGES
+                  or re.fullmatch(r'\d{1,4}', n)):
+            continue
+        keep.append(ln)
+    return '\n'.join(keep)
+
+
 _TABLE_ABSENT_MIN = 0.5    # recover when this share of a table's distinctive values is gone
 _TABLE_MIN_DISTINCTIVE = 4  # ignore tables with too little unique data to judge
 _TABLE_MIN_ROWS = 2
@@ -529,25 +559,26 @@ def _llm_table_markdown(api_key, doc, pno, rows, normalize):
 
 
 def _recover_missing_tables(qmd_path, out_dir, api_key=None):
-    """Re-emit source tables whose data never reached the .qmd.
+    """Re-emit source tables whose data never reached the .qmd. Returns (count, llm_cost).
 
-    Fully deterministic: the grid comes straight from PyMuPDF find_tables, so the values
-    are exact — no LLM, no paraphrase, no non-determinism. Detection uses each table's
-    DISTINCTIVE values (tokens rare in the source itself). Shared boilerplate ('small',
-    '%', column headers) proves nothing, because sibling tables supply it — which is how
-    13 pages of missing tables still scored 77-85% on token-bag matching.
+    Values come straight from PyMuPDF find_tables, so they are exact; the LLM is only
+    (optionally) asked for better STRUCTURE, and its rendering is kept solely when every
+    source value survives. Detection uses each table's DISTINCTIVE values (tokens rare
+    in the source itself). Shared boilerplate ('small', '%', column headers) proves
+    nothing, because sibling tables supply it — which is how 13 pages of missing tables
+    still scored 77-85% on token-bag matching.
     """
     try:
         import fitz
     except ImportError:
-        return 0
+        return 0, 0.0
     from .verify.checks.table_coverage import _qmd_grids, _tokens_of
     from .verify.textutil import normalize
 
     stem = qmd_path.stem
     source_pdf = out_dir / '{}.source.pdf'.format(stem)
     if not source_pdf.exists():
-        return 0
+        return 0, 0.0
     qmd_text = qmd_path.read_text(encoding='utf-8')
 
     qtoks = set()
@@ -609,14 +640,14 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
         added += 1
 
     if not blocks:
-        return 0
+        return 0, llm_cost[0]
     parts = [qmd_text.rstrip()]
     for pno, md, src_label in blocks:
         parts.append('<!-- postfix: table recovered from source p{} ({}) -->\n\n{}'
                      .format(pno + 1, src_label, md))
     qmd_path.write_text('\n\n'.join(parts) + '\n', encoding='utf-8')
     log.info('postfix: re-emitted %d missing table(s) from the source PDF', added)
-    return added
+    return added, llm_cost[0]
 
 
 _WINDOW_RE = re.compile(r'<<<PAGE\s+(\d+)>>>')
@@ -670,11 +701,80 @@ def _convert_window(api_key, doc, pno, span=1):
     return out, cost
 
 
+def _postfix_headings(qmd_path, out_dir):
+    """Restore source-outline headings the converter dropped. Deterministic:
+    the PDF bookmark outline gives (level, title, page); each missing heading is
+    inserted right before the first line of its own section content that
+    survived into the .qmd. No anchor found → skipped, never guessed."""
+    import fitz
+    from .verify.textutil import normalize
+    from .verify.checks.heading_hierarchy import _fuzzy, _qmd_headings, _similar
+
+    stem = qmd_path.stem
+    source_pdf = out_dir / '{}.source.pdf'.format(stem)
+    if not source_pdf.exists():
+        return 0
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+    qmd_keys = [_fuzzy(t) for t in _qmd_headings(qmd_text)]
+
+    doc = fitz.open(str(source_pdf))
+    try:
+        toc = doc.get_toc(simple=True)          # [[level, title, 1-based page], …]
+        if not toc:
+            return 0
+        missing = [(lvl, title, pg - 1) for lvl, title, pg in toc
+                   if normalize(title)
+                   and not any(_similar(_fuzzy(normalize(title)), q) for q in qmd_keys)]
+        if not missing:
+            return 0
+
+        hay = qmd_text.lower()
+
+        def _section_anchor(title, pno):
+            """Start-of-line offset in the .qmd of the first unique line that
+            follows the heading in the source (same page, then the next)."""
+            seen_title = False
+            for p in (pno, pno + 1):
+                if not (0 <= p < doc.page_count):
+                    continue
+                for ln in doc[p].get_text().splitlines():
+                    s = ' '.join(ln.split())
+                    if not seen_title and normalize(s) and normalize(title) in normalize(s):
+                        seen_title = True
+                        continue            # the heading line itself is not an anchor
+                    if len(s) < 40:
+                        continue
+                    probe = s[:60].lower()
+                    i = hay.find(probe)
+                    if i != -1 and hay.find(probe, i + 1) == -1:
+                        return qmd_text.rfind('\n', 0, i) + 1
+            return None
+
+        plans = []
+        for lvl, title, pno in missing:
+            at = _section_anchor(title, pno)
+            if at is not None:
+                # drop manual section numbers, matching the converter's own style
+                clean = re.sub(r'^\s*[\d.]+\s*', '', title).strip() or title.strip()
+                plans.append((at, '#' * max(1, min(6, lvl)) + ' ' + clean))
+
+        for at, heading in sorted(plans, reverse=True):
+            qmd_text = qmd_text[:at] + heading + '\n\n' + qmd_text[at:]
+        if plans:
+            qmd_path.write_text(qmd_text, encoding='utf-8')
+            log.info('postfix: restored %d missing heading(s) from the source outline '
+                     '(%d unanchorable, skipped)', len(plans), len(missing) - len(plans))
+        return len(plans)
+    finally:
+        doc.close()
+
+
+
+
 def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
     import fitz
     from .verify.textutil import normalize, pdf_lines, split_sentences, tokens
     from .verify.textutil import qmd_to_plain, shingles
-    import urllib.request, json
 
     stem = qmd_path.stem
     source_pdf = out_dir / '{}.source.pdf'.format(stem)
@@ -683,7 +783,7 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
 
     qmd_text = qmd_path.read_text(encoding='utf-8')
 
-    # Find pages with most missing sentences
+    # Find pages with missing sentences
     lines = pdf_lines(source_pdf, exclude_boxes_by_page={})
     sentence_pages = defaultdict(set)
     for pno, txt in lines:
@@ -709,13 +809,13 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
     if not missing_by_page:
         return 0, 0, 0.0
 
-    worst = sorted(missing_by_page.items(), key=lambda x: -x[1])[:_MAX_REPAIR_PAGES]
-    worst = [(p, c) for p, c in worst if c >= 1]
-    if not worst:
-        return 0, 0, 0.0
+    # no cap: every page with missing sentences gets a repair pass — cost is one
+    # cheap flash call per damaged page, bounded by damage, not document length
+    log.info('postfix: %d page(s) carry missing text, repairing all of them',
+             len(missing_by_page))
 
     # ascending page order so earlier inserts don't invalidate later anchors
-    repair_pages = sorted(p for p, _ in worst)
+    repair_pages = sorted(missing_by_page)
 
     # Anchor only on lines unique in the source. Running headers/footers repeat on
     # every page, and str.find returns their FIRST hit, which would drag every insert
@@ -739,7 +839,8 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
                 continue
             window, cost = _convert_window(api_key, doc, pno)
             llm_cost += cost
-            recovered = _drop_already_present(window.get(pno, '').strip(), qmd_text)
+            recovered = _strip_chrome_lines(window.get(pno, '').strip(), line_freq)
+            recovered = _drop_already_present(recovered, qmd_text)
             if not recovered:
                 continue
 

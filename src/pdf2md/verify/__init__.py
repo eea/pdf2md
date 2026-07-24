@@ -283,9 +283,16 @@ def write_report(results: list, run_dir: Path, meta: dict = None) -> Path:
 
     title = meta.get("stem") or run_dir.name
     md = [f"# Conversion quality report - {title}", ""]
+    from ..cost import fmt_eur
+    cost_bits = []
+    if meta.get("cost_convert") is not None:
+        cost_bits.append(f"conversion {fmt_eur(meta['cost_convert'])}")
+    if meta.get("cost_repair"):
+        cost_bits.append(f"repair {fmt_eur(meta['cost_repair'])}")
     header_bits = [b for b in (meta.get("date"),
                                f"{meta['pages']} pages" if meta.get("pages") else None,
-                               meta.get("model")) if b]
+                               meta.get("model"),
+                               " + ".join(cost_bits) if cost_bits else None) if b]
     if header_bits:
         md.append(" · ".join(header_bits))
         md.append("")
@@ -332,10 +339,17 @@ def write_report(results: list, run_dir: Path, meta: dict = None) -> Path:
         md.append("")
 
     if meta.get("postfixes"):
-        md.append("The tool already repaired some damage on its own: "
-                  + "; ".join(meta["postfixes"])
-                  + ". You don't need to redo any of that - details in "
-                    "`postfix_report.md`.")
+        # the numbers above are the FINAL, post-repair state; this line records what
+        # the repair pass changed to get there (before → after coverage)
+        deltas = []
+        if meta.get("text_cov_before") is not None and tc and tc.metric is not None:
+            deltas.append(f"text {meta['text_cov_before']}% → {tc.metric}%")
+        if meta.get("table_cov_before") is not None and tb and tb.metric is not None:
+            deltas.append(f"tables {meta['table_cov_before']}% → {tb.metric}%")
+        delta_note = f" ({'; '.join(deltas)})" if deltas else ""
+        md.append("The numbers above already include automatic repairs" + delta_note
+                  + ". What the repair pass did: " + "; ".join(meta["postfixes"])
+                  + ". You don't need to redo any of it.")
         md.append("")
     if issues:
         md.append("For everything below: page numbers refer to the **original PDF**, "

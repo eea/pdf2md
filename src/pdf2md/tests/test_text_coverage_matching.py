@@ -10,8 +10,32 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from pdf2md.verify.checks.text_coverage import _short_line_covered  # noqa: E402
+from pdf2md.verify.checks.text_coverage import (  # noqa: E402
+    _join_wrapped, _short_line_covered, _TOC_LEADER_RE)
 from pdf2md.verify.textutil import tokens  # noqa: E402
+
+
+def test_wrapped_lines_join_into_one_sentence():
+    lines = ["In some cases, especially when steep terrain is involved,",
+             "pre-processing aiming to level illumination effects is applied."]
+    assert _join_wrapped(lines) == (
+        "In some cases, especially when steep terrain is involved, "
+        "pre-processing aiming to level illumination effects is applied.")
+
+
+def test_heading_stays_separate():
+    assert _join_wrapped(["4.2.2 Results", "The validation confirms the trends."]) == \
+        "4.2.2 Results\nThe validation confirms the trends."
+
+
+def test_trailing_unpunctuated_buffer_kept():
+    assert _join_wrapped(["a final line without punctuation"]) == \
+        "a final line without punctuation"
+
+
+def test_toc_leader_matches():
+    assert _TOC_LEADER_RE.search("2.1 Scope of the Document ........... 12")
+    assert not _TOC_LEADER_RE.search("An ordinary sentence ending in 2021.")
 
 
 def _index(qmd_plain: str):

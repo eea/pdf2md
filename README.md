@@ -48,8 +48,10 @@ Figures are cropped out of the PDF before conversion and replaced with numbered
 through; afterwards the original images are put back where the tokens are.
 Tables get the opposite treatment: they are never cropped, so the model can
 transcribe their content. At the end of a run, a set of checks compares the
-result with the source document and restores missing tables or links without
-another LLM call.
+result with the source document. Missing tables, links and code blocks are
+restored deterministically from the source; pages still missing prose after
+that are re-sent to the LLM one page at a time, and only text not already
+present in the output is inserted.
 
 ## Output files
 

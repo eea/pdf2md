@@ -51,12 +51,20 @@ DOCUMENT BODY:
 - Transcribe EVERY line of body text — do not omit any sentence, list item, or
   note. When in doubt, include it.
 - Produce clean Quarto/GitHub-flavored Markdown.
-- Headings: use #, ##, ### following the document's heading hierarchy. Do NOT keep
-  manual section numbers (e.g. "6.1") in the heading text — Quarto numbers sections.
+- Headings: use #, ##, ### following the document's heading hierarchy. Include
+  EVERY heading of the document — especially top-level chapter headings, which
+  often sit alone on a page or in decorative layout; skipping one orphans its
+  whole chapter. Do NOT keep manual section numbers (e.g. "6.1") in the heading text — Quarto numbers sections.
 - Tables: see the dedicated TABLES section below. Tables are TEXT, not figures —
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
-  names and codes, footnotes, and superscripts/subscripts where present.
+  names and codes, and superscripts/subscripts where present.
+- Footnotes: a superscript footnote mark in the text becomes [^n] at that exact
+  spot, and its footnote text at the bottom of the page becomes a matching
+  definition line [^n]: placed after the paragraph. Example:
+    "…the nomenclature³ was applied." with page-bottom note "3 See Annex 1."
+    →  "…the nomenclature[^3] was applied." plus the line "[^3]: See Annex 1."
+  Never drop the mark and never inline the footnote text into the sentence.
 - Mathematical formulas and equations: transcribe as LaTeX math, NOT as HTML
   entities (NEVER write &sqrt; — it is not a valid entity) and NOT as plain
   sub/superscript text. Use $...$ for a formula INLINE in a sentence and $$...$$

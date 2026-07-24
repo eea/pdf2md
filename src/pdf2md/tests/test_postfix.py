@@ -93,6 +93,50 @@ def test_drop_already_present_skips_tiny_fragments():
     assert _drop_already_present("too short", QMD) == ""
 
 
+def test_postfix_headings_restores_missing_chapter(tmp_path):
+    import fitz
+    from pdf2md.postfix import _postfix_headings
+    body_line = ("This chapter describes the water cover duration product in detail "
+                 "for the pan-European area.")
+    doc = fitz.open()
+    p = doc.new_page()
+    p.insert_text((72, 80), "4 Water Cover Duration (WCD)")
+    p.insert_text((72, 120), body_line)
+    doc.set_toc([[1, "4 Water Cover Duration (WCD)", 1]])
+    src = tmp_path / "d.source.pdf"
+    doc.save(str(src)); doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text(f"## Overview\n\nSome intro.\n\n{body_line}\n", encoding="utf-8")
+    n = _postfix_headings(qmd, tmp_path)
+    assert n == 1
+    out = qmd.read_text()
+    # inserted as H1, section number stripped, right before its section body
+    assert "# Water Cover Duration (WCD)\n" in out
+    assert out.index("Water Cover Duration") < out.index(body_line)
+
+
+def test_postfix_headings_skips_unanchorable(tmp_path):
+    import fitz
+    from pdf2md.postfix import _postfix_headings
+    doc = fitz.open(); doc.new_page()
+    doc.set_toc([[1, "Ghost chapter", 1]])
+    src = tmp_path / "d.source.pdf"; doc.save(str(src)); doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("## Other\n\nUnrelated text entirely.\n", encoding="utf-8")
+    assert _postfix_headings(qmd, tmp_path) == 0
+
+
+def test_strip_chrome_lines_drops_running_header_and_page_number():
+    from pdf2md.postfix import _strip_chrome_lines
+    from pdf2md.verify.textutil import normalize
+    freq = {normalize("CLC+ Backbone Product Specification and User Manual"): 130}
+    text = ("CLC+ Backbone Product Specification and User Manual\n"
+            "96\n"
+            "Genuine prose that appears only on this page of the document.")
+    out = _strip_chrome_lines(text, freq)
+    assert out == "Genuine prose that appears only on this page of the document."
+
+
 # ── window recovery: page-marker parsing ────────────────────────────────────────
 
 from pdf2md.postfix import _WINDOW_RE  # noqa: E402

@@ -96,6 +96,41 @@ _PFX_RECOVERY_RE = re.compile(
 _LIST_MARKER_RE = re.compile(r"^\s*(?:[•·▪◦‣∙*+-]|o)\s+(?=\S)", re.IGNORECASE)
 _SECTION_NO_RE = re.compile(r"^\s*\d+(?:\.\d+)+\.?\s+(?=\D)")
 
+# table-of-contents entries ("2.1 Scope ......... 12") are never transcribed —
+# Quarto regenerates the TOC — so they must not count as missing text
+_TOC_LEADER_RE = re.compile(r"\.{4,}\s*\d+\s*$")
+# a heading-like line: section-numbered, or a shouty all-caps run — kept as its
+# own unit, never glued to the paragraph that follows
+_HEADING_LIKE_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?\s+\S|[A-Z0-9][A-Z0-9 :\-]{6,}$)")
+
+
+def _join_wrapped(lines: list) -> str:
+    """Join PDF line-wrap continuations into flowing sentences.
+
+    A PDF line that doesn't end a clause continues on the next line; splitting
+    at every line break turned each wrap into its own "sentence" fragment, and
+    fragment shingles misreport reworded prose as missing. Heading-like lines
+    stay on their own — gluing "4.2.2 Results" onto the next paragraph would
+    break its match against the .qmd (which strips section numbers)."""
+    out, buf = [], ""
+    for s in lines:
+        s = s.strip()
+        if not s:
+            continue
+        if _HEADING_LIKE_RE.match(s):
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(s)
+            continue
+        buf = f"{buf} {s}".strip()
+        if re.search(r"[.!?;:]\s*$", s):
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return "\n".join(out)
+
 
 _CLUSTER_GAP = 2      # pages this close belong to the same cluster
 _CLUSTER_MIN = 3      # smaller groups stay in the scattered remainder
@@ -259,10 +294,10 @@ class TextCoverageCheck:
                 or any(p.match(norm_line) for p in _IGNORE_PATTERNS)
             )
 
-        source_text = "\n".join(
+        source_text = _join_wrapped([
             _strip_structural_markers(txt) for _, txt in lines
-            if not _ignored(normalize(txt))
-        )
+            if not _ignored(normalize(txt)) and not _TOC_LEADER_RE.search(txt)
+        ])
         sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
 
         # STRICT (in-place) coverage: exclude the postfix recovery appendix — recovered

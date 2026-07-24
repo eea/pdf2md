@@ -23,10 +23,32 @@ _QMD_DISPLAY = re.compile(r"\$\$.+?\$\$", re.DOTALL)
 _QMD_INLINE = re.compile(r"(?<!\$)\$(?!\$)[^\n$]+?\$(?!\$)")
 
 
+# an equation is anchored by an equals sign or a structural operator; a line
+# without one is data/prose that merely contains glyphs (thresholds "≤ 10%",
+# error bars "± 1.5%", set notation "A ∪ B", Greek variables named in prose)
+_MATH_ANCHORS = set("=√∑∏∫∬∮∂∇")
+_MATH_OPS = set("=+×÷⋅/^_(){}[]")
+
+
 def _line_is_math(text: str) -> bool:
     if _LATEX_DELIM.search(text):
         return True
-    return sum(1 for ch in text if ch in _MATH_SYMBOLS) >= _MATH_MIN_SYMBOLS
+    # a table row is data, not an equation — even when its cells hold ∪/± glyphs
+    stripped = text.lstrip()
+    if stripped.startswith("|") or "<td" in text or "<tr" in text:
+        return False
+    if not any(c in _MATH_ANCHORS for c in text):
+        return False
+    dense = [c for c in text if not c.isspace()]
+    if not dense:
+        return False
+    symbols = sum(1 for c in dense if c in _MATH_SYMBOLS)
+    if symbols < _MATH_MIN_SYMBOLS:
+        return False
+    # prose with a few stray glyphs reads as math on a raw symbol count; a real
+    # equation is symbol-DENSE and carries operators. Require both.
+    ops = sum(1 for c in dense if c in _MATH_OPS)
+    return (symbols + ops) / len(dense) >= 0.15 and ops >= 1
 
 
 @lru_cache(maxsize=8)
