@@ -59,12 +59,17 @@ DOCUMENT BODY:
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
   names and codes, and superscripts/subscripts where present.
-- Footnotes: a superscript footnote mark in the text becomes [^n] at that exact
-  spot, and its footnote text at the bottom of the page becomes a matching
-  definition line [^n]: placed after the paragraph. Example:
+- Footnotes: a superscript footnote mark — a small raised digit that has a
+  matching note at the BOTTOM of the page — becomes [^n] at that exact spot, and
+  the page-bottom note becomes a matching definition line [^n]: placed after the
+  paragraph. Example:
     "…the nomenclature³ was applied." with page-bottom note "3 See Annex 1."
     →  "…the nomenclature[^3] was applied." plus the line "[^3]: See Annex 1."
   Never drop the mark and never inline the footnote text into the sentence.
+  This is for BODY text. Inside a table cell, a footnote mark stays a superscript
+  (<sup>n</sup>) — do NOT write [^n] in a cell, it renders literally there.
+  Exponents (x², km²) and author affiliation marks are not footnotes — keep them
+  as superscripts everywhere.
 - Mathematical formulas and equations: transcribe as LaTeX math, NOT as HTML
   entities (NEVER write &sqrt; — it is not a valid entity) and NOT as plain
   sub/superscript text. Use $...$ for a formula INLINE in a sentence and $$...$$

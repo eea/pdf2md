@@ -73,6 +73,17 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'headings: restored {} missing heading(s) from source outline'.format(n_head))
 
+    # Pass 1.95: footnote rescue (deterministic, no LLM). An orphaned [^n] definition
+    # (no matching [^n] reference) is dropped by Quarto — common for footnotes marking
+    # table cells, whose {=html} raw block can't carry a [^n] link. Recover the lost
+    # text as a visible ^n^ table-note in place.
+    fn_check = verify_by_name.get('footnote_placement')
+    if fn_check and fn_check.status in ('warn', 'fail'):
+        n_fn = _postfix_footnotes(qmd_path, out_dir)
+        if n_fn:
+            summary['postfixes_applied'].append(
+                'footnotes: recovered {} dropped note(s) as table-note(s)'.format(n_fn))
+
     # Pass 2: missing text rescue
     text_check = verify_by_name.get('text_coverage')
     if text_check and text_check.status in ('warn', 'fail') and api_key:
@@ -1120,6 +1131,65 @@ def _region_gaps(units, present):
             gaps.append((i - 1 if i > 0 else None, run, j if j < n else None))
         i = j
     return gaps
+
+
+_SUP_DIGITS = str.maketrans('0123456789', '⁰¹²³⁴⁵⁶⁷⁸⁹')
+
+
+def _postfix_footnotes(qmd_path, out_dir):
+    """Rescue orphaned footnote definitions whose content Quarto would silently drop.
+
+    A `[^n]:` definition with no matching `[^n]` reference is 'orphaned', and Quarto
+    renders an orphaned definition to NOTHING — its text is lost. This is unavoidable
+    for footnotes that annotate table cells: complex tables are emitted as ```{=html}```
+    raw blocks, and inside a raw block a `[^n]` renders literally (never links), so the
+    mark stays a <sup>n</sup> and the definition is left orphaned.
+
+    Fix, deterministic and no LLM: rewrite each such definition — it already sits right
+    after its table — into a visible note line `^n^ text`, the conventional table-note.
+    The <sup>n</sup> mark stays put in the cell. A definition is converted only when its
+    digit actually appears as a superscript mark (<sup>n</sup> or unicode ⁿ) in the doc;
+    a mark-less definition (e.g. a model-invented one) is left untouched and logged, so
+    we never emit a note whose number points at nothing."""
+    from .verify.checks.footnote_placement import _QMD_REF, _QMD_DEF
+
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+    ref_ids = set(_QMD_REF.findall(qmd_text))
+    orphaned = [fid for fid in dict.fromkeys(_QMD_DEF.findall(qmd_text))
+                if fid not in ref_ids]
+    if not orphaned:
+        return 0
+
+    lines = qmd_text.split('\n')
+    converted, skipped = 0, 0
+    for fid in orphaned:
+        if not fid.isdigit():
+            skipped += 1
+            continue
+        # the mark must exist as <sup>n</sup> or a unicode superscript, else it dangles
+        has_mark = (re.search(r'<sup>\s*{}\s*</sup>'.format(re.escape(fid)), qmd_text)
+                    or fid.translate(_SUP_DIGITS) in qmd_text)
+        if not has_mark:
+            skipped += 1
+            continue
+        prefix = '[^{}]:'.format(fid)
+        for i, ln in enumerate(lines):
+            if ln.startswith(prefix):
+                # a def with an indented continuation line would become a code block if
+                # de-prefixed — rare; leave those for a human rather than mangle them
+                nxt = lines[i + 1] if i + 1 < len(lines) else ''
+                if nxt[:4] == '    ' and nxt.strip():
+                    skipped += 1
+                    break
+                lines[i] = '^{}^{}'.format(fid, ln[len(prefix):])
+                converted += 1
+                break
+    if not converted:
+        return 0
+    qmd_path.write_text('\n'.join(lines), encoding='utf-8')
+    log.info('postfix: recovered %d dropped footnote(s) as visible table-note(s)%s',
+             converted, ' (%d left, no in-doc mark)' % skipped if skipped else '')
+    return converted
 
 
 def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):

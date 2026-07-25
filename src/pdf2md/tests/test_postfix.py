@@ -370,3 +370,40 @@ def test_safe_again_after_table_closes():
 def test_not_safe_inside_an_existing_link():
     t = "see [Convention](http://x) for details"
     assert not _safe_to_inline(t, t.index("Convention"))
+
+
+# ── footnote table-note rescue ──────────────────────────────────────────────────
+
+_FN_QMD = (
+    "# Doc\n\n"
+    "Body ref links here.[^4]\n\n"
+    "```{=html}\n"
+    "<table><tr><td>Resampling via GdalWarp<sup>1</sup> in UTM<sup>5</sup>.</td></tr></table>\n"
+    "```\n\n"
+    "[^1]: GDAL 3.8.3 package.\n"
+    "[^5]: WGS84/UTM projection note.\n"
+    "[^4]: A real linked footnote.\n"
+    "[^9]: A definition whose mark was never emitted.\n"
+)
+
+
+def test_postfix_footnotes_converts_orphaned_intable_defs(tmp_path):
+    from pdf2md.postfix import _postfix_footnotes
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text(_FN_QMD, encoding="utf-8")
+    n = _postfix_footnotes(qmd, tmp_path)
+    out = qmd.read_text(encoding="utf-8")
+    assert n == 2                                   # only [^1] and [^5] (have <sup> marks)
+    assert "^1^ GDAL 3.8.3 package." in out         # def rewritten to a visible note
+    assert "^5^ WGS84/UTM projection note." in out
+    assert "[^1]:" not in out and "[^5]:" not in out
+    assert "<sup>1</sup>" in out and "<sup>5</sup>" in out   # marks left in the cell
+    assert "[^4]:" in out and "[^4]" in out         # linked footnote untouched
+    assert "[^9]: A definition" in out              # mark-less orphan left alone
+
+
+def test_postfix_footnotes_noop_when_all_linked(tmp_path):
+    from pdf2md.postfix import _postfix_footnotes
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Text with a ref.[^1]\n\n[^1]: linked note.\n", encoding="utf-8")
+    assert _postfix_footnotes(qmd, tmp_path) == 0
