@@ -237,3 +237,85 @@ class TestScaffolding:
         assert (out_root / "_quarto.yml").exists()
         assert (out_root / "_typst.yml").exists()
         assert (out_root / "_meta").exists()    # symlink to render assets
+
+class TestStripChrome:
+    """1:1 conversion is the default; --strip-chrome opts into chrome removal."""
+
+    def _spy_phase1(self, monkeypatch, seen):
+        def spy(pdf, out_dir, **kw):
+            seen.update(kw)
+            return {"figures": 0, "cost_usd": {"cover": 0.0, "detect": 0.0},
+                    "cover": None}
+        monkeypatch.setattr(app, "run_phase1", spy)
+
+    def test_phase1_keeps_chrome_by_default(self, tmp_path, monkeypatch):
+        _stub_phases(monkeypatch)
+        seen = {}
+        self._spy_phase1(monkeypatch, seen)
+        r = app.convert_one(_make_pdf(tmp_path / "doc.pdf"), tmp_path / "out", api_key="k")
+        assert r.status == "ok"
+        assert seen["do_strip_chrome"] is False
+
+    def test_strip_chrome_strips_in_phase1_and_postfixes_qmd(self, tmp_path, monkeypatch):
+        _stub_phases(monkeypatch)
+        seen = {}
+        self._spy_phase1(monkeypatch, seen)
+        verifies = {"n": 0}
+        orig_verify = app._run_verify
+
+        def counting_verify(out_dir, stem, meta=None):
+            verifies["n"] += 1
+            return orig_verify(out_dir, stem, meta=meta)
+        monkeypatch.setattr(app, "_run_verify", counting_verify)
+        monkeypatch.setattr(app, "strip_chrome_qmd", lambda qmd, out_dir: 2)
+
+        r = app.convert_one(_make_pdf(tmp_path / "doc.pdf"), tmp_path / "out",
+                            api_key="k", strip_chrome=True)
+        assert seen["do_strip_chrome"] is True
+        assert any(p.startswith("chrome:") for p in r.postfixes_applied)
+        assert verifies["n"] == 2       # main verify + post-strip re-verify
+
+    def test_no_qmd_postfix_when_nothing_stripped(self, tmp_path, monkeypatch):
+        _stub_phases(monkeypatch)
+        monkeypatch.setattr(app, "strip_chrome_qmd", lambda qmd, out_dir: 0)
+        r = app.convert_one(_make_pdf(tmp_path / "doc.pdf"), tmp_path / "out",
+                            api_key="k", strip_chrome=True)
+        assert not any(p.startswith("chrome:") for p in r.postfixes_applied)
+
+
+class TestCliChromeFlags:
+    def _parse(self, argv):
+        from pdf2md.app_cli import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_strip_chrome_defaults_off(self):
+        args = self._parse(["doc.pdf"])
+        assert args.strip_chrome is False
+
+    def test_strip_chrome_flag(self):
+        args = self._parse(["doc.pdf", "--strip-chrome"])
+        assert args.strip_chrome is True
+
+    def test_keep_headers_still_accepted_as_noop(self):
+        args = self._parse(["doc.pdf", "--keep-headers"])
+        assert args.keep_headers is True and args.strip_chrome is False
+
+
+class TestCliPostfixFlags:
+    def _parse(self, argv):
+        from pdf2md.app_cli import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_postfix_defaults_to_three_iterations(self):
+        assert self._parse(["doc.pdf"]).postfix == 3
+
+    def test_postfix_takes_an_iteration_budget(self):
+        assert self._parse(["doc.pdf", "--postfix", "5"]).postfix == 5
+
+    def test_no_postfix_disables_the_loop(self):
+        assert self._parse(["doc.pdf", "--no-postfix"]).postfix == 0
+
+    def test_review_flag_is_gone(self, capsys):
+        import pytest
+        with pytest.raises(SystemExit):
+            self._parse(["doc.pdf", "--review"])

@@ -62,7 +62,11 @@ def _load_result(out_dir: Path, stem: str) -> FileResult:
         for k in ("pdf", "out_dir", "qmd", "pdf_out", "verify_report"):
             if rj.get(k):
                 rj[k] = Path(rj[k])
-        return FileResult(**rj)
+        # drop fields a newer/older pdf2md wrote that this FileResult no longer has
+        # (e.g. the removed "review" summary), so old snapshots stay replayable
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(FileResult)}
+        return FileResult(**{k: v for k, v in rj.items() if k in known})
 
     # no result.json: derive from detections.json + verify_report.md
     det = _read_json(out_dir / "detections.json") or {}

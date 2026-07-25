@@ -57,6 +57,7 @@ def _build_json_report(result, timing, model, cover_model):
         "postfix": {
             "items_recovered": result.postfix_items,
             "applied": result.postfixes_applied,
+            "iterations": result.repair_iterations,
         },
         "tablefix": result.tablefix,
     }
@@ -196,8 +197,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
     p.add_argument("--no-verify", action="store_true", help="skip the content-fidelity verify pass")
     p.add_argument("--json-report", action="store_true", help="write a comprehensive machine-readable <stem>-report.json alongside the output")
-    p.add_argument("--postfix", type=int, default=1, metavar="N", help="post-conversion fixes after verify (default: 1, 0 to disable)")
-    p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and postfix existing output")
+    p.add_argument("--postfix", type=int, default=3, metavar="N",
+                   help="max iterations of the post-conversion repair loop "
+                        "(deterministic fixes → LLM missing-text → vision patches → "
+                        "re-verify; default 3)")
+    p.add_argument("--no-postfix", action="store_const", const=0, dest="postfix",
+                   help="disable the repair loop entirely")
+    p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and run the repair loop on existing output")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")
     p.add_argument("--max-cost-per-file", type=float, default=None, metavar="EUR",
                    help="skip a file whose pre-flight estimate exceeds this (EUR); "
@@ -218,8 +224,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Use 1 for sequential)")
     p.add_argument("--quiet", action="store_true", help="plain logging output (no rich UI)")
     p.add_argument("--verbose", action="store_true", help="DEBUG logging")
+    p.add_argument("--strip-chrome", action="store_true", default=False,
+                   help="after conversion, strip running headers/footers/page numbers "
+                        "from the output")
+    # deprecated alias: 1:1 (headers kept) is now the default, so this is a no-op
+    # kept only so existing invocations don't break
     p.add_argument("--keep-headers", action="store_true", default=False,
-                   help="keep running headers/footers (only useful with --format qmd)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--setup", action="store_true", help="interactive setup: configure API key and default model")
     return p
 
@@ -390,13 +401,17 @@ def main() -> int:
             return 1
     model = resolve_model(args.model)
 
+    if args.keep_headers:
+        log.info("--keep-headers is deprecated: headers are kept by default now "
+                 "(use --strip-chrome to remove them)")
+
     batch = args.path.is_dir()
     events, rich_active = _setup_ui_and_logging(args, batch)
 
     common = dict(
         api_key=api_key, model=model, cover_model=args.cover_model,
         do_render=args.render, do_verify=not args.no_verify, force=args.force,
-        format=args.format, strip_headers=(not args.keep_headers),
+        format=args.format, strip_chrome=args.strip_chrome,
         postfix_passes=args.postfix,
         improve_only=args.improve,
         max_cost_per_file=eur_to_usd(args.max_cost_per_file),

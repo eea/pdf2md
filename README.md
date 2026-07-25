@@ -15,8 +15,11 @@ pip install -e .
 # One-time setup (API key + default model)
 python3 pdf2md.py --setup
 
-# Convert a PDF
+# Convert a PDF (1:1 fidelity, all content preserved)
 python3 pdf2md.py document.pdf
+
+# Convert + strip chrome for web output (repair loop runs by default)
+python3 pdf2md.py document.pdf --strip-chrome
 
 # Batch convert a directory
 python3 pdf2md.py inbox/ --out output/
@@ -38,20 +41,49 @@ converted documents end up with the same header layout.
 
 ## How it works
 
-A PDF becomes Markdown in four phases. The text goes through the LLM, the
+A PDF becomes Markdown in five phases. The text goes through the LLM, the
 images go around it.
 
 <img src="docs/pipeline.svg" alt="How pdf2md works" width="840">
 
-Figures are cropped out of the PDF before conversion and replaced with numbered
-`[FIG_n]` boxes. The LLM only transcribes text and carries these tokens
-through; afterwards the original images are put back where the tokens are.
-Tables get the opposite treatment: they are never cropped, so the model can
-transcribe their content. At the end of a run, a set of checks compares the
-result with the source document. Missing tables, links and code blocks are
-restored deterministically from the source; pages still missing prose after
-that are re-sent to the LLM one page at a time, and only text not already
-present in the output is inserted.
+**Phase 1 — Detect.** Figures are cropped out of the PDF before conversion and
+replaced with numbered `[FIG_n]` boxes. The PDF is processed 1:1 — all running
+headers, footers, and page numbers are preserved so the verification and repair
+steps can compare against a faithful copy.
+
+**Phase 2 — Convert.** The LLM transcribes text and carries figure tokens
+through. Tables are never cropped, so the model can transcribe their content.
+
+**Phase 3 — Verify.** Every converted document is checked against the original:
+text coverage, table fidelity, figure placement, link preservation, heading
+structure, and more. The `verify_report.md` shows what passed and what needs
+attention.
+
+**Phase 4 — Iterative repair loop (`--postfix N`, default 3).** Each iteration
+runs cheapest-first: deterministic fixes (missing tables, links, code blocks,
+headings — €0), then LLM missing-text rescue on pages still flagged, then a
+vision model that compares each still-flagged source page against the output
+and applies exact text patches. After each iteration the document is
+re-verified; the loop repeats while coverage keeps improving, and stops on a
+clean verify, no improvement, or the iteration budget — whichever comes first.
+Per-iteration cost and coverage deltas are saved in `repair_report.md`.
+Disable with `--no-postfix`.
+
+**Phase 5.5 — Strip chrome (`--strip-chrome`).** Optionally removes running
+headers, footers, and page numbers from the final output — useful when the
+target is a web page rather than a PDF replica. Deterministic (regex-based,
+zero LLM cost). Runs after all repair and verification steps so the quality
+checks always see the complete 1:1 document.
+
+### Pipeline summary
+
+| Step | What | When |
+|------|------|------|
+| Detect | 1:1 page images, figure crops, chrome preserved | Always |
+| Convert | LLM transcribes text + places figures | Always |
+| Verify | Mechanical fidelity checks | Always for .qmd |
+| Repair loop | Deterministic fixes → LLM text rescue → vision patches, iterated | `--postfix N` (default 3; `--no-postfix` to disable) |
+| Strip chrome | Removes running headers/footers/page numbers | `--strip-chrome` |
 
 ## Output files
 
@@ -59,8 +91,9 @@ Each converted document produces:
 
 - `<stem>.qmd` — the converted document (or `.md`/`.gfm`, see `--format`)
 - `<stem>-media/` — figures extracted from the source PDF
-- `verify_report.md` — results of the fidelity checks, worth a look before trusting the output
-- `postfix_report.md` — coverage before and after the automatic fixes
+- `verify_report.md` — results of the fidelity checks
+- `repair_report.md` — per-iteration repair loop history (fixes, cost, coverage)
+- `result.json` — machine-readable summary (cost, figures, verify status)
 
 ## Configuration
 

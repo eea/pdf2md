@@ -19,9 +19,10 @@ from .cost import fmt_eur
 from .cover import DEFAULT_COVER_MODEL
 from .estimate import estimate_file, load_calibration
 from .llm_client import check_model_fit
+from .lint import lint_qmd
 from .phase1 import run_phase1
 from .phase2 import run_phase2
-from .postfix import run_postfix
+from .postfix import run_repair_loop, strip_chrome_qmd
 from .tablefix import run_phase_tablefix
 from .phase25 import run_phase25
 from .verify import VerifyContext, overall_status, run_verify, write_report
@@ -76,7 +77,10 @@ class FileResult:
     cost_usd: float = 0.0
     phase_cost: dict = field(default_factory=dict)
     tablefix: dict = None        # Phase 2.5 summary; kept for dry-run replay
+    repair_iterations: list = field(default_factory=list)  # per-iteration repair stats
     timing: dict = field(default_factory=dict)   # phase -> seconds
+    lint_fixes: list = field(default_factory=list)     # emit-time hazards auto-repaired
+    lint_failures: list = field(default_factory=list)  # unfixable hazards -> status fail
 
 
 class Events:
@@ -288,10 +292,10 @@ def convert_one(
     events: Events = None,
     index: int = 1,
     total: int = 1,
-    format: str = "qmd", strip_headers: bool = None,
+    format: str = "qmd", strip_chrome: bool = False,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
     template: str = None,               # path to a .qmd template for YAML frontmatter
-    postfix_passes: int = 1,
+    postfix_passes: int = 3,           # max iterations of the repair loop (0 = off)
     improve_only: bool = False,
     json_report: bool = False,
 ) -> FileResult:
@@ -315,8 +319,9 @@ def convert_one(
             import json as _json
             detections = _json.loads(det_path.read_text())
         # no conversion in this run, so no conversion cost — repair cost is added
-        # to the report by run_postfix itself
-        report_meta = {"stem": stem, "date": _time.strftime("%d %b %Y")}
+        # to the report by run_repair_loop itself
+        report_meta = {"stem": stem,
+                       "date": datetime.date.today().strftime("%d %b %Y")}
         events.verify_start()
         results = _run_verify(out_dir, stem, meta=report_meta)
         result.verify_status = overall_status(results)
@@ -327,23 +332,24 @@ def convert_one(
                                 for r in results if r.status in ("warn", "fail")]
         result.verify_report = out_dir / "verify_report.md"
         if postfix_passes > 0 and results:
-            postfix_summary = run_postfix(
-                result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes, meta=report_meta,
+            repair_summary = run_repair_loop(
+                result.qmd, out_dir, results, api_key,
+                max_iterations=postfix_passes, meta=report_meta,
             )
-            result.phase_cost["postfix"] = postfix_summary.get("cost_usd", 0.0)
+            result.phase_cost["postfix"] = repair_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
-            if postfix_summary.get("postfixes_applied"):
-                result.postfixes_applied = postfix_summary["postfixes_applied"]
-                log.info("Postfix applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
-                if postfix_summary.get("verify_after"):
-                    result.verify_status = postfix_summary["verify_after"]
+            result.repair_iterations = repair_summary.get("iterations", [])
+            if repair_summary.get("postfixes_applied"):
+                result.postfixes_applied = repair_summary["postfixes_applied"]
+                log.info("Repair applied: %s", ", ".join(repair_summary["postfixes_applied"]))
+                if repair_summary.get("verify_after"):
+                    result.verify_status = repair_summary["verify_after"]
         result.status = "warn" if result.verify_status in ("warn", "fail") else "ok"
         events.file_done(result)
         return result
 
-    # resume: a completed .qmd means this file is done. checked before estimating
-    # so a resume run doesn't even estimate files it'll skip.
+    # resume: a completed .qmd means this file is done (use --improve to re-run
+    # verify + the repair loop on existing output).
     if out_dir.exists() and (out_dir / f"{stem}.{ext}").exists() and not force:
         log.info("Skipping %s — %s already exists (use force to overwrite)", pdf.name, out_dir)
         result.status = "ok"
@@ -408,10 +414,10 @@ def convert_one(
         if do_render: _ensure_scaffolding(out_root)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Phase 1 — detect
-        do_strip = strip_headers
+        # Phase 1 — detect. 1:1 by default: the working PDF keeps its running
+        # headers/footers unless --strip-chrome asked for them to go.
         p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
-                        do_strip_chrome=do_strip,
+                        do_strip_chrome=strip_chrome,
                         cover_model=cover_model, events=events,
                         detect_workers=detect_workers)
         result.figures = p1.get("figures", 0)
@@ -497,7 +503,9 @@ def convert_one(
             result.verify_report = out_dir / "verify_report.md"
             result.timing["verify"] = round(_time.perf_counter() - t_verify, 3)
 
-        # Phase 4.5 — postfix (surgical fixes driven by verify results)
+        # Phase 4.5 — iterative repair loop (deterministic fixes → LLM missing-text
+        # → vision patches → re-verify, cycling until stable or the iteration
+        # budget is spent)
         t_postfix = _time.perf_counter()
         if postfix_passes > 0 and results:
             # snapshot pre-fix coverage so the single report can show the before→after
@@ -506,20 +514,21 @@ def convert_one(
             result.table_cov_before = result.table_cov
             report_meta["text_cov_before"] = result.text_cov
             report_meta["table_cov_before"] = result.table_cov
-            postfix_summary = run_postfix(
-                result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes, meta=report_meta,
+            repair_summary = run_repair_loop(
+                result.qmd, out_dir, results, api_key,
+                max_iterations=postfix_passes, meta=report_meta,
             )
-            result.phase_cost["repair"] = postfix_summary.get("cost_usd", 0.0)
+            result.phase_cost["repair"] = repair_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
-            result.postfix_items = postfix_summary.get("items_recovered", 0)
-            if postfix_summary.get("postfixes_applied"):
-                result.postfixes_applied = postfix_summary["postfixes_applied"]
-                log.info("Repair applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
-                if postfix_summary.get("verify_after"):
-                    result.verify_status = postfix_summary["verify_after"]
+            result.postfix_items = repair_summary.get("items_recovered", 0)
+            result.repair_iterations = repair_summary.get("iterations", [])
+            if repair_summary.get("postfixes_applied"):
+                result.postfixes_applied = repair_summary["postfixes_applied"]
+                log.info("Repair applied: %s", ", ".join(repair_summary["postfixes_applied"]))
+                if repair_summary.get("verify_after"):
+                    result.verify_status = repair_summary["verify_after"]
                 # adopt the post-fix coverage as the final numbers (in-place + effective)
-                ca = postfix_summary.get("coverage_after") or {}
+                ca = repair_summary.get("coverage_after") or {}
                 if ca.get("text") is not None:
                     result.text_cov = ca["text"]
                     result.text_cov_effective = ca.get("text_effective")
@@ -527,6 +536,48 @@ def convert_one(
                 if ca.get("table") is not None:
                     result.table_cov = ca["table"]
             result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
+
+        # Phase 4.6 — emit-time lint gate. Deterministic, no LLM. The repair passes
+        # above can re-introduce structural hazards after pass2's write (one stray
+        # fence inverts every downstream "``` parity" check), so this is the LAST
+        # touch: sanitize the single-correct-repair hazards, fail only on the rest.
+        if format == "qmd" and result.qmd and Path(result.qmd).exists():
+            lint_res = lint_qmd(Path(result.qmd))
+            if lint_res.fixes:
+                result.lint_fixes = [i.message for i in lint_res.fixes]
+                log.info("Lint sanitized: %s", "; ".join(result.lint_fixes))
+            for w in lint_res.warnings:
+                log.warning("Lint: %s", w.message)
+            if lint_res.failures:
+                result.lint_failures = [i.message for i in lint_res.failures]
+                for f in lint_res.failures:
+                    log.error("Lint FAIL: %s", f.message)
+                result.verify_status = "fail"
+                result.verify_issues = list(result.verify_issues) + [
+                    {"name": "lint", "status": "fail", "summary": f.message}
+                    for f in lint_res.failures
+                ]
+
+        # Phase 5.5 — deterministic chrome strip (--strip-chrome). Runs LAST so
+        # verify/review judged the chrome-complete 1:1 content; whole-line
+        # removals only, so it cannot break fence parity or table markup.
+        if strip_chrome and format == "qmd" and result.qmd and Path(result.qmd).exists():
+            n_chrome = strip_chrome_qmd(Path(result.qmd), out_dir)
+            if n_chrome:
+                result.postfixes_applied = list(result.postfixes_applied) + [
+                    f"chrome: stripped {n_chrome} running header/footer line(s)"]
+                if do_verify:
+                    # re-verify to confirm coverage held (chrome is excluded from
+                    # text_coverage, so removals must not regress it)
+                    events.verify_start()
+                    results = _run_verify(out_dir, stem, meta=report_meta)
+                    result.verify_status = overall_status(results)
+                    events.verify_done(result.verify_status)
+                    result.text_cov = _metric(results, "text_coverage")
+                    result.table_cov = _metric(results, "table_coverage")
+                    result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+                                            for r in results if r.status in ("warn", "fail")]
+
         result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)
         sev = {"ok": 0, "warn": 1, "fail": 2}
@@ -560,9 +611,9 @@ def convert_batch(
     allow_over_budget: bool = False,   # override both gates
     events: Events = None,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
-    format: str = "qmd", strip_headers: bool = None,
+    format: str = "qmd", strip_chrome: bool = False,
     template: str = None,               # path to a .qmd template for YAML frontmatter
-    postfix_passes: int = 1,
+    postfix_passes: int = 3,           # max iterations of the repair loop (0 = off)
     improve_only: bool = False,
     json_report: bool = False,
 ) -> list:
@@ -614,10 +665,11 @@ def convert_batch(
             r = convert_one(
                 pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
                 do_render=do_render, do_verify=do_verify, force=force,
-                max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
+                max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_chrome=strip_chrome,
                 estimate=est, events=events, index=i, total=len(pdfs), template=template,
                 detect_workers=detect_workers,
                 postfix_passes=postfix_passes,
+                improve_only=improve_only,
                 json_report=json_report,
             )
             results.append(r)
