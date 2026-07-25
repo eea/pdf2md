@@ -9,6 +9,22 @@ _MIN_TABLE_PCT = 0.70
 _MIN_FRAGMENT_LEN = 8
 _REPAIR_MODEL = 'google/gemini-2.5-flash'
 
+# recovered tables are anchored in place (like missing text), never appended: a marker
+# is dropped on the surviving text above the table's source position, then filled
+_TBL_MARKER_TMPL = '<!--pdf2md-tbl-{}-->'
+_TBL_MARKER_RE = re.compile(r'<!--pdf2md-tbl-\d+-->')
+
+
+def _body_pdf(out_dir, stem):
+    """The chrome/footer-stripped copy the .qmd was actually derived from, when it
+    survived the run — so anchor context is body text only, matching what the
+    conversion saw. Falls back to the original source.pdf (with the heuristic chrome
+    filter) for improve-only / replay runs where the working copy was cleaned up."""
+    working = Path(out_dir) / '{}.working.pdf'.format(stem)
+    source = Path(out_dir) / '{}.source.pdf'.format(stem)
+    return working if working.exists() else source
+
+
 # code-block recovery tuning
 _CODE_BLOCK_MIN_MONO_SPANS = 2   # a block needs this many mono spans to count as code
 _CODE_BLOCK_MONO_RATIO = 0.6     # ...and this share of its spans must be monospaced
@@ -40,16 +56,6 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'code_blocks: recovered {} code block(s) from source PDF'.format(recovered))
 
-    # Pass 1.7: missing-table recovery (deterministic, no LLM). Not gated on the check's
-    # status: whole tables can be absent while the aggregate still reads ok, because a
-    # missing table's boilerplate is supplied by its siblings.
-    if table_check:
-        n_tbl, tbl_cost = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
-        summary['cost_usd'] += tbl_cost
-        if n_tbl:
-            summary['postfixes_applied'].append(
-                'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
-
     # Pass 1.8: hyperlink recovery (deterministic, no LLM). The href lives in a PDF
     # annotation the model never sees, so this is the only way those links can survive.
     link_check = verify_by_name.get('link_preservation')
@@ -76,6 +82,19 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'missing_text: {} items recovered from {} pages'.format(items, rescued))
             summary['items_recovered'] = items
+
+    # Pass 3: missing-table recovery (deterministic, no LLM). Runs LAST — after text and
+    # heading recovery — so a table in a collapsed region can anchor on the prose those
+    # passes just restored, instead of declining for want of surviving context. This is
+    # the sequential-repair principle: each pass builds on the previous one's output.
+    # Not gated on the check's status: whole tables can be absent while the aggregate
+    # still reads ok, because a missing table's boilerplate is supplied by its siblings.
+    if table_check:
+        n_tbl, tbl_cost = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
+        summary['cost_usd'] += tbl_cost
+        if n_tbl:
+            summary['postfixes_applied'].append(
+                'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
 
     # Re-verify
     if summary['postfixes_applied']:
@@ -576,7 +595,7 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
     from .verify.textutil import normalize
 
     stem = qmd_path.stem
-    source_pdf = out_dir / '{}.source.pdf'.format(stem)
+    source_pdf = _body_pdf(out_dir, stem)   # prefer the chrome-stripped body copy
     if not source_pdf.exists():
         return 0, 0.0
     qmd_text = qmd_path.read_text(encoding='utf-8')
@@ -585,17 +604,54 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
     for g in _qmd_grids(qmd_text):
         qtoks |= _tokens_of(g)
 
+    from .verify.textutil import tokens as _tok
+
+    def _chrome_sig(txt):
+        return re.sub(r'\d+', '#', normalize(txt))
+
     doc = fitz.open(str(source_pdf))
     try:
-        tables = []
+        # first pass: all substantial lines per page (15-char floor keeps captions like
+        # "Table 5. …" while dropping stray glyphs)
+        page_lines = {}
         for pno in range(doc.page_count):
+            lines = []
+            for b in doc[pno].get_text("dict").get("blocks", []):
+                for ln in b.get("lines", []):
+                    txt = "".join(s["text"] for s in ln["spans"]).strip()
+                    if len(txt) >= 15:
+                        lines.append((ln["bbox"][1], txt))
+            lines.sort()
+            page_lines[pno] = lines
+
+        # running headers/footers were stripped from the .qmd during conversion, so they
+        # must be kept OUT of the anchor context or it will never match. Digit-insensitive
+        # signature, dropped when it repeats across pages (same detector as _build_units).
+        total_pages = doc.page_count or 1
+        seen = defaultdict(set)
+        for pno, lines in page_lines.items():
+            for _y, txt in lines:
+                seen[_chrome_sig(txt)].add(pno)
+        chrome = {s for s, ps in seen.items() if len(ps) >= max(3, total_pages * 0.5)}
+
+        # second pass: tables with chrome-free preceding context (across the page
+        # boundary, so a page-top table still has its caption/paragraph to anchor on)
+        tables = []
+        prev_tail = []
+        for pno in range(doc.page_count):
+            plines = [(y, txt) for y, txt in page_lines[pno] if _chrome_sig(txt) not in chrome]
             try:
-                for t in doc[pno].find_tables().tables:
-                    rows = [r for r in t.extract() if any(c for c in r)]
-                    if rows:
-                        tables.append((pno, rows))
+                found = doc[pno].find_tables().tables
             except Exception:               # noqa: BLE001 — one bad page must not abort
-                continue
+                found = []
+            for t in found:
+                rows = [r for r in t.extract() if any(c for c in r)]
+                if not rows:
+                    continue
+                above = [txt for y, txt in plines if y < t.bbox[1]]
+                pre = (prev_tail + above)[-10:]
+                tables.append((pno, rows, _tok(' '.join(pre))))
+            prev_tail = [txt for _, txt in plines]
     finally:
         doc.close()
 
@@ -608,14 +664,13 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
         return out
 
     src_df = Counter()
-    for _p, rows in tables:
+    for _p, rows, _c in tables:
         for t in toks_of(rows):
             src_df[t] += 1
 
-    added = 0
-    blocks = []
+    blocks = []                             # (pno, md, label, ctx_tokens)
     llm_cost = [0.0]
-    for pno, rows in tables:
+    for pno, rows, ctx in tables:
         if len(rows) < _TABLE_MIN_ROWS or max(len(r) for r in rows) < _TABLE_MIN_COLS:
             continue                        # degenerate segmentation — not a real grid
         distinctive = {t for t in toks_of(rows) if src_df[t] <= 2}
@@ -636,18 +691,53 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
                 src_label = 'structured'
         if not md:
             md = _grid_to_markdown(rows)
-        blocks.append((pno, md, src_label))
-        added += 1
+        blocks.append((pno, md, src_label, ctx))
 
     if not blocks:
         return 0, llm_cost[0]
-    parts = [qmd_text.rstrip()]
-    for pno, md, src_label in blocks:
-        parts.append('<!-- postfix: table recovered from source p{} ({}) -->\n\n{}'
-                     .format(pno + 1, src_label, md))
-    qmd_path.write_text('\n\n'.join(parts) + '\n', encoding='utf-8')
-    log.info('postfix: re-emitted %d missing table(s) from the source PDF', added)
-    return added, llm_cost[0]
+
+    # anchor each recovered table on the surviving text above its source position and
+    # drop a marker there; decline (never append) when there is no unique anchor
+    words, starts, ends = _qmd_word_offsets(qmd_text)
+    planned = []                            # (safe_offset, tid, pno, md, label)
+    tid = 0
+    for pno, md, label, ctx in blocks:
+        at = _anchor_by_context(words, ends, ctx)   # dynamic: grow until unique
+        if at is None:
+            continue                        # no unique anchor at any length → decline
+        safe = _safe_boundary(qmd_text, at)
+        if safe is None:
+            continue
+        tid += 1
+        planned.append((safe, tid, pno, md, label))
+
+    declined = len(blocks) - len(planned)
+    if not planned:
+        if declined:
+            log.info('postfix: %d missing table(s) had no anchor — left for manual '
+                     '(not appended)', declined)
+        return 0, llm_cost[0]
+
+    # place markers back-to-front (offsets stay valid), then fill by token
+    for safe, tid, _pno, _md, _label in sorted(planned, key=lambda p: p[0], reverse=True):
+        qmd_text = qmd_text[:safe] + _TBL_MARKER_TMPL.format(tid) + '\n\n' + qmd_text[safe:]
+    for _safe, tid, pno, md, label in planned:
+        block = ('<!-- postfix: table recovered in place (source p{}, {}) -->\n\n{}'
+                 .format(pno + 1, label, md))
+        marker = _TBL_MARKER_TMPL.format(tid)
+        if marker in qmd_text:
+            qmd_text = qmd_text.replace(marker, block, 1)
+
+    leftover = _TBL_MARKER_RE.findall(qmd_text)
+    if leftover:
+        log.warning('postfix: %d table marker(s) unfilled — stripped', len(leftover))
+        qmd_text = _TBL_MARKER_RE.sub('', qmd_text)
+
+    qmd_path.write_text(qmd_text, encoding='utf-8')
+    log.info('postfix: recovered %d missing table(s) in place from the source PDF%s',
+             len(planned),
+             '' if not declined else ' (%d unanchorable, left for manual)' % declined)
+    return len(planned), llm_cost[0]
 
 
 _WINDOW_RE = re.compile(r'<<<PAGE\s+(\d+)>>>')
@@ -769,115 +859,350 @@ def _postfix_headings(qmd_path, out_dir):
         doc.close()
 
 
+# ── Marker-based missing-text repair ────────────────────────────────────────────
+# Instead of re-converting whole damaged pages (expensive: ~90% of the generated
+# output is content already present, then discarded), we diff the source against
+# the .qmd, anchor each gap on the SURVIVING sentence right before it, drop a
+# placeholder marker there, batch every gap's source text into ONE LLM call to
+# clean-format it, then fill each marker. Cost scales with what's actually missing,
+# not document length. A fidelity guard falls back to raw text if the model drifts.
+
+_MARKER_TMPL = '<!--pdf2md-repair-{}-->'
+_MARKER_RE = re.compile(r'<!--pdf2md-repair-\d+-->')
+_GAP_RE = re.compile(r'<<<GAP\s+(\d+)>>>')
+_MIN_INJECT_TOKENS = 8       # a shorter run is a fragment, not a body sentence
+_SOLID_TOKENS = 6            # a sentence long enough to be a trustworthy anchor; shorter
+#                             survivors ("Pol.", "J.") don't break a gap, so a collapsed
+#                             region (mostly missing, sparse fragment survivors) stays one
+#                             gap anchored on the solid sentence before it — not appended
+_ANCHOR_PROBE = 8            # tokens of the before/after sentence used to locate it
+_ANCHOR_PROBE_LONG = 15      # escalated probe when the short one isn't unique (Tier 2a)
+_DEDUP_OVERLAP = 0.6         # a gap whose text is already this present is a false miss
+
+
+def _clean_raw(text):
+    """Minimal deterministic cleanup for raw PDF text (fallback when the LLM drifts):
+    join hyphenated line breaks, collapse whitespace. No reflow, no reformat."""
+    text = re.sub(r'-\s*\n\s*', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def _qmd_word_offsets(qmd_text):
+    """Lowercased alnum words of the .qmd with each word's start and end char offset —
+    the coordinate space anchor sentences are located in."""
+    words, starts, ends = [], [], []
+    for m in re.finditer(r'[a-z0-9]+', qmd_text.lower()):
+        words.append(m.group())
+        starts.append(m.start())
+        ends.append(m.end())
+    return words, starts, ends
+
+
+def _find_unique(words, probe):
+    """Index of the UNIQUE consecutive occurrence of `probe` (a token list) in the
+    .qmd word stream. None if absent or ambiguous — the anchor never guesses."""
+    n = len(probe)
+    if not n:
+        return None
+    hit = -1
+    for i in range(len(words) - n + 1):
+        if words[i:i + n] == probe:
+            if hit != -1:
+                return None                 # not unique
+            hit = i
+    return hit if hit != -1 else None
+
+
+def _locate_after(words, ends, probe):
+    """Char offset just past a unique occurrence of `probe`. None if absent/ambiguous."""
+    i = _find_unique(words, probe)
+    return ends[i + len(probe) - 1] if i is not None else None
+
+
+def _anchor_by_context(words, ends, ctx, cap=40):
+    """Dynamic minimal-unique anchor: grow the probe outward from the TAIL of `ctx`
+    (the text right before where the content belongs) until that suffix is UNIQUE in
+    the .qmd, and return the char offset just after it. A short suffix that repeats
+    gets disambiguated by adding more preceding context. None if no suffix up to
+    `cap` tokens is unique — absent (reworded/missing context) or irreducibly
+    repeated — in which case the caller declines rather than guess."""
+    n = len(ctx)
+    if not n:
+        return None
+    for k in range(min(_ANCHOR_PROBE, n), min(cap, n) + 1):
+        i = _find_unique(words, ctx[-k:])
+        if i is not None:
+            return ends[i + k - 1]
+    return None
+
+
+def _safe_boundary_before(text, pos):
+    """Last blank-line boundary at/before `pos` that is not inside a code fence — so a
+    marker inserted BEFORE the following sentence lands at a paragraph start, never
+    mid-block. None when no safe boundary precedes `pos`."""
+    cut = text.rfind('\n\n', 0, pos)
+    while cut != -1:
+        cand = cut + 2
+        if text.count('```', 0, cand) % 2 == 0:
+            return cand
+        cut = text.rfind('\n\n', 0, cut)
+    return None
+
+
+def _anchor_gap(units, present, before_idx, after_idx, words, starts, ends, qmd_text):
+    """Find a safe insertion offset for a gap, escalating through precision-preserving
+    tiers, stopping at the first that yields a UNIQUE anchor. Every tier matches a real
+    word run, so placement stays exact; when none is unique we return None and decline
+    rather than guess.
+
+      Tier 1  : tail of the surviving sentence right before the gap (short probe)
+      Tier 2a : same, longer probe (more often unique)
+      Tier 2b : the two surviving sentences before the gap, combined (short sentences
+                become distinctive together)
+      Tier 2c : head of the surviving sentence AFTER the gap — insert before it
+                (rescues gaps whose leading context wasn't unique, incl. top-of-doc)
+    """
+    def _order_ok(at):
+        # the following surviving sentence, if locatable, must sit after `at`
+        if after_idx is None:
+            return True
+        i = _find_unique(words, units[after_idx][2][:_ANCHOR_PROBE])
+        return i is None or ends[i] > at
+
+    # Tiers 1 / 2a / 2b — anchor AFTER a surviving sentence preceding the gap
+    if before_idx is not None:
+        combos = [units[before_idx][2]]
+        if before_idx - 1 >= 0 and present[before_idx - 1]:
+            combos.append(units[before_idx - 1][2] + units[before_idx][2])
+        for toks in combos:
+            for n in (_ANCHOR_PROBE, _ANCHOR_PROBE_LONG):
+                i = _find_unique(words, toks[-min(n, len(toks)):])
+                if i is None:
+                    continue
+                at = ends[i + min(n, len(toks)) - 1]
+                if _order_ok(at):
+                    safe = _safe_boundary(qmd_text, at)
+                    if safe is not None:
+                        return safe
+
+    # Tier 2c — anchor BEFORE the surviving sentence following the gap
+    if after_idx is not None:
+        atk = units[after_idx][2]
+        for n in (_ANCHOR_PROBE, _ANCHOR_PROBE_LONG):
+            i = _find_unique(words, atk[:min(n, len(atk))])
+            if i is None:
+                continue
+            safe = _safe_boundary_before(qmd_text, starts[i])
+            if safe is not None:
+                return safe
+    return None
+
+
+def _faithful(raw, md):
+    """True if the model's rendering preserved the source (didn't summarise, drop,
+    or rewrite): most of the source's 4-gram shingles survive in the output."""
+    from .verify.textutil import shingles, tokens
+    rs = shingles(tokens(raw))
+    if not rs:
+        return True
+    return len(rs & shingles(tokens(md))) / len(rs) >= 0.5
+
+
+def _llm_convert_gaps(api_key, gaps, model=_REPAIR_MODEL, char_budget=12000):
+    """Convert each gap's raw source text to clean Markdown in as few calls as the
+    output budget allows. gaps: [(gap_id, raw_text)]. Returns ({gap_id: md}, cost)."""
+    out, total_cost = {}, 0.0
+
+    def _flush(batch):
+        nonlocal total_cost
+        if not batch:
+            return
+        body = '\n\n'.join('<<<GAP {}>>>\n{}'.format(g, _clean_raw(r)) for g, r in batch)
+        prompt = (
+            'The excerpts below were dropped from a technical document during an '
+            'earlier PDF-to-Markdown conversion. Convert EACH excerpt to clean '
+            'Markdown, faithfully and in full: reproduce the wording verbatim; do '
+            'NOT summarise, translate, reorder, add commentary, or invent anything. '
+            'Fix only mechanical artefacts (hyphenation, broken spacing). Keep each '
+            '<<<GAP n>>> marker on its own line immediately before its excerpt.\n\n'
+            + body)
+        try:
+            resp, usage = _post_with_retries(
+                api_key=api_key,
+                payload={'model': model, 'messages': [{'role': 'user', 'content': prompt}],
+                         'max_tokens': 8192},
+                label='repair-gaps', timeout=180,
+            )
+        except RuntimeError as e:
+            log.warning('gap-convert batch failed: %s', e)
+            return
+        total_cost += (usage or {}).get('cost', 0.0)
+        if not resp:
+            return
+        parts = _GAP_RE.split(resp)
+        for i in range(1, len(parts) - 1, 2):
+            try:
+                out[int(parts[i])] = parts[i + 1].strip()
+            except ValueError:
+                continue
+
+    batch, size = [], 0
+    for g, r in gaps:
+        if batch and size + len(r) > char_budget:
+            _flush(batch)
+            batch, size = [], 0
+        batch.append((g, r))
+        size += len(r)
+    _flush(batch)
+    return out, total_cost
+
+
+def _build_units(source_pdf):
+    """Ordered source prose units: [(page, raw_sentence, norm_tokens)] in reading
+    order, with running headers/footers and TOC leaders dropped."""
+    from .verify.textutil import normalize, pdf_lines, split_sentences, tokens
+    from .verify.checks.text_coverage import _join_wrapped, _TOC_LEADER_RE
+
+    lines = pdf_lines(source_pdf, exclude_boxes_by_page={})
+    total_pages = (max((p for p, _ in lines), default=-1) + 1) or 1
+
+    # digit-insensitive chrome signature: "Page | 9" and "Page | 15" collapse to one
+    # key, so numbered running headers/footers are recognised as chrome (an
+    # exact-text match would treat each numbered variant as unique and leak it in)
+    def _sig(t):
+        return re.sub(r'\d+', '#', normalize(t))
+
+    seen = defaultdict(set)
+    for pno, txt in lines:
+        seen[_sig(txt)].add(pno)
+    chrome = {s for s, ps in seen.items() if len(ps) >= max(3, total_pages * 0.5)}
+
+    by_page = defaultdict(list)
+    for pno, txt in lines:
+        n = normalize(txt)
+        if not n or _sig(txt) in chrome or _TOC_LEADER_RE.search(txt):
+            continue                        # chrome, blank, or table-of-contents leader
+        by_page[pno].append(txt)
+
+    units = []
+    for pno in sorted(by_page):
+        for sent in split_sentences(_join_wrapped(by_page[pno])):
+            tk = tokens(sent)
+            if tk:
+                units.append((pno, sent.strip(), tk))
+    return units
+
+
+def _region_gaps(units, present):
+    """Group missing sentences into gaps bounded by SOLID surviving sentences.
+
+    A gap spans everything between two solid survivors: missing sentences AND tiny
+    non-anchorable fragments ("Pol.", "J.") alike. So a heavily collapsed region — a
+    references section that mostly failed to convert, leaving only fragments — becomes
+    ONE region gap anchored on the solid sentence before it, recovered in place at the
+    region boundary rather than appended. Each gap's `run` lists the MISSING units only;
+    surviving fragments stay where they are (no duplication). Returns
+    [(before_idx, run_of_missing_indices, after_idx)]."""
+    def _solid(k):
+        return present[k] and len(units[k][2]) >= _SOLID_TOKENS
+
+    gaps, i, n = [], 0, len(units)
+    while i < n:
+        if _solid(i):
+            i += 1
+            continue
+        j = i
+        while j < n and not _solid(j):
+            j += 1
+        run = [k for k in range(i, j) if not present[k]]
+        if run and any(len(units[k][2]) >= _MIN_INJECT_TOKENS for k in run):
+            gaps.append((i - 1 if i > 0 else None, run, j if j < n else None))
+        i = j
+    return gaps
 
 
 def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
-    import fitz
-    from .verify.textutil import normalize, pdf_lines, split_sentences, tokens
-    from .verify.textutil import qmd_to_plain, shingles
+    """Recover dropped body sentences by anchoring each gap on the surviving
+    sentence before it and filling a placeholder marker with an LLM-cleaned (raw
+    fallback) rendering of the gap's source text. Returns (pages, items, cost)."""
+    from .verify.textutil import qmd_to_plain, shingles, tokens
 
     stem = qmd_path.stem
-    source_pdf = out_dir / '{}.source.pdf'.format(stem)
+    source_pdf = _body_pdf(out_dir, stem)   # prefer the chrome-stripped body copy
     if not source_pdf.exists():
         return 0, 0, 0.0
 
     qmd_text = qmd_path.read_text(encoding='utf-8')
+    qmd_sh = shingles(tokens(qmd_to_plain(qmd_text)))
 
-    # Find pages with missing sentences
-    lines = pdf_lines(source_pdf, exclude_boxes_by_page={})
-    sentence_pages = defaultdict(set)
-    for pno, txt in lines:
-        for sent in split_sentences(txt):
-            if len(tokens(sent)) >= 5:
-                sentence_pages[normalize(sent)].add(pno)
-
-    qmd_tokens = tokens(qmd_to_plain(qmd_text))
-    qmd_shingles = shingles(qmd_tokens)
-
-    missing_by_page = defaultdict(int)
-    for sent, pages in sentence_pages.items():
-        stoks = tokens(sent)
-        if len(stoks) <= 7:
-            continue
-        sh = shingles(stoks)
-        if not sh:
-            continue
-        if len(sh & qmd_shingles) / len(sh) < 0.5:
-            for p in pages:
-                missing_by_page[p] += 1
-
-    if not missing_by_page:
-        return 0, 0, 0.0
-
-    # no cap: every page with missing sentences gets a repair pass — cost is one
-    # cheap flash call per damaged page, bounded by damage, not document length
-    log.info('postfix: %d page(s) carry missing text, repairing all of them',
-             len(missing_by_page))
-
-    # ascending page order so earlier inserts don't invalidate later anchors
-    repair_pages = sorted(missing_by_page)
-
-    # Anchor only on lines unique in the source. Running headers/footers repeat on
-    # every page, and str.find returns their FIRST hit, which would drag every insert
-    # to the top of the document (observed).
-    line_freq = Counter(normalize(t) for _, t in lines)
-    page_lines = defaultdict(list)
-    for pno, txt in lines:
-        if line_freq[normalize(txt)] == 1:
-            page_lines[pno].append(txt)
-
-    doc = fitz.open(str(source_pdf))
     try:
-        llm_cost = 0.0
-        plans = []
-        repaired = 0
-        n_items = 0
-        for pno in repair_pages:
-            if pno >= doc.page_count:
-                continue
-            if not doc[pno].get_text().strip():
-                continue
-            window, cost = _convert_window(api_key, doc, pno)
-            llm_cost += cost
-            recovered = _strip_chrome_lines(window.get(pno, '').strip(), line_freq)
-            recovered = _drop_already_present(recovered, qmd_text)
-            if not recovered:
-                continue
-
-            # Anchor on the model's OWN rendering of the preceding page — it matches the
-            # (model-rendered) .qmd far better than raw PDF text. Fall back to raw-text
-            # bracketing, then to appending, rather than guessing a location.
-            neighbour = [l.strip() for l in window.get(pno - 1, '').splitlines()
-                         if len(l.strip()) >= 40]
-            at = _insertion_point(qmd_text, neighbour) if neighbour else None
-            if at is None:
-                at = _bracketed_insertion_point(qmd_text, page_lines, pno)
-            # Plan only — positions resolve against the ORIGINAL text. Editing as we go
-            # made each insert anchor onto the previous one and chain to the end.
-            plans.append((at, pno, recovered))
-
-        # Apply back-to-front so earlier offsets stay valid.
-        for at, pno, recovered in sorted(
-                plans, key=lambda t: (t[0] if t[0] is not None else len(qmd_text)),
-                reverse=True):
-            block = ('<!-- postfix: recovered in place (source p{}) -->\n\n{}\n\n'
-                     .format(pno + 1, recovered))
-            if at is None:
-                # no trustworthy anchor — append rather than guess a location
-                qmd_text = qmd_text.rstrip() + '\n\n' + block
-            else:
-                qmd_text = qmd_text[:at] + block + qmd_text[at:]
-            repaired += 1
-            n_items += len([p for p in recovered.split('\n\n') if p.strip()])
-
-        if not repaired:
-            return 0, 0, llm_cost
-        qmd_path.write_text(qmd_text, encoding='utf-8')
-        log.info('postfix: re-inserted prose from %d page(s) in place via %s',
-                 repaired, _REPAIR_MODEL)
-        return repaired, n_items, llm_cost
+        units = _build_units(source_pdf)
     except Exception as e:                  # noqa: BLE001 — repair must never abort
-        log.warning('Missing-text repair failed: %s', e)
+        log.warning('Missing-text repair: could not read source: %s', e)
         return 0, 0, 0.0
-    finally:
-        doc.close()
+    if not units:
+        return 0, 0, 0.0
+
+    def _present(tk):
+        sh = shingles(tk)
+        return bool(sh) and len(sh & qmd_sh) / len(sh) >= 0.5
+
+    present = [_present(tk) for _, _, tk in units]
+    gaps = _region_gaps(units, present)
+    if not gaps:
+        return 0, 0, 0.0
+
+    words, starts, ends = _qmd_word_offsets(qmd_text)
+    planned = []                            # (safe_offset, gap_id, page, raw_text)
+    gid = 0
+    for before_idx, run, after_idx in gaps:
+        safe = _anchor_gap(units, present, before_idx, after_idx,
+                           words, starts, ends, qmd_text)
+        if safe is None:                    # no unique anchor in any tier → decline
+            continue
+        raw = ' '.join(units[k][1] for k in run)
+        # dedup guard: if the gap text is already largely present, the diff mis-flagged
+        # it — do not inject a duplicate
+        gsh = shingles(tokens(raw))
+        if gsh and len(gsh & qmd_sh) / len(gsh) >= _DEDUP_OVERLAP:
+            continue
+        gid += 1
+        planned.append((safe, gid, units[run[0]][0], raw))
+
+    if not planned:
+        return 0, 0, 0.0
+
+    # place every marker first (back-to-front so offsets stay valid), then fill by
+    # token — so the fill is order-independent and no marker can shift another
+    for safe, gid, _pno, _raw in sorted(planned, key=lambda p: p[0], reverse=True):
+        marker = _MARKER_TMPL.format(gid)
+        qmd_text = qmd_text[:safe] + marker + '\n\n' + qmd_text[safe:]
+
+    rendered, cost = _llm_convert_gaps(api_key, [(gid, raw) for _, gid, _, raw in planned])
+
+    pages, items = set(), 0
+    for _safe, gid, pno, raw in planned:
+        content = rendered.get(gid)
+        if not content or not _faithful(raw, content):
+            content = _clean_raw(raw)       # model drifted or dropped it → raw fallback
+        block = ('<!-- postfix: recovered in place (source p{}) -->\n\n{}'
+                 .format(pno + 1, content))
+        marker = _MARKER_TMPL.format(gid)
+        if marker in qmd_text:
+            qmd_text = qmd_text.replace(marker, block, 1)
+            pages.add(pno)
+            items += 1
+
+    # safety sweep: no unfilled marker may ever reach the output
+    leftover = _MARKER_RE.findall(qmd_text)
+    if leftover:
+        log.warning('postfix: %d repair marker(s) unfilled — stripped', len(leftover))
+        qmd_text = _MARKER_RE.sub('', qmd_text)
+
+    if not items:
+        return 0, 0, cost
+    qmd_path.write_text(qmd_text, encoding='utf-8')
+    log.info('postfix: recovered %d missing passage(s) from %d page(s) via marker '
+             'anchoring (batched %s)', items, len(pages), _REPAIR_MODEL)
+    return len(pages), items, cost

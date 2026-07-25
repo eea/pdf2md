@@ -57,8 +57,16 @@ class FigurePlacementCheck:
             summary = (f"{n_img} image reference(s) in the .qmd, "
                        f"{sum(1 for t in referenced_files if t in on_disk)} present in media "
                        f"(no detection inventory)")
+        if leftover:
+            problem = f"{len(leftover)} figure token(s) unresolved"
+        elif unreferenced:
+            problem = f"{len(unreferenced)} figure{'s' if len(unreferenced) != 1 else ''} unplaced"
+        elif findings:
+            problem = "some figures reference unknown crops"
+        else:
+            problem = None
         return CheckResult(
-            self.name, status, summary,
+            self.name, status, summary, problem=problem,
             metric=round(100 * placed / len(figures), 1) if figures else None,
             findings=findings,
         )

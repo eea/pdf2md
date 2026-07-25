@@ -238,11 +238,11 @@ def _count_tables(qmd_path: Path) -> int:
 
 
 def _cleanup_artifacts(out_dir: Path) -> None:
-    """Remove intermediate files, keeping only the final outputs, result.json
-    (needed for dry-run replay) and detections.json (the figure inventory —
-    verify/improve-only reruns and replay need it)."""
-    for pattern in ["*.working.pdf", "*.placeholders.pdf",
-                     "phase1.json", "verify.json"]:
+    """Remove intermediate files, keeping the final outputs, result.json (dry-run
+    replay), detections.json (figure inventory) and the chrome-stripped working.pdf
+    (the body-text copy the .qmd derives from — repairs anchor against it so context
+    matches the conversion instead of re-stripping chrome from the raw source)."""
+    for pattern in ["*.placeholders.pdf", "phase1.json", "verify.json"]:
         for f in out_dir.glob(pattern):
             try:
                 f.unlink()
@@ -323,7 +323,7 @@ def convert_one(
         events.verify_done(result.verify_status)
         result.text_cov = _metric(results, "text_coverage")
         result.table_cov = _metric(results, "table_coverage")
-        result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+        result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary, "problem": r.problem}
                                 for r in results if r.status in ("warn", "fail")]
         result.verify_report = out_dir / "verify_report.md"
         if postfix_passes > 0 and results:
@@ -492,7 +492,7 @@ def convert_one(
             events.verify_done(result.verify_status)
             result.text_cov = _metric(results, "text_coverage")
             result.table_cov = _metric(results, "table_coverage")
-            result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+            result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary, "problem": r.problem}
                                     for r in results if r.status in ("warn", "fail")]
             result.verify_report = out_dir / "verify_report.md"
             result.timing["verify"] = round(_time.perf_counter() - t_verify, 3)

@@ -468,6 +468,40 @@ _CONVERSION_MAX_TOKENS = {}
 _CONVERSION_DEFAULT_MAX = 16384
 
 
+def validate_key(api_key: str, timeout: int = 10) -> tuple:
+    """Pre-flight: is this OpenRouter key actually accepted? Returns (ok, message).
+
+    Hits GET /api/v1/key (no generation, effectively free). ok=True on 200. A
+    definitive 401/402 returns ok=False with a friendly, actionable message so the
+    run stops before spending. A network/timeout error returns ok=True (skip the
+    check) — a flaky connection must not block an otherwise-valid run."""
+    import json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/key",
+        headers={"Authorization": f"Bearer {api_key}", "User-Agent": "pdf2md/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            json.loads(resp.read())
+        return True, "ok"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False, (
+                "Your OpenRouter API key was rejected (HTTP 401 'User not found'). "
+                "The key is invalid, revoked, or belongs to a different account. "
+                "Set a valid OPENROUTER_API_KEY, or run 'pdf2md --setup'.")
+        if e.code == 402:
+            return False, (
+                "Your OpenRouter account has no credit (HTTP 402). Add credits at "
+                "https://openrouter.ai/settings/credits, or use a ':free' model via --model.")
+        return False, f"OpenRouter rejected the key check (HTTP {e.code})."
+    except Exception as e:                  # noqa: BLE001 — never block on a flaky check
+        log.debug("key validation skipped (network error): %s", e)
+        return True, "skipped (network error)"
+
+
 def _fetch_openrouter_limits(api_key: str = "") -> dict:
     """Query OpenRouter /models for top_provider.max_completion_tokens per model.
     Cached to ~/.pdf2md/model_limits.json for 24h."""

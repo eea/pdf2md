@@ -137,12 +137,21 @@ class FootnotePlacementCheck:
             # footnote marks and none survived
             summary = (f"source has ~{src_count} footnote mark(s); none survived "
                        f"into the .qmd")
+            problem = f"{src_count} footnote{'s' if src_count != 1 else ''} dropped"
         else:
             summary = (f"{len(resolved)}/{len(ref_set)} footnote reference(s) resolved"
                        + (f", {len(dangling)} dangling" if dangling else "")
                        + (f", {len(orphaned)} orphaned definition(s)" if orphaned else ""))
+            # lead with whichever half is broken
+            if orphaned:
+                problem = f"{len(orphaned)} footnote{'s' if len(orphaned) != 1 else ''} unlinked"
+            elif dangling:
+                problem = f"{len(dangling)} footnote marker{'s' if len(dangling) != 1 else ''} unmatched"
+            else:
+                problem = "footnote count differs from source"
         return CheckResult(
             self.name, status, summary,
+            problem=problem if findings else None,
             metric=f"{len(resolved)}/{len(ref_set)} resolved" if ref_set else None,
             findings=findings,
             detail={"src_count": src_count, "src_pages": list(src_pages)},

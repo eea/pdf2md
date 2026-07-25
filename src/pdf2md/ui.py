@@ -49,12 +49,19 @@ def _fit_name(name: str, width: int = _NAME_W) -> str:
     return name[:head] + "…" + name[len(name) - (keep - head):]
 
 
+def _issue_text(iss) -> str:
+    """The terse, problem-focused line for a verify issue — what a reader needs to
+    act on ("23 sentences missing"), falling back to the verbose check summary for
+    any check that didn't set one."""
+    return iss.get("problem") or iss["summary"]
+
+
 def _attention_reason(r) -> str:
     """Plain-text reason for a warn/fail/skip row: the first verify issue (with a
     +N for the rest), else the error, else a bare status."""
     if r.verify_issues:
         more = f"  (+{len(r.verify_issues) - 1} more)" if len(r.verify_issues) > 1 else ""
-        return r.verify_issues[0]["summary"] + more
+        return _issue_text(r.verify_issues[0]) + more
     if r.error:
         return r.error
     if r.verify_status and r.verify_status != "ok":
@@ -373,7 +380,7 @@ class RichUI(Events):
         # assessable without opening verify_report.md
         for iss in r.verify_issues or []:
             t = Text.from_markup(f"      {_ICON.get(iss['status'], '[yellow]⚠[/]')} ")
-            t.append(_clip(iss["summary"], 74), style="dim")
+            t.append(_clip(_issue_text(iss), 74), style="dim")
             self.con.print(t)
 
     def _tally(self):
@@ -435,7 +442,7 @@ class RichUI(Events):
                 t.add_row("verify", f"[{_VCOLOR.get(r.verify_status, 'yellow')}]{r.verify_status}[/]")
             for iss in r.verify_issues or []:    # the why, so warn/fail is assessable here
                 cell = Text.from_markup(f"{_ICON.get(iss['status'], '[yellow]⚠[/]')} ")
-                cell.append(_clip(iss["summary"], 64), style="dim")
+                cell.append(_clip(_issue_text(iss), 64), style="dim")
                 t.add_row("", cell)
             if r.postfixes_applied:
                 for postfix in r.postfixes_applied:

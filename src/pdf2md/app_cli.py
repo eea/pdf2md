@@ -390,6 +390,14 @@ def main() -> int:
             return 1
     model = resolve_model(args.model)
 
+    # pre-flight: reject a bad/expired key here with a friendly message, instead of
+    # letting every page's detection call fail mid-run with a raw HTTP 401
+    from .llm_client import validate_key
+    ok, why = validate_key(api_key)
+    if not ok:
+        log.error("%s", why)
+        return 1
+
     batch = args.path.is_dir()
     events, rich_active = _setup_ui_and_logging(args, batch)
 

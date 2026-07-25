@@ -230,6 +230,47 @@ class TestLargeDocWarning:
         assert not any("very large" in r.message for r in caplog.records)
 
 
+class TestValidateKey:
+    def _mock(self, monkeypatch, *, code=None):
+        import urllib.error, urllib.request
+        from pdf2md import llm_client
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"data": {"label": "ok"}}'
+
+        def _open(req, timeout=10):
+            if code:
+                raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
+            return _Resp()
+        monkeypatch.setattr(urllib.request, "urlopen", _open)
+        return llm_client
+
+    def test_valid_key_ok(self, monkeypatch):
+        lc = self._mock(monkeypatch)
+        ok, _ = lc.validate_key("sk-or-good")
+        assert ok
+
+    def test_401_rejected_with_friendly_message(self, monkeypatch):
+        lc = self._mock(monkeypatch, code=401)
+        ok, msg = lc.validate_key("sk-or-bad")
+        assert not ok and "rejected" in msg.lower() and "setup" in msg.lower()
+
+    def test_402_reports_credits(self, monkeypatch):
+        lc = self._mock(monkeypatch, code=402)
+        ok, msg = lc.validate_key("sk-or-broke")
+        assert not ok and "credit" in msg.lower()
+
+    def test_network_error_does_not_block(self, monkeypatch):
+        import urllib.request
+        from pdf2md import llm_client
+        def _boom(req, timeout=10): raise OSError("no network")
+        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+        ok, _ = llm_client.validate_key("sk-or-x")
+        assert ok            # flaky network must not block a valid run
+
+
 class TestScaffolding:
     def test_ensure_scaffolding_creates_project(self, tmp_path):
         out_root = tmp_path / "out"

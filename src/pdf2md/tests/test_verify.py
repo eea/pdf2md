@@ -116,6 +116,13 @@ class TestFigurePlacementCheck:
         msgs = " ".join(f.message for f in r.findings)
         assert "FIG_2" in msgs and "FIG_9" in msgs
 
+    def test_sets_terse_problem_on_unresolved_token(self, tmp_path):
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        figs = [{"fig_id": "FIG_1", "file": "img-a.png", "page": 0, "bbox": [0, 0, 1, 1]}]
+        qmd = "![cap](FIG_9)\n"                       # unresolved token → fail
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, figs))
+        assert r.status == "fail" and r.problem == "1 figure token(s) unresolved"
+
     def test_no_detections_falls_back_to_media_dir(self, tmp_path):
         # detections.json gone (cleaned-up / improve-only rerun): crops on disk
         # are the inventory — no "unknown crop" spam, no misleading "0/0" summary

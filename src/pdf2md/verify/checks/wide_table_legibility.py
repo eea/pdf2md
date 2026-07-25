@@ -35,4 +35,5 @@ class WideTableLegibilityCheck:
         return CheckResult(
             self.name, "warn",
             f"{len(sizes)} wide table(s) shrunk to ≤6pt to fit ({n6}×6pt, {n5}×5pt)",
+            problem=f"{len(sizes)} wide table{'s' if len(sizes) != 1 else ''} hard to read",
             findings=findings)
