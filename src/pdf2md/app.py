@@ -282,6 +282,7 @@ def convert_one(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
@@ -416,7 +417,9 @@ def convert_one(
 
         # Phase 1 — detect. 1:1 by default: the working PDF keeps its running
         # headers/footers unless --strip-chrome asked for them to go.
-        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
+        # Uses figure_llm for figure-detection when set, falling back to the
+        # main conversion model.
+        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=figure_llm or model,
                         do_strip_chrome=strip_chrome,
                         cover_model=cover_model, events=events,
                         detect_workers=detect_workers)
@@ -602,6 +605,7 @@ def convert_batch(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
