@@ -212,7 +212,7 @@ class TableCoverageCheck:
         return _FITZ_AVAILABLE and ctx.original_pdf and ctx.original_pdf.exists()
 
     def run(self, ctx) -> CheckResult:
-        src_grids = _source_grids(ctx.original_pdf)
+        src_grids = _source_grids(ctx.reference_pdf)
         if not src_grids:
             return CheckResult(self.name, "ok", "no source tables detected")
         qmd_grids = _qmd_grids(ctx.qmd_text)
@@ -267,12 +267,16 @@ class TableCoverageCheck:
         wpct = round(100 * weighted, 1)
         apct = round(100 * aligned_w, 1)
         avg = round(100 * simple_avg, 1)
+        n_thin = len(thin)
         return CheckResult(
             self.name, status,
             f"{len(src_grids)} source table(s); word coverage {wpct}% "
             f"(simple avg {avg}%; {apct}% single-table aligned)"
             + (f"; {len(findings)} substantial table(s) below {int(_CELL_HIT*100)}%"
                if findings else ""),
+            problem=(f"table coverage {wpct}%"
+                     + (f", {n_thin} table(s) thin" if n_thin else "")
+                     if status == "warn" else None),
             metric=wpct, findings=findings,
             detail={"content": wpct, "aligned": apct, "thin": thin,
                     "n_tables": len(src_grids)},

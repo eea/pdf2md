@@ -29,10 +29,12 @@ class Finding:
 class CheckResult:
     name: str
     status: str                # ok | warn | fail | skipped
-    summary: str               # one-line headline
+    summary: str               # one-line headline (verbose shape readout, for verify.json)
     metric: float = None       # optional number, e.g. coverage %
     findings: list = field(default_factory=list)
     detail: dict = None        # optional extras, e.g. {"effective": 99.1, "recovered": 21}
+    problem: str = None         # terse actionable phrase for warn/fail, e.g. "23 sentences
+    #                             missing" — what the UI shows instead of the full summary
 
 
 def ok(name, summary, metric=None):
@@ -59,6 +61,16 @@ class VerifyContext:
     @property
     def figures(self) -> list:
         return self.detections.get("figures", [])
+
+    @property
+    def reference_pdf(self) -> Path:
+        """The chrome-stripped body copy the .qmd was derived from, when it survived
+        the run; else the raw source. Coverage checks measure against this so their
+        idea of "body text" matches what the converter saw and the repair anchors on —
+        chrome the conversion dropped isn't counted as missing."""
+        if self.working_pdf and self.working_pdf.exists():
+            return self.working_pdf
+        return self.original_pdf
 
 
 # ── Registry ────────────────────────────────────────────────────────────────────

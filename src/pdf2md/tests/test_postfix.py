@@ -126,6 +126,140 @@ def test_postfix_headings_skips_unanchorable(tmp_path):
     assert _postfix_headings(qmd, tmp_path) == 0
 
 
+def test_build_units_drops_numbered_running_footer(tmp_path):
+    import fitz
+    from pdf2md.postfix import _build_units
+    doc = fitz.open()
+    bodies = [f"Distinct paragraph number {w} about the processing chain for stage {w}."
+              for w in ("alpha", "beta", "gamma", "delta")]
+    for i, body in enumerate(bodies):        # footer number differs; body differs per page
+        p = doc.new_page()
+        p.insert_text((72, 60), f"Page | {i + 1}")
+        p.insert_text((72, 120), body)
+    src = tmp_path / "d.pdf"
+    doc.save(str(src)); doc.close()
+    units = _build_units(src)
+    joined = " ".join(u[1] for u in units)
+    assert "Page |" not in joined                          # numbered footer gone
+    assert "processing chain" in joined                    # bodies kept
+
+
+def test_locate_after_unique_anchor():
+    from pdf2md.postfix import _qmd_word_offsets, _locate_after
+    qmd = "Intro line.\n\nThe fox jumps over the lazy dog here.\n\nTrailing text.\n"
+    words, starts, ends = _qmd_word_offsets(qmd)
+    at = _locate_after(words, ends, ["the", "lazy", "dog"])
+    assert at is not None and "dog" in qmd[:at] and qmd[at:].lstrip().startswith("here")
+
+
+def test_locate_after_declines_ambiguous():
+    from pdf2md.postfix import _qmd_word_offsets, _locate_after
+    qmd = "the same words here and the same words there"
+    words, starts, ends = _qmd_word_offsets(qmd)
+    assert _locate_after(words, ends, ["the", "same", "words"]) is None   # appears twice
+
+
+def test_body_pdf_prefers_working_copy(tmp_path):
+    from pdf2md.postfix import _body_pdf
+    (tmp_path / "d.source.pdf").write_bytes(b"src")
+    assert _body_pdf(tmp_path, "d").name == "d.source.pdf"          # fallback
+    (tmp_path / "d.working.pdf").write_bytes(b"work")
+    assert _body_pdf(tmp_path, "d").name == "d.working.pdf"          # preferred
+
+
+def test_anchor_by_context_grows_until_unique():
+    # a short suffix that repeats ("the report") is disambiguated by adding more of
+    # the preceding context, keeping placement exact
+    from pdf2md.postfix import _qmd_word_offsets, _anchor_by_context
+    qmd = ("intro the report says one thing here.\n\n"
+           "the distinctive alpha beta gamma prelude to the report says another.\n")
+    words, starts, ends = _qmd_word_offsets(qmd)
+    ctx = ["distinctive", "alpha", "beta", "gamma", "prelude", "to", "the", "report", "says"]
+    at = _anchor_by_context(words, ends, ctx)
+    assert at is not None and qmd[:at].count("the report says") == 2  # landed at 2nd, unique run
+
+
+def test_region_gaps_absorbs_fragments_into_one_collapsed_gap():
+    # a collapsed references block: two solid body sentences bracket a region that is
+    # mostly missing with only tiny surviving fragments — must be ONE gap, not many
+    from pdf2md.postfix import _region_gaps
+    def u(text):
+        toks = text.lower().split()
+        return (0, text, toks)
+    units = [
+        u("This is a solid body sentence before the references section here"),  # 0 solid present
+        u("First missing reference entry with plenty of words to inject here"),  # 1 missing
+        u("Pol"),                                                                # 2 tiny fragment present
+        u("Second missing reference entry also long enough to be injected now"),  # 3 missing
+        u("J"),                                                                  # 4 tiny fragment present
+        u("Third missing reference entry likewise carrying many words indeed"),  # 5 missing
+        u("Another solid body sentence after the references block appears now"),  # 6 solid present
+    ]
+    present = [True, False, True, False, True, False, True]
+    gaps = _region_gaps(units, present)
+    assert len(gaps) == 1                       # one region gap, not three
+    before, run, after = gaps[0]
+    assert before == 0 and after == 6           # bounded by the solid survivors
+    assert run == [1, 3, 5]                      # only the MISSING units; fragments (2,4) skipped
+
+
+def test_find_unique_returns_start_index():
+    from pdf2md.postfix import _qmd_word_offsets, _find_unique
+    qmd = "alpha beta gamma delta epsilon"
+    words, starts, ends = _qmd_word_offsets(qmd)
+    i = _find_unique(words, ["gamma", "delta"])
+    assert i == 2 and starts[i] == qmd.index("gamma")
+
+
+def test_safe_boundary_before_finds_paragraph_start():
+    from pdf2md.postfix import _safe_boundary_before
+    text = "First para.\n\nSecond para here.\n\nThird."
+    pos = text.index("Third")
+    at = _safe_boundary_before(text, pos)
+    assert text[at:].startswith("Third")
+
+
+def test_anchor_gap_uses_after_sentence_when_before_ambiguous():
+    # before-sentence is non-unique ("see below"); after-sentence is distinctive,
+    # so Tier 2c anchors the gap right before it (and rescues a top-of-doc gap)
+    from pdf2md.postfix import _qmd_word_offsets, _anchor_gap
+    qmd = ("see below\n\nThe distinctive concluding paragraph about ice cover.\n")
+    words, starts, ends = _qmd_word_offsets(qmd)
+    units = [(0, "see below", ["see", "below"]),
+             (0, "the missing sentence text here", ["the", "missing", "sentence", "text", "here"]),
+             (0, "The distinctive concluding paragraph about ice cover.",
+              ["the", "distinctive", "concluding", "paragraph", "about", "ice", "cover"])]
+    present = [True, False, True]
+    at = _anchor_gap(units, present, 0, 2, words, starts, ends, qmd)
+    # a duplicate "see below" makes the before-anchor ambiguous → falls to Tier 2c
+    qmd2 = "see below\n\n" + qmd
+    w2, s2, e2 = _qmd_word_offsets(qmd2)
+    at2 = _anchor_gap(units, present, 0, 2, w2, s2, e2, qmd2)
+    assert at2 is not None and qmd2[at2:].lstrip().startswith("The distinctive")
+
+
+def test_faithful_accepts_verbatim_rejects_rewrite():
+    from pdf2md.postfix import _faithful
+    src = "Regions with scarce vegetation typically indicate high human influence."
+    assert _faithful(src, "Regions with scarce vegetation typically indicate high human influence.")
+    assert not _faithful(src, "Something completely different about unrelated topics entirely.")
+
+
+def test_clean_raw_joins_hyphenation():
+    from pdf2md.postfix import _clean_raw
+    assert _clean_raw("topo-\ngraphic normal-\nisation applied") == "topographic normalisation applied"
+
+
+def test_gap_convert_parses_labelled_response(monkeypatch):
+    import pdf2md.postfix as pf
+    def fake_post(**kw):
+        return ("<<<GAP 1>>>\nFirst recovered.\n\n<<<GAP 2>>>\nSecond recovered.",
+                {"cost": 0.004})
+    monkeypatch.setattr(pf, "_post_with_retries", fake_post)
+    out, cost = pf._llm_convert_gaps("k", [(1, "first raw"), (2, "second raw")])
+    assert out == {1: "First recovered.", 2: "Second recovered."} and cost == 0.004
+
+
 def test_strip_chrome_lines_drops_running_header_and_page_number():
     from pdf2md.postfix import _strip_chrome_lines
     from pdf2md.verify.textutil import normalize

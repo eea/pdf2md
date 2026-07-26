@@ -102,6 +102,7 @@ class CodeBlockPresenceCheck:
         summary = f"~{src} monospaced source page(s); {qmd} fenced code block(s) in the .qmd"
         return CheckResult(
             self.name, status, summary,
+            problem=("code listings may be missing" if status == "warn" else None),
             metric=f"{preserved}/{src} code blocks preserved",
             findings=findings,
             detail={"src_pages": list(src_pages), "qmd_blocks": qmd},

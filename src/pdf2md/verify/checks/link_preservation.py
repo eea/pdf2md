@@ -77,6 +77,8 @@ class LinkPreservationCheck:
                    + (f", {len(missing)} missing" if missing else ""))
         return CheckResult(
             self.name, status, summary,
+            problem=(f"{len(missing)} link{'s' if len(missing) != 1 else ''} missing"
+                     if missing else None),
             metric=f"{preserved}/{len(uris)} preserved",
             findings=findings,
         )

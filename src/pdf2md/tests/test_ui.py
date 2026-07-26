@@ -17,6 +17,19 @@ from rich.console import Console  # noqa: E402
 from pdf2md import ui  # noqa: E402
 
 
+def test_issue_text_prefers_terse_problem():
+    # the UI shows the terse problem, not the verbose shape summary
+    assert ui._issue_text({"problem": "23 sentences missing",
+                           "summary": "text coverage 97.8% in-place (1035/1058 …)"}) \
+        == "23 sentences missing"
+
+
+def test_issue_text_falls_back_to_summary():
+    # a check that didn't set `problem` still renders something
+    assert ui._issue_text({"problem": None, "summary": "old verbose line"}) == "old verbose line"
+    assert ui._issue_text({"summary": "no problem key"}) == "no problem key"
+
+
 def _console():
     # force_terminal so the rich UI path is exercised even though we write to a buffer
     return Console(file=io.StringIO(), force_terminal=True, width=100)

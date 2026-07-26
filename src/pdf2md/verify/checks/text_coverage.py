@@ -263,7 +263,7 @@ class TextCoverageCheck:
             exclude[f["page"]].append(tuple(f["bbox"]))
 
         # table cells — scored by table_coverage, not double-counted here
-        for pno, boxes in _table_regions(ctx.original_pdf).items():
+        for pno, boxes in _table_regions(ctx.reference_pdf).items():
             exclude[pno].extend(boxes)
 
         # running header/footer chrome via the shared region detector
@@ -271,14 +271,14 @@ class TextCoverageCheck:
         skip_pages = {0} if is_cover else set()
         try:
             from ...marginchrome import detect_running_chrome
-            chrome_regions = detect_running_chrome(ctx.original_pdf,
+            chrome_regions = detect_running_chrome(ctx.reference_pdf,
                                                    skip_pages=skip_pages)
             for pno, region_list in chrome_regions.items():
                 exclude[pno].extend(region_list)
         except Exception:
             chrome_regions = {}
 
-        lines = pdf_lines(ctx.original_pdf, exclude_boxes_by_page=dict(exclude))
+        lines = pdf_lines(ctx.reference_pdf, exclude_boxes_by_page=dict(exclude))
         # the cover page isn't transcribed into the body (the Typst template rebuilds
         # the title page from frontmatter), so its text would falsely read as missing
         if is_cover:
@@ -366,6 +366,8 @@ class TextCoverageCheck:
             self.name, status,
             f"text coverage {coverage}% in-place ({present}/{total} present; "
             f"{len(missing)} missing{reworded_note}){eff_note}",
+            problem=(f"{len(missing)} sentence{'s' if len(missing) != 1 else ''} missing"
+                     if missing else None),
             metric=coverage, findings=findings,
             detail={"effective": effective, "recovered": recovered_gaps,
                     "missing_count": len(missing), "reworded_count": len(reworded),

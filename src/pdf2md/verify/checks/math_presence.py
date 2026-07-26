@@ -109,6 +109,7 @@ class MathPresenceCheck:
         summary = f"~{src} source equation region(s); {qmd} math block(s) in the .qmd"
         return CheckResult(
             self.name, status, summary,
+            problem=("equations may be dropped" if status == "warn" else None),
             metric=f"{preserved}/{src} equations preserved",
             findings=findings,
         )

@@ -141,8 +141,17 @@ class HeadingHierarchyCheck:
         status = "warn" if findings else "ok"
         summary = (f"{len(qmd_titles)} heading(s); {len(missing)} missing, "
                    f"{reordered} reordered vs the source outline")
+        # terse line leads with the reliable, actionable signal (missing count);
+        # "reordered" is noisy so it's the fallback only when nothing is missing
+        if missing:
+            problem = f"{len(missing)} heading{'s' if len(missing) != 1 else ''} missing"
+        elif reordered:
+            problem = f"{reordered} heading(s) out of order"
+        else:
+            problem = "heading count differs from source"
         return CheckResult(
             self.name, status, summary,
+            problem=problem if findings else None,
             metric=f"{len(qmd_titles)} headings, {reordered} reordered",
             findings=findings,
         )
