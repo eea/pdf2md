@@ -57,6 +57,7 @@ def _build_json_report(result, timing, model, cover_model):
         "postfix": {
             "items_recovered": result.postfix_items,
             "applied": result.postfixes_applied,
+            "iterations": result.repair_iterations,
         },
         "tablefix": result.tablefix,
     }
@@ -77,7 +78,7 @@ KEY_FILE = CONFIG_DIR / "key"  # CONFIG_DIR/CONFIG_FILE are the canonical defs i
 
 
 def resolve_key() -> str:
-    """Resolve OpenRouter API key: env var -> key file -> error.
+    """Resolve OpenRouter API key: env var -> key file -> shell profile -> error.
     Ignores env vars that don't look like real OpenRouter keys (e.g. '***' redactions)."""
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if key and key.startswith("sk-or-"):
@@ -93,6 +94,19 @@ def resolve_key() -> str:
         key = KEY_FILE.read_text(encoding="utf-8").strip()
         if key and key.startswith("sk-or-"):
             return key
+    # Fallback: check .bashrc / .profile for a raw export
+    for rc_path in [Path.home() / ".bashrc", Path.home() / ".profile",
+                    Path.home() / ".bash_profile"]:
+        if rc_path.exists():
+            try:
+                for line in rc_path.read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("export OPENROUTER_API_KEY="):
+                        val = stripped.split("=", 1)[1].strip().strip("\"'")
+                        if val.startswith("sk-or-") and "..." not in val:
+                            return val
+            except Exception:
+                continue
     return ""
 
 
@@ -132,161 +146,45 @@ def resolve_model(args_model=None):
     return DEFAULT_MODEL
 
 
-def resolve_figure_llm(args_figure_llm=None, main_model=None):
-    """Resolve figure LLM: CLI arg -> config file -> main model (fallback)."""
-    if args_figure_llm:
-        return args_figure_llm
-    if CONFIG_FILE.exists():
-        try:
-            import json as _json
-            cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            m = cfg.get("figure_llm", "").strip()
-            if m:
-                return m
-        except Exception:
-            pass
-    return main_model  # fallback: use the main conversion model
-
-
-def _fetch_models(api_key: str) -> list[dict]:
-    """Fetch available models from OpenRouter API. Returns [] on failure."""
-    import urllib.request, json
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        return data.get("data", [])
-    except Exception:
-        return []
-
-
-def _select_llm(prompt: str, api_key: str, default: str = "",
-                filter_fn=None) -> str:
-    """Interactive LLM picker using live OpenRouter model catalogue.
-
-    Args:
-        prompt:  question shown before the list
-        api_key: for API call
-        default: fallback slug if fetch fails or user enters nothing
-        filter_fn: callable(model_dict) -> bool, None = keep all
-
-    Returns chosen model slug (str).
-    """
-    models = _fetch_models(api_key)
-    if filter_fn:
-        models = [m for m in models if filter_fn(m)]
-    # Sort: multimodal first, then by prompt price ascending
-    models.sort(key=lambda m: (
-        0 if (m.get("architecture") or {}).get("modality", "").startswith("text+image")
-        else 1,
-        float((m.get("pricing") or {}).get("prompt", 999)),
-    ))
-    # Cap at 25 to avoid overwhelming
-    top = models[:25]
-
-    print(f"\n{prompt}")
-    if top:
-        print()
-        for i, m in enumerate(top, 1):
-            slug = m.get("id", "?")
-            p = (m.get("pricing") or {})
-            cost = float(p.get("prompt", 0)) * 1e3
-            ctx = m.get("context_length", "?")
-            mm = "🖼️" if ((m.get("architecture") or {}).get("modality", "").startswith("text+image")) else "  "
-            print(f"  [{i:2d}] {mm} {slug}  (€{cost:.1f}/1M prompt  |  {ctx:,} ctx)")
-        print(f"  [{len(top)+1:2d}] type custom slug")
-    else:
-        models = []
-        print("  (could not fetch model list from OpenRouter)")
-
-    print("Enter number or slug [default: %s]: " % (default or "(none)"), end="")
-    ans = input("> ").strip()
-    if not ans:
-        return default
-    # Check if it's a number from the list
-    try:
-        idx = int(ans) - 1
-        if 0 <= idx < len(top):
-            return top[idx].get("id", default)
-    except ValueError:
-        pass
-    return ans  # treat as custom slug
-
-
 def run_setup() -> int:
     """Interactive setup: API key (+ optional Quarto path), saved to ~/.pdf2md/."""
     import json
-    print("pdf2md — one—time setup\n")
-    existing = resolve_key()
-    if existing:
-        print(f"Valid OpenRouter API key found at {KEY_FILE}")
-        ans = input("Replace? [y/N] ").strip().lower()
-        if ans not in ("y", "yes"):
-            key = existing
-            print("  (keeping existing key)\n")
-        else:
-            key = ""
+    print("pdf2md — one-time setup\n")
+    print("Paste your OpenRouter API key (or press Enter to skip):")
+    key = input("> ").strip()
+    if key:
+        if not key.startswith("sk-or-"):
+            print("  Error: key must start with 'sk-or-' (OpenRouter API key format).")
+            return 1
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        KEY_FILE.write_text(key, encoding="utf-8")
+        KEY_FILE.chmod(0o600)
+        print(f"  Key saved to {KEY_FILE} (permissions 600)\n")
     else:
-        key = ""
+        print("  (skipped — set OPENROUTER_API_KEY env var to use pdf2md)\n")
 
-    if not key:
-        print("Paste your OpenRouter API key (or press Enter to skip):")
-        key = input("> ").strip()
-        if key:
-            if not key.startswith("sk-or-"):
-                print("  Error: key must start with 'sk-or-' (OpenRouter API key format).")
-                return 1
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            KEY_FILE.write_text(key, encoding="utf-8")
-            KEY_FILE.chmod(0o600)
-            print(f"  Key saved to {KEY_FILE} (permissions 600)\n")
-        else:
-            print("  (no key — set OPENROUTER_API_KEY env var to use pdf2md)\n")
-
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cfg = {}
 
-    # Key is known now — use it to fetch models
-    ak = key or resolve_key()
 
-    main = _select_llm(
-        "Select conversion LLM:",
-        ak, default=DEFAULT_MODEL,
-    )
-    cfg["model"] = main
-    print(f"  Conversion LLM: {main}\n")
-
-    ans = input("Use a cheaper figure-detection LLM? [y/N] ").strip().lower()
-    if ans in ("y", "yes"):
-        fig = _select_llm(
-            "Select figure-detection LLM (Phase 1):",
-            ak, default="google/gemini-2.5-flash",
-        )
-        cfg["figure_llm"] = fig
-        print(f"  Figure LLM: {fig}\n")
-
-    # Quarto auto-detection (for --render)
+    # Quarto auto-detection (needed for PDF output, which is on by default)
     import shutil as _shutil
     quarto = _shutil.which("quarto")
     if quarto:
-        print(f"\nQuarto found at: {quarto} (optional, only needed for --render)")
+        print(f"\nQuarto found at: {quarto} (needed for PDF output; --no-render to skip)")
         print("Press Enter to accept, or type a different path (Enter to skip):")
         alt = input("> ").strip()
         if alt:
             quarto = alt
     else:
-        print("\nQuarto not found in PATH (optional, only needed for --render).")
+        print("\nQuarto not found in PATH (needed for PDF output; --no-render to skip).")
         print("Enter path to quarto binary, or press Enter to skip:")
         quarto = input("> ").strip() or None
     if quarto:
         cfg["quarto_path"] = quarto
     
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    dm = cfg.get("figure_llm", cfg.get("model", DEFAULT_MODEL))
-    print(f"  Conversion LLM: {cfg.get('model', DEFAULT_MODEL)} (set via --main-llm)")
-    print(f"  Figure LLM:     {dm}" + (" (same as conversion)" if dm == cfg.get("model", DEFAULT_MODEL) else " (cheaper — Phase 1 only)"))
+    print(f"  Model: {DEFAULT_MODEL} (override with --model or OPENROUTER_MODEL env var)")
     if quarto:
         print(f"  Quarto path: {quarto}")
     return 0
@@ -303,21 +201,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--format", "-f", default="qmd", choices=["qmd", "md", "gfm"], help="output format (default: qmd)")
     p.add_argument("--out", type=Path, default=Path("output"),
                    help="output root directory (default: output/)")
-    p.add_argument("--main-llm", default=None,
-                   help=f"conversion LLM (default: env OPENROUTER_MODEL, config 'model', or {DEFAULT_MODEL})")
-    p.add_argument("--model", default=None, help=argparse.SUPPRESS)  # deprecated alias
-    p.add_argument("--figure-llm", default=None,
-                   help="LLM for Phase 1 figure detection (default: same as --main-llm, "
-                        "or 'figure_llm' from config)")
+    p.add_argument("--model", default=None,
+                   help=f"OpenRouter model (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
     p.add_argument("--template", type=str, default=None, metavar="TEMPLATE",
                    help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
-    p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
+    p.add_argument("--no-render", action="store_true",
+                   help="skip PDF output (default: produce .qmd + verbatim PDF)")
     p.add_argument("--no-verify", action="store_true", help="skip the content-fidelity verify pass")
     p.add_argument("--json-report", action="store_true", help="write a comprehensive machine-readable <stem>-report.json alongside the output")
-    p.add_argument("--postfix", type=int, default=1, metavar="N", help="post-conversion fixes after verify (default: 1, 0 to disable)")
-    p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and postfix existing output")
+    p.add_argument("--no-postfix", action="store_true",
+                   help="disable the post-conversion repair loop")
+    p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and run the repair loop on existing output")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")
     p.add_argument("--max-cost-per-file", type=float, default=None, metavar="EUR",
                    help="skip a file whose pre-flight estimate exceeds this (EUR); "
@@ -338,8 +234,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Use 1 for sequential)")
     p.add_argument("--quiet", action="store_true", help="plain logging output (no rich UI)")
     p.add_argument("--verbose", action="store_true", help="DEBUG logging")
+    p.add_argument("--strip-chrome", action="store_true", default=False,
+                   help="after conversion, strip running headers/footers/page numbers "
+                        "from the output")
+    # deprecated alias: 1:1 (headers kept) is now the default, so this is a no-op
+    # kept only so existing invocations don't break
     p.add_argument("--keep-headers", action="store_true", default=False,
-                   help="keep running headers/footers (only useful with --format qmd)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--setup", action="store_true", help="interactive setup: configure API key and default model")
     return p
 
@@ -508,17 +409,21 @@ def main() -> int:
             log.error("No API key provided (%s). Set OPENROUTER_API_KEY or run "
                       "'pdf2md --setup'.", describe_key_sources())
             return 1
-    model = resolve_model(args.main_llm or args.model)
-    figure_llm = resolve_figure_llm(args.figure_llm, main_model=model)
+    model = resolve_model(args.model)
+
+    if args.keep_headers:
+        log.info("--keep-headers is deprecated: headers are kept by default now "
+                 "(use --strip-chrome to remove them)")
 
     batch = args.path.is_dir()
     events, rich_active = _setup_ui_and_logging(args, batch)
 
     common = dict(
-        api_key=api_key, model=model, figure_llm=figure_llm, cover_model=args.cover_model,
-        do_render=args.render, do_verify=not args.no_verify, force=args.force,
-        format=args.format, strip_headers=(not args.keep_headers),
-        postfix_passes=args.postfix,
+        api_key=api_key, model=model, cover_model=args.cover_model,
+        do_render=not args.no_render,
+        do_verify=not args.no_verify, force=args.force,
+        format=args.format, strip_chrome=args.strip_chrome,
+        postfix_passes=0 if args.no_postfix else 3,
         improve_only=args.improve,
         max_cost_per_file=eur_to_usd(args.max_cost_per_file),
         allow_over_budget=args.allow_over_budget,
