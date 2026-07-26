@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -409,6 +410,15 @@ def convert_one(
             events.file_done(result)
             return result
 
+    # ---- Temp-dir redirect (avoids Deno KV disk I/O on synced FS) ----
+    real_out_root = out_root
+    _temp_root = None
+    if not improve_only:
+        _temp_root = Path(tempfile.mkdtemp(prefix="pdf2md-"))
+        out_root = _temp_root
+        out_dir = out_root / stem
+        result.out_dir = out_dir
+
     try:
         import time as _time
         t0 = _time.perf_counter()
@@ -504,7 +514,12 @@ def convert_one(
         results = []
         t_verify = _time.perf_counter()
         report_meta = {"stem": stem, "date": _time.strftime("%d %b %Y"),
-                       "pages": (estimate or {}).get("pages"), "model": model,
+                       "pages": (estimate or {}).get("pages"),
+                       "model": model,
+                       "model_cover": cover_model,
+                       "model_detect": figure_llm or model,
+                       "model_convert": model,
+                       "model_repair": "google/gemini-2.5-flash",
                        "cost_convert": round(sum(result.phase_cost.values()), 4)}
         if do_verify and format == "qmd":
             events.verify_start()
@@ -607,6 +622,25 @@ def convert_one(
     if out_dir.exists():
         _persist_result(result)
         _cleanup_artifacts(out_dir)
+
+    # ---- Copy from temp dir to real output (undo the temp-dir redirect) ----
+    if _temp_root is not None:
+        src = out_dir
+        dst = real_out_root / stem
+        if dst.exists():
+            shutil.rmtree(dst)
+        if src.exists():
+            shutil.copytree(src, dst)
+            result.out_dir = dst
+            if result.qmd:
+                result.qmd = dst / result.qmd.name
+            if result.pdf_out:
+                result.pdf_out = dst / result.pdf_out.name
+            if result.verify_report:
+                result.verify_report = dst / result.verify_report.name
+        shutil.rmtree(_temp_root, ignore_errors=True)
+        _temp_root = None
+
     events.file_done(result)
     return result
 

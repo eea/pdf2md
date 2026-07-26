@@ -89,6 +89,13 @@ def _deterministic_pass(qmd_path, out_dir, verify_results, api_key):
             fixes.append('headings: restored {} missing heading(s) from source outline'
                          .format(n_head))
 
+    artifacts_check = verify_by_name.get('artifacts')
+    if artifacts_check and artifacts_check.status in ('warn', 'fail'):
+        n_artifacts = _strip_artifacts(qmd_path)
+        if n_artifacts:
+            fixes.append('artifacts: stripped {} leftover Office/reference artifact(s)'
+                         .format(n_artifacts))
+
     return fixes, cost
 
 
@@ -291,6 +298,28 @@ def run_repair_loop(qmd_path, out_dir, verify_results, api_key, max_iterations=3
         }
 
     return summary
+
+
+_ARTIFACT_PATTERNS = (
+    re.compile(r"[Ee]rror!\s*Reference source not found\.?"),
+    re.compile(r"[Ee]rror!\s*Bookmark not defined\.?"),
+    re.compile(r"[Ee]rror!\s*Hyperlink reference not valid\.?"),
+    re.compile(r"#REF!"),
+)
+
+
+def _strip_artifacts(qmd_path):
+    """Remove leftover Word/Office field-code artifacts (e.g. "Error! Reference
+    source not found.", "#REF!") that sometimes survive PDF conversion. Free —
+    pure regex substitution, no LLM. Returns the number of replacements made."""
+    text = qmd_path.read_text(encoding='utf-8')
+    n = 0
+    for pat in _ARTIFACT_PATTERNS:
+        text, count = pat.subn('[missing reference]', text)
+        n += count
+    if n:
+        qmd_path.write_text(text, encoding='utf-8')
+    return n
 
 
 def _strip_header_bleed(qmd_path):

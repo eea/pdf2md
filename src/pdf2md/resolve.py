@@ -5,6 +5,7 @@ frontmatter to satisfy validate_qmd_files.py, and a handful of HTML-table fixes
 for the HTML→Typst path.
 """
 
+import datetime
 import logging
 import re
 from pathlib import Path
@@ -605,13 +606,14 @@ def _apply_template_frontmatter(qmd_text: str, template_ref) -> str:
     return "---\n" + "\n".join(merged) + "\n---" + body
 
 def normalize_frontmatter(
-    qmd_text: str, category: str = "uncategorized", date: str = None,
+    qmd_text: str, category: str = None, date: str = None,
     cover_fields: dict = None,
     keep_template_fields = False,  # bool or template path/URL
 ) -> str:
     """Ensure the .qmd frontmatter carries the fields the PR gate requires.
 
-    Always forces `category` (taxonomy label the model must not guess). Injects
+    When `category` is None (verbatim mode), no category field is injected.
+    Otherwise forces `category` (taxonomy label the model must not guess). Injects
     `date` if the model omitted one (validate_qmd_files.py requires it); a
     model-supplied date is kept. Prepends a minimal block if there's no frontmatter.
 
@@ -625,6 +627,26 @@ def normalize_frontmatter(
         return _apply_template_frontmatter(qmd_text, keep_template_fields)
 
     m = fm_re.match(qmd_text.lstrip())
+    # Validate: the extracted frontmatter must actually look like YAML. When the
+    # LLM opens `---` but never closes it properly, the DOTALL regex above can
+    # match the first `\n---` found anywhere deep in the document (a fenced div,
+    # code block, or thematic break), eating body content into the "frontmatter".
+    # Guard against that by checking the first non-blank line looks like `key: value`.
+    if m:
+        fm_content = m.group(1).strip()
+        for line in fm_content.splitlines():
+            line = line.strip()
+            if line:
+                if not re.match(r"^[\w-]+\s*:", line):
+                    log.warning(
+                        "Frontmatter block doesn't look like valid YAML (first "
+                        "non-blank line %r) — treating as missing", line[:80])
+                    m = None
+                break
+        else:
+            # fm_content was entirely blank lines — not valid YAML either
+            log.warning("Frontmatter block was empty/blank — treating as missing")
+            m = None
     cat_line = f"category: {category}"
 
     def _set_or_add(fm: str, key: str, value: str) -> str:
@@ -638,11 +660,15 @@ def normalize_frontmatter(
         return fm.rstrip() + f"\n{key}: {quoted}"
 
     def _inject(fm: str) -> str:
-        # category always forced (controlled vocabulary)
-        if re.search(r"^\s*category\s*:", fm, re.MULTILINE):
-            fm = re.sub(r"^\s*category\s*:.*$", cat_line, fm, count=1, flags=re.MULTILINE)
+        # category — injected only when set (verbatim: category=None skips this)
+        if category:
+            if re.search(r"^\s*category\s*:", fm, re.MULTILINE):
+                fm = re.sub(r"^\s*category\s*:.*$", cat_line, fm, count=1, flags=re.MULTILINE)
+            else:
+                fm = fm.rstrip() + "\n" + cat_line
         else:
-            fm = fm.rstrip() + "\n" + cat_line
+            # verbatim: strip any existing category the LLM may have added
+            fm = re.sub(r"^\s*category\s*:.*\n?", "", fm, flags=re.MULTILINE)
         # cover fields override the converter's guesses where non-empty
         if cover_fields:
             for key in ("title", "subtitle", "version"):
@@ -653,12 +679,12 @@ def normalize_frontmatter(
         # which the operator should correct). date is required, so always set one.
         if not re.search(r"^\s*date\s*:", fm, re.MULTILINE):
             cover_date = cover_fields.get("date", "") if cover_fields else ""
-            chosen = cover_date or (date or "")
+            chosen = cover_date or (date or "") or datetime.date.today().isoformat()
             if chosen:
                 fm = fm.rstrip() + f"\ndate: '{chosen}'"
-                if not cover_date and chosen == date:
+                if not cover_date and chosen != cover_date:
                     log.warning("No date on cover or in converter output — defaulting to %s "
-                                "(operator should correct)", date)
+                                "(operator should correct)", chosen)
         # coerce whatever date is present to YYYY-MM-DD (the PR gate requires it)
         dm = re.search(r"^\s*date\s*:\s*(.+)$", fm, re.MULTILINE)
         if dm:
@@ -670,13 +696,18 @@ def normalize_frontmatter(
         # subtitle is required by the PR gate; emit an empty one when none supplied
         if not re.search(r"^\s*subtitle\s*:", fm, re.MULTILINE):
             fm = fm.rstrip() + "\nsubtitle: ''"
+        # title is required by the PR gate; emit a placeholder when none supplied
+        if not re.search(r"^\s*title\s*:", fm, re.MULTILINE):
+            fm = fm.rstrip() + "\ntitle: ''"
         return fm
 
     if not m:
         log.warning("Converter output had no YAML frontmatter — prepending a minimal block")
-        fields = [cat_line]
+        fields = []
+        if category:
+            fields.append(cat_line)
         cover_date = cover_fields.get("date", "") if cover_fields else ""
-        chosen_date = cover_date or (date or "")
+        chosen_date = cover_date or (date or "") or datetime.date.today().isoformat()
         if chosen_date:
             fields.append(f"date: '{_coerce_date(chosen_date)}'")
         if cover_fields:
@@ -687,6 +718,9 @@ def normalize_frontmatter(
         # subtitle required by the PR gate — emit it even when empty
         sub = (cover_fields or {}).get('subtitle', '').replace("'", "''")
         fields.append(f"subtitle: '{sub}'")
+        # title required by the PR gate — emit it even when empty
+        if not any(f.startswith("title:") for f in fields):
+            fields.append("title: ''")
         return f"---\n{chr(10).join(fields)}\n---\n\n{qmd_text.lstrip()}"
 
     body_start = qmd_text.lstrip()[m.end():]

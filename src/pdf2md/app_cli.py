@@ -323,8 +323,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--figure-llm", default=None,
                    help="LLM for Phase 1 figure detection (default: same as --main-llm, "
                         "or 'figure_llm' from config)")
-    p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
-                   help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
+    p.add_argument("--cover-llm", default=DEFAULT_COVER_MODEL, dest="cover_model",
+                   help=f"LLM for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
+    p.add_argument("--cover-model", default=None, dest="cover_model_deprecated",
+                   help=argparse.SUPPRESS)  # deprecated alias
     p.add_argument("--template", type=str, default=None, metavar="TEMPLATE",
                    help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
     p.add_argument("--no-render", action="store_true",
@@ -537,6 +539,7 @@ def main() -> int:
             return 1
     model = resolve_model(args.main_llm or args.model)
     figure_llm = resolve_figure_llm(args.figure_llm, main_model=model)
+    cover_model = args.cover_model or args.cover_model_deprecated or DEFAULT_COVER_MODEL
 
     if args.keep_headers:
         log.info("--keep-headers is deprecated: headers are kept by default now "
@@ -546,7 +549,7 @@ def main() -> int:
     events, rich_active = _setup_ui_and_logging(args, batch)
 
     common = dict(
-        api_key=api_key, model=model, figure_llm=figure_llm, cover_model=args.cover_model,
+        api_key=api_key, model=model, figure_llm=figure_llm, cover_model=cover_model,
         do_render=not args.no_render, do_verify=not args.no_verify, force=args.force,
         format=args.format, strip_chrome=args.strip_chrome,
         postfix_passes=args.postfix,
@@ -571,7 +574,7 @@ def main() -> int:
             import json as _json
             for r in results:
                 if r.status in ("ok", "warn") and hasattr(r, "timing"):
-                    report = _build_json_report(r, r.timing, model, args.cover_model)
+                    report = _build_json_report(r, r.timing, model, cover_model)
                     report_path = r.out_dir / f"{r.stem}-report.json"
                     report_path.write_text(_json.dumps(report, indent=2, default=str), encoding="utf-8")
                     log.info("Wrote json report: %s", report_path)
