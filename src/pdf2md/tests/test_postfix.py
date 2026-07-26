@@ -407,3 +407,39 @@ def test_postfix_footnotes_noop_when_all_linked(tmp_path):
     qmd = tmp_path / "d.qmd"
     qmd.write_text("Text with a ref.[^1]\n\n[^1]: linked note.\n", encoding="utf-8")
     assert _postfix_footnotes(qmd, tmp_path) == 0
+
+
+# ── focused-crop table repair ───────────────────────────────────────────────────
+
+def test_qmd_table_spans_finds_pipe_and_html_blocks():
+    from pdf2md.postfix import _qmd_table_spans
+    qmd = (
+        "Intro text.\n\n"
+        "| A | B |\n|---|---|\n| x1 | y1 |\n\n"
+        "Prose between.\n\n"
+        "```{=html}\n<table><tr><td>alpha</td><td>beta</td></tr></table>\n```\n\n"
+        "Tail.\n"
+    )
+    spans = _qmd_table_spans(qmd)
+    assert len(spans) == 2
+    (s1, e1, t1), (s2, e2, t2) = spans
+    assert "x1" in t1 and "y1" in t1
+    assert "alpha" in t2 and "beta" in t2
+    assert qmd[s2:e2].startswith("```{=html}") and qmd[s2:e2].endswith("```")
+
+
+def test_crop_replace_guard():
+    from pdf2md.postfix import _crop_replace_ok
+    dist = {"v1", "v2", "v3", "v4"}
+    src = dist | {"header", "unit"}
+    block = {"v1", "v2", "header"}          # incumbent holds 2 of 4 values
+    better = {"v1", "v2", "v3", "header"}   # keeps both, gains one → ok
+    assert _crop_replace_ok(dist, better, block, src)
+    lossy = {"v1", "v3", "v4"}              # gains two but LOSES v2 → decline
+    assert not _crop_replace_ok(dist, lossy, block, src)
+    nogain = {"v1", "v2"}                   # keeps but adds nothing → decline
+    assert not _crop_replace_ok(dist, nogain, block, src)
+    merged_block = block | {"other%d" % i for i in range(10)}  # mostly alien content
+    assert not _crop_replace_ok(dist, better, merged_block, src)  # multi-page merge
+    third_alien = block | {"o1", "o2"}      # ~40% alien: above the 0.25 ceiling
+    assert not _crop_replace_ok(dist, better, third_alien, src)

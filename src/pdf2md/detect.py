@@ -307,6 +307,12 @@ def detect_figures(
         with _fitz_lock:
             page_regions = [r for b in boxes
                             if (r := _box_to_region(b, doc[i], i)) is not None]
+            # keep excluded-table bboxes as rtype="table" regions: they reach the
+            # detections.json sidecar so the table-repair postfix can re-convert
+            # tables find_tables can't see (borderless / color-coded grids)
+            page_regions += [r for b in excluded
+                             if (r := _box_to_region({**b, "type": "table"},
+                                                     doc[i], i)) is not None]
         return {"i": i, "ok": True, "cost": page_cost,
                 "regions": page_regions, "excluded": len(excluded)}
 
@@ -333,7 +339,7 @@ def detect_figures(
         if page_regions or res["excluded"]:
             log.info(
                 "  page %d: %d figure(s)%s",
-                i + 1, len(page_regions),
+                i + 1, sum(1 for r in page_regions if r.rtype == "figure"),
                 f", {res['excluded']} table(s) excluded (preserved for transcription)"
                 if res["excluded"] else "",
             )

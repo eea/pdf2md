@@ -107,6 +107,16 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'tables: re-emitted {} missing table(s) from source'.format(n_tbl))
 
+    # Pass 4: focused-crop repair of PARTIALLY-mangled tables (substitutive). Pass 3
+    # only recovers fully-missing tables — one that survived thin is invisible to it.
+    # Also not gated on status: the aggregate can read ok while one table sits at 0%.
+    if api_key and table_check and table_check.status != 'skipped':
+        n_crop, crop_cost = _repair_thin_tables(qmd_path, out_dir, api_key)
+        summary['cost_usd'] += crop_cost
+        if n_crop:
+            summary['postfixes_applied'].append(
+                'tables: re-converted {} thin table(s) from focused crops'.format(n_crop))
+
     # Re-verify
     if summary['postfixes_applied']:
         try:
@@ -588,6 +598,307 @@ def _llm_table_markdown(api_key, doc, pno, rows, normalize):
     return response.strip(), cost
 
 
+def _scan_source_tables(source_pdf):
+    """find_tables scan shared by the table passes.
+
+    Returns (tables, clean_lines): tables = [(pno, bbox, rows, ctx_tokens)] where ctx
+    is the chrome-free text preceding the table (crossing the page boundary, so a
+    page-top table still has its caption/paragraph to anchor on); clean_lines maps
+    pno -> [(y, txt)] chrome-free substantial lines. Running headers/footers are
+    excluded from context via a digit-insensitive repeats-across-pages signature —
+    they were stripped from the .qmd, so an anchor containing them can never match."""
+    import fitz
+    from .verify.textutil import normalize, tokens as _tok
+
+    def _chrome_sig(txt):
+        return re.sub(r'\d+', '#', normalize(txt))
+
+    doc = fitz.open(str(source_pdf))
+    try:
+        # first pass: all substantial lines per page (15-char floor keeps captions like
+        # "Table 5. …" while dropping stray glyphs)
+        page_lines = {}
+        for pno in range(doc.page_count):
+            lines = []
+            for b in doc[pno].get_text("dict").get("blocks", []):
+                for ln in b.get("lines", []):
+                    txt = "".join(s["text"] for s in ln["spans"]).strip()
+                    if len(txt) >= 15:
+                        lines.append((ln["bbox"][1], txt))
+            lines.sort()
+            page_lines[pno] = lines
+
+        total_pages = doc.page_count or 1
+        seen = defaultdict(set)
+        for pno, lines in page_lines.items():
+            for _y, txt in lines:
+                seen[_chrome_sig(txt)].add(pno)
+        chrome = {s for s, ps in seen.items() if len(ps) >= max(3, total_pages * 0.5)}
+
+        tables, clean_lines = [], {}
+        prev_tail = []
+        for pno in range(doc.page_count):
+            plines = [(y, txt) for y, txt in page_lines[pno] if _chrome_sig(txt) not in chrome]
+            clean_lines[pno] = plines
+            try:
+                found = doc[pno].find_tables().tables
+            except Exception:               # noqa: BLE001 — one bad page must not abort
+                found = []
+            for t in found:
+                rows = [r for r in t.extract() if any(c for c in r)]
+                if not rows:
+                    continue
+                above = [txt for y, txt in plines if y < t.bbox[1]]
+                pre = (prev_tail + above)[-10:]
+                tables.append((pno, tuple(t.bbox), rows, _tok(' '.join(pre))))
+            prev_tail = [txt for _, txt in plines]
+    finally:
+        doc.close()
+    return tables, clean_lines
+
+
+# ── Focused-crop table repair (substitutive) ────────────────────────────────────
+# Whole-doc conversion partially mangles dense tables (attention dilution over ~80
+# pages), and the additive Pass-3 recovery only fires on FULLY-missing tables — a
+# table that survived thin is invisible to it. Measured on 20 tables / 5 docs: a
+# focused 300-dpi crop of just the table region lifts them 81%→93% avg (44→100 on
+# the worst). Transcription is noisy run-to-run, so a guard keeps the incumbent
+# unless the crop is strictly better — the pass can only improve, never corrupt.
+
+_TBL_CROP_DPI = 300
+_TBL_CROP_MAX_COV = 0.9        # incumbent at/above this is left alone
+_TBL_CROP_MIN_DISTINCT = 8     # fewer distinctive values = sliver, not worth a call
+_TBL_CROP_INCUMBENT_MIN = 0.3  # below this the table is "missing" (Pass 3's job)
+_TBL_CROP_INSERT_MIN = 0.7     # a vision-found table must transcribe this well to insert
+_TBL_CROP_SYS = (
+    'You transcribe a data table to Markdown. Preserve EVERY cell value exactly as '
+    'written; never omit a row or summarize; join wrapped cell text. If the table has '
+    'merged/spanning cells, emit a raw HTML <table> instead of a pipe table. '
+    'Output ONLY the table, no commentary.')
+
+
+def _tbl_md_tokens(md):
+    """Normalized word tokens of a markdown/HTML table blob — the common coin all
+    coverage comparisons in this pass are made in."""
+    from .verify.textutil import normalize
+    txt = re.sub(r'<[^>]+>', ' ', md)
+    txt = txt.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+    return set(normalize(txt).split())
+
+
+def _qmd_table_spans(qmd_text):
+    """(start, end, token_set) of each replaceable .qmd table block: ```{=html}```
+    fences containing a <table>, and pipe-table line runs outside those fences."""
+    raw = []
+    for m in re.finditer(r'```\{=html\}\n.*?\n```', qmd_text, re.DOTALL):
+        if '<table' in m.group(0).lower():
+            raw.append((m.start(), m.end()))
+    fenced = list(raw)
+    for m in re.finditer(r'(?m)^(?:\|[^\n]*\|[ \t]*\n?)+', qmd_text):
+        if not any(s <= m.start() < e for s, e in fenced):
+            raw.append((m.start(), m.end()))
+    return [(s, e, _tbl_md_tokens(qmd_text[s:e])) for s, e in sorted(raw)]
+
+
+def _crop_replace_ok(dist, new_toks, block_toks, src_toks):
+    """Replace only when strictly safer: the crop keeps every distinctive value the
+    incumbent block already has, adds at least one more, AND the block is mostly
+    THIS table — never overwrite a block that merged other content (e.g. the other
+    pages of a multi-page table, which a single-page crop cannot supply)."""
+    new_hit = dist & new_toks
+    inc_hit = dist & block_toks
+    if not (inc_hit <= new_hit and len(new_hit) > len(inc_hit)):
+        return False
+    # alien share 0.25: a replaced block may carry at most a quarter of content that
+    # is not this table's — replacing deletes that content, so keep the ceiling low
+    # (0.5 allowed losing up to half a merged block; measured -1.4pt on one doc)
+    return len(block_toks - src_toks) <= 0.25 * len(block_toks)
+
+
+def _crop_table_md(api_key, doc, pno, bbox, est_chars):
+    """One focused vision call: render the table bbox at 300 dpi and transcribe it.
+    max_tokens is PROPORTIONAL to the table's own text volume — ~est_chars/4 source
+    tokens with 4x headroom gives cap ≈ est_chars — clamped to [2000, 16000]: big
+    enough that no legitimate table clips, small enough that a repetition runaway
+    fails fast and cheap."""
+    import base64
+    import fitz
+    from .llm_client import call_vision
+    from .cost import usage_cost
+
+    png = doc[pno].get_pixmap(clip=fitz.Rect(*bbox), dpi=_TBL_CROP_DPI).tobytes('png')
+    uri = 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')
+    cap = max(2000, min(16000, int(est_chars)))
+    try:
+        md, usage = call_vision(
+            api_key=api_key, model=_REPAIR_MODEL, system_instruction=_TBL_CROP_SYS,
+            user_prompt='Transcribe the table in this cropped image.',
+            image_data_uris=[uri], timeout=120, max_tokens=cap,
+            response_format=None, return_usage=True)
+    except RuntimeError as e:               # truncation / API failure → decline
+        log.warning('table-crop p%d: %s', pno + 1, e)
+        return None, 0.0
+    md = md.strip()
+    md = re.sub(r'^```[^\n]*\n', '', md)
+    md = re.sub(r'\n```$', '', md).strip()
+    if '<table' in md.lower():
+        md = '```{=html}\n' + md + '\n```'
+    return (md or None), usage_cost(usage)
+
+
+def _repair_thin_tables(qmd_path, out_dir, api_key):
+    """Re-convert partially-mangled tables from focused crops, in place.
+
+    Region set = find_tables grids ∪ vision-detected excluded_tables (borderless
+    grids find_tables can't see, from the detections.json sidecar). Each region is
+    scored by its DISTINCTIVE values against the .qmd's table blocks; a thin
+    incumbent (< _TBL_CROP_MAX_COV) is re-converted from a 300-dpi crop and
+    replaced only if _crop_replace_ok holds. A vision-only region with no incumbent
+    is inserted at its anchored position when the crop transcribes well. One retry
+    per region (transcription is noisy). Returns (n_changed, llm_cost)."""
+    import fitz
+    from .verify.textutil import normalize
+
+    stem = qmd_path.stem
+    source_pdf = _body_pdf(out_dir, stem)
+    if not source_pdf.exists():
+        return 0, 0.0
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+
+    try:
+        found, clean_lines = _scan_source_tables(source_pdf)
+    except Exception as e:                  # noqa: BLE001 — repair must never abort
+        log.warning('Table-crop repair: could not scan source: %s', e)
+        return 0, 0.0
+
+    # unified region list: (pno, bbox, src_toks, ctx_tokens, est_chars, origin)
+    regions = []
+    for pno, bbox, rows, ctx in found:
+        ncols = max((len(r) for r in rows), default=0)
+        if ncols >= 45 or len(rows) * ncols >= 2500:
+            continue                        # oversized → cropped as a figure upstream
+        cells = [normalize(c) for r in rows for c in r if c]
+        stoks = set(t for c in cells for t in c.split())
+        regions.append((pno, bbox, stoks, ctx,
+                        sum(len(c) + 1 for c in cells), 'grid'))
+
+    det = out_dir / 'detections.json'
+    if det.exists():
+        try:
+            others = json.loads(det.read_text(encoding='utf-8')).get('other_detections', [])
+        except Exception:                   # noqa: BLE001
+            others = []
+        grid_boxes = defaultdict(list)
+        for pno, bbox, _s, _c, _e, _o in regions:
+            grid_boxes[pno].append(bbox)
+        doc = fitz.open(str(source_pdf))
+        try:
+            for r in others:
+                if r.get('rtype') != 'table' or not r.get('bbox'):
+                    continue
+                pno, bbox = int(r['page']), tuple(r['bbox'])
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                if any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3]
+                       for b in grid_boxes.get(pno, [])):
+                    continue                # find_tables already owns this region
+                if not (0 <= pno < doc.page_count):
+                    continue
+                clip = doc[pno].get_text(clip=fitz.Rect(*bbox))
+                stoks = set(normalize(clip).split())
+                above = [t for y, t in clean_lines.get(pno, []) if y < bbox[1]]
+                from .verify.textutil import tokens as _tok
+                regions.append((pno, bbox, stoks, _tok(' '.join(above[-10:])),
+                                len(clip), 'vision'))
+        finally:
+            doc.close()
+
+    if not regions:
+        return 0, 0.0
+    df = Counter()
+    for _p, _b, stoks, _c, _e, _o in regions:
+        for t in stoks:
+            df[t] += 1
+    spans = _qmd_table_spans(qmd_text)
+    words, starts, ends = _qmd_word_offsets(qmd_text)
+
+    doc = fitz.open(str(source_pdf))
+    edits, used, cost = [], set(), 0.0
+    try:
+        for pno, bbox, stoks, ctx, est_chars, origin in regions:
+            dist = {t for t in stoks if df[t] <= 2}
+            if len(dist) < _TBL_CROP_MIN_DISTINCT:
+                log.debug('table-crop p%d %s: skip, %d distinctive value(s)',
+                          pno + 1, origin, len(dist))
+                continue
+            best, inc_cov = None, 0.0
+            for sp in spans:
+                c = len(dist & sp[2]) / len(dist)
+                if c > inc_cov:
+                    best, inc_cov = sp, c
+            if inc_cov >= _TBL_CROP_MAX_COV:
+                log.debug('table-crop p%d %s: skip, incumbent %.0f%%',
+                          pno + 1, origin, 100 * inc_cov)
+                continue
+
+            def _score(m):
+                return len(dist & _tbl_md_tokens(m)) / len(dist) if m else 0.0
+            md, c1 = _crop_table_md(api_key, doc, pno, bbox, est_chars)
+            cost += c1
+            if _score(md) <= inc_cov:       # noisy — one retry before declining
+                md2, c2 = _crop_table_md(api_key, doc, pno, bbox, est_chars)
+                cost += c2
+                if _score(md2) > _score(md):
+                    md = md2
+            if not md:
+                log.debug('table-crop p%d %s: decline, no usable transcription',
+                          pno + 1, origin)
+                continue
+            new_toks = _tbl_md_tokens(md)
+
+            if best is not None and inc_cov >= _TBL_CROP_INCUMBENT_MIN:
+                s, e, btoks = best
+                if (s, e) in used:
+                    log.debug('table-crop p%d %s: decline, block already claimed',
+                              pno + 1, origin)
+                    continue
+                if _crop_replace_ok(dist, new_toks, btoks, stoks):
+                    used.add((s, e))
+                    if qmd_text[s:e].endswith('\n') and not md.endswith('\n'):
+                        md += '\n'
+                    edits.append((s, e, md))
+                    log.info('table-crop p%d %s: replacing block (%.0f%% -> %.0f%% '
+                             'of %d distinctive values)', pno + 1, origin,
+                             100 * inc_cov, 100 * _score(md), len(dist))
+                else:
+                    log.debug('table-crop p%d %s: guard declined (inc %.0f%%, '
+                              'crop %.0f%%)', pno + 1, origin,
+                              100 * inc_cov, 100 * _score(md))
+            elif origin == 'vision' and len(dist & new_toks) / len(dist) >= _TBL_CROP_INSERT_MIN:
+                at = _anchor_by_context(words, ends, ctx)
+                if at is None:
+                    log.debug('table-crop p%d vision: decline, no unique anchor', pno + 1)
+                    continue                # no unique anchor → decline, never append
+                safe = _safe_boundary(qmd_text, at)
+                if safe is None:
+                    continue
+                edits.append((safe, safe, md + '\n\n'))
+                log.info('table-crop p%d vision: inserting missing table (%.0f%% of '
+                         '%d distinctive values)', pno + 1, 100 * _score(md), len(dist))
+            else:
+                log.debug('table-crop p%d %s: decline (inc %.0f%% below replace floor, '
+                          'crop %.0f%%)', pno + 1, origin, 100 * inc_cov, 100 * _score(md))
+    finally:
+        doc.close()
+
+    if not edits:
+        return 0, cost
+    for s, e, md in sorted(edits, reverse=True):
+        qmd_text = qmd_text[:s] + md + qmd_text[e:]
+    qmd_path.write_text(qmd_text, encoding='utf-8')
+    log.info('postfix: re-converted %d thin table(s) from focused crops', len(edits))
+    return len(edits), cost
+
+
 def _recover_missing_tables(qmd_path, out_dir, api_key=None):
     """Re-emit source tables whose data never reached the .qmd. Returns (count, llm_cost).
 
@@ -615,56 +926,8 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
     for g in _qmd_grids(qmd_text):
         qtoks |= _tokens_of(g)
 
-    from .verify.textutil import tokens as _tok
-
-    def _chrome_sig(txt):
-        return re.sub(r'\d+', '#', normalize(txt))
-
-    doc = fitz.open(str(source_pdf))
-    try:
-        # first pass: all substantial lines per page (15-char floor keeps captions like
-        # "Table 5. …" while dropping stray glyphs)
-        page_lines = {}
-        for pno in range(doc.page_count):
-            lines = []
-            for b in doc[pno].get_text("dict").get("blocks", []):
-                for ln in b.get("lines", []):
-                    txt = "".join(s["text"] for s in ln["spans"]).strip()
-                    if len(txt) >= 15:
-                        lines.append((ln["bbox"][1], txt))
-            lines.sort()
-            page_lines[pno] = lines
-
-        # running headers/footers were stripped from the .qmd during conversion, so they
-        # must be kept OUT of the anchor context or it will never match. Digit-insensitive
-        # signature, dropped when it repeats across pages (same detector as _build_units).
-        total_pages = doc.page_count or 1
-        seen = defaultdict(set)
-        for pno, lines in page_lines.items():
-            for _y, txt in lines:
-                seen[_chrome_sig(txt)].add(pno)
-        chrome = {s for s, ps in seen.items() if len(ps) >= max(3, total_pages * 0.5)}
-
-        # second pass: tables with chrome-free preceding context (across the page
-        # boundary, so a page-top table still has its caption/paragraph to anchor on)
-        tables = []
-        prev_tail = []
-        for pno in range(doc.page_count):
-            plines = [(y, txt) for y, txt in page_lines[pno] if _chrome_sig(txt) not in chrome]
-            try:
-                found = doc[pno].find_tables().tables
-            except Exception:               # noqa: BLE001 — one bad page must not abort
-                found = []
-            for t in found:
-                rows = [r for r in t.extract() if any(c for c in r)]
-                if not rows:
-                    continue
-                above = [txt for y, txt in plines if y < t.bbox[1]]
-                pre = (prev_tail + above)[-10:]
-                tables.append((pno, rows, _tok(' '.join(pre))))
-            prev_tail = [txt for _, txt in plines]
-    finally:
-        doc.close()
+    tables = [(pno, rows, ctx)
+              for pno, _bbox, rows, ctx in _scan_source_tables(source_pdf)[0]]
 
     def toks_of(rows):
         out = set()

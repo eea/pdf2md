@@ -172,6 +172,11 @@ def run_phase1(
         timeout=timeout,
         workers=detect_workers,
     )
+    # split off excluded-table regions before the figure pipeline: they must not
+    # block oversized-table cropping or be materialized — they only ride along to
+    # the sidecar for the table-repair postfix
+    excluded_tables = [r for r in regions if r.rtype == "table"]
+    regions = [r for r in regions if r.rtype != "table"]
 
     # ── Step 2b: oversized tables (local), crop as figures ─────────────────────
     # the convert LLM silently drops huge tables (thousands of cells blow its
@@ -192,7 +197,7 @@ def run_phase1(
     figures = materialize_figures(
         working_pdf, regions, media_dir, dpi=figure_dpi, refine=refine
     )
-    others = [r for r in regions if r.rtype != "figure"]
+    others = [r for r in regions if r.rtype != "figure"] + excluded_tables
 
     inject_placeholders(working_pdf, figures, placeholders_pdf)
     size_mb = placeholders_pdf.stat().st_size / 1e6
