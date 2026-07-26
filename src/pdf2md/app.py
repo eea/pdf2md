@@ -278,6 +278,7 @@ def convert_one(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
@@ -410,7 +411,7 @@ def convert_one(
 
         # Phase 1 — detect
         do_strip = strip_headers
-        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
+        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=figure_llm or model,
                         do_strip_chrome=do_strip,
                         cover_model=cover_model, events=events,
                         detect_workers=detect_workers)
@@ -551,6 +552,7 @@ def convert_batch(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
