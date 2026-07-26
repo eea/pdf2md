@@ -219,19 +219,32 @@ def _select_llm(prompt: str, api_key: str, default: str = "",
 def run_setup() -> int:
     """Interactive setup: API key (+ optional Quarto path), saved to ~/.pdf2md/."""
     import json
-    print("pdf2md — one-time setup\n")
-    print("Paste your OpenRouter API key (or press Enter to skip):")
-    key = input("> ").strip()
-    if key:
-        if not key.startswith("sk-or-"):
-            print("  Error: key must start with 'sk-or-' (OpenRouter API key format).")
-            return 1
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        KEY_FILE.write_text(key, encoding="utf-8")
-        KEY_FILE.chmod(0o600)
-        print(f"  Key saved to {KEY_FILE} (permissions 600)\n")
+    print("pdf2md — one—time setup\n")
+    existing = resolve_key()
+    if existing:
+        print(f"Valid OpenRouter API key found at {KEY_FILE}")
+        ans = input("Replace? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            key = existing
+            print("  (keeping existing key)\n")
+        else:
+            key = ""
     else:
-        print("  (skipped -- set OPENROUTER_API_KEY env var to use pdf2md)\n")
+        key = ""
+
+    if not key:
+        print("Paste your OpenRouter API key (or press Enter to skip):")
+        key = input("> ").strip()
+        if key:
+            if not key.startswith("sk-or-"):
+                print("  Error: key must start with 'sk-or-' (OpenRouter API key format).")
+                return 1
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            KEY_FILE.write_text(key, encoding="utf-8")
+            KEY_FILE.chmod(0o600)
+            print(f"  Key saved to {KEY_FILE} (permissions 600)\n")
+        else:
+            print("  (no key — set OPENROUTER_API_KEY env var to use pdf2md)\n")
 
     cfg = {}
 
