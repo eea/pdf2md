@@ -336,9 +336,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(deterministic fixes → LLM missing-text → vision patches → "
                         "re-verify; default 3)")
     p.add_argument("--no-postfix", action="store_const", const=0, dest="postfix",
-                   help="disable the repair loop entirely")
-    p.add_argument("--no-repair", action="store_const", const=0, dest="postfix",
-                   help="alias for --no-postfix: disable the repair loop entirely")
+                   help=argparse.SUPPRESS)  # deprecated
+    p.add_argument("--no-review", action="store_const", const=0, dest="postfix",
+                   help="disable the post-conversion review/repair loop")
     p.add_argument("--improve", action="store_true", help="skip conversion, only re-verify and run the repair loop on existing output")
     p.add_argument("--force", action="store_true", help="overwrite existing output/<doc>/")
     p.add_argument("--max-cost-per-file", type=float, default=None, metavar="EUR",
