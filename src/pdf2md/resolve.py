@@ -11,8 +11,9 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# body figure: ![caption](FIG_3)
-_FIG_IMG_RE = re.compile(r"!\[(.+?)\]\s*\.?\s*\(\s*(FIG_(\d+))[^)]*\)")
+# body figure: ![caption](FIG_3). Alt may be EMPTY — the prompt itself instructs
+# "![](FIG_n)" for caption-less figures, so `.+?` left those tokens unresolved.
+_FIG_IMG_RE = re.compile(r"!\[(.*?)\]\s*\.?\s*\(\s*(FIG_(\d+))[^)]*\)")
 # figure inside a raw-HTML table cell: <img src="FIG_3" …> (whole tag captured, so
 # an unresolvable token can be replaced by a marker instead of a broken <img>)
 _FIG_HTML_RE = re.compile(r'(<img\b[^>]*\bsrc\s*=\s*["\'])\s*(FIG_(\d+))\s*(["\'][^>]*/?>)', re.IGNORECASE)

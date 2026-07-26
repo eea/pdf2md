@@ -1079,6 +1079,15 @@ class TestResolveFigTokens:
         assert set(rep["resolved"]) == {"FIG_1", "FIG_2"}
         assert rep["hallucinated"] == [] and rep["unreferenced"] == []
 
+    def test_resolves_empty_caption_token(self, tmp_path):
+        # the prompt instructs "![](FIG_n)" for caption-less figures; the resolver
+        # must not require a non-empty alt (it silently skipped these before)
+        from pdf2md.resolve import resolve_fig_tokens
+        body = "Intro\n\n![](FIG_1)\n"
+        out, rep = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert "](doc-media/img-aaa.png)" in out and "(FIG_1)" not in out
+        assert "FIG_1" in rep["resolved"]
+
     def test_hallucinated_token_becomes_marker(self, tmp_path):
         from pdf2md.resolve import resolve_fig_tokens
         body = "![bogus](FIG_9)\n"
