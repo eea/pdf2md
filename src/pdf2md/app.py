@@ -473,6 +473,18 @@ def convert_one(
         result.timing["phase25"] = round(_time.perf_counter() - t_phase25, 3)
         result.tables = _count_tables(result.qmd)
 
+        # Phase 2.9 — pre-render sanitize. Phase 2 / rescue / tablefix can leave
+        # nested image markdown (`![](![alt](path))`) in the .qmd; Quarto turns
+        # that literally into `image("![alt](path)")` in the Typst output instead
+        # of failing, so it must be cleaned BEFORE render, not just at the final
+        # lint gate (Phase 4.6) which runs after render/verify/postfix. The final
+        # gate still runs afterward since postfix can reintroduce the hazard.
+        if format == "qmd" and result.qmd and Path(result.qmd).exists():
+            pre_lint_res = lint_qmd(Path(result.qmd))
+            if pre_lint_res.fixes:
+                log.info("Pre-render lint sanitized: %s",
+                         "; ".join(i.message for i in pre_lint_res.fixes))
+
         # Phase 3 — render. A render failure is a warn; the .qmd is still produced.
         render_failed = False
         t_render = _time.perf_counter()
