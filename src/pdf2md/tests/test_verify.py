@@ -556,3 +556,27 @@ class TestLayoutArtifact:
                 ["3 Algorithm ............. 12"], ["4 File naming ........... 25"]]
         page = self._Page("contents 1 Introduction 4 2 Product overview 8 3 Algorithm 12")
         assert _is_layout_artifact(page, rows) is True
+
+
+class TestProseCallout:
+    def test_prose_callout_detected(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        # one populated column of paragraph text (other column empty) -> prose box
+        rows = [["Although longer time series are generally preferred in phenology "
+                 "estimation because they improve smoothing stability and reduce edge "
+                 "effects, a shorter window can still work well.", ""],
+                ["Nevertheless regions with irregular seasonality or persistent cloud "
+                 "contamination may remain more sensitive to the input window length.", ""]]
+        assert _is_prose_callout(rows) is True
+
+    def test_two_column_glossary_kept(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        rows = [["SOSD", "start of season date, the day the season begins for the pixel"],
+                ["EOSD", "end of season date, the day the season ends for the pixel"],
+                ["MAXD", "date of maximum value within the growing season for the pixel"]]
+        assert _is_prose_callout(rows) is False   # 2 populated columns -> real table
+
+    def test_short_value_table_kept(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        rows = [["Band", "Res"], ["PPI", "500m"], ["QA", "500m"]]
+        assert _is_prose_callout(rows) is False

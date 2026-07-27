@@ -53,10 +53,31 @@ def _is_toc(rows: list) -> bool:
     return hits / len(lines) >= 0.6
 
 
+def _is_prose_callout(rows: list) -> bool:
+    """A bordered prose paragraph (a note/callout box) that find_tables split into a
+    1-column "table" — one populated column of PROSE, not tabular values. It's body
+    text, scored by text_coverage, so it must not count as a table (and the postfix
+    un-tables it). A real 2-column glossary is spared: it has >=2 populated columns."""
+    import statistics
+    ncols = max((len(row) for row in rows), default=0)
+    populated_rows = sum(1 for row in rows if any(c and normalize(c) for c in row))
+    if ncols == 0 or populated_rows == 0:
+        return False
+    populated_cols = sum(
+        1 for c in range(ncols)
+        if sum(1 for row in rows if c < len(row) and row[c] and normalize(row[c]))
+        >= max(1, populated_rows) / 2)
+    cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
+    if not cells:
+        return False
+    median_words = statistics.median(len(c.split()) for c in cells)
+    return populated_cols <= 1 and median_words >= 12
+
+
 def _is_layout_artifact(page, rows: list) -> bool:
     """True when a find_tables region is not a data table we score against.
 
-    Two disjoint cases, both content we intentionally don't render as a table:
+    Three disjoint cases, all content we intentionally don't render as a table:
 
     1. Page-layout false-positive — a sidebar or multi-column page layout that
        find_tables misreads as a 2-col "table" spanning the whole page (measured: a
@@ -67,8 +88,9 @@ def _is_layout_artifact(page, rows: list) -> bool:
        fills the page too but has many rows (measured: phantoms 1-2 rows, real tables
        7-28).
     2. A printed Table of Contents (see _is_toc) — dropped from the output on purpose.
+    3. A prose callout box (see _is_prose_callout) — body text, not a table.
     """
-    if _is_toc(rows):
+    if _is_toc(rows) or _is_prose_callout(rows):
         return True
     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
     if not cells:

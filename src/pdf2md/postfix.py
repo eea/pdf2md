@@ -1008,21 +1008,29 @@ def _repair_mangled_tables(qmd_path, out_dir, api_key):
             cost += c
             if not new_md:
                 continue
-            # v1: only REBUILD real tables; do not un-table prose (that fights the
-            # coverage metric, which counts find_tables-detected prose as tables)
-            if '|' not in new_md and '<table' not in new_md.lower():
+            new_is_prose = '|' not in new_md and '<table' not in new_md.lower()
+            # structure must improve: prose always beats a `| prose |` table; a rebuilt
+            # grid must shed its empty filler columns. (The coverage metric now excludes
+            # prose-callout regions, so un-tabling them no longer drags the score.)
+            if new_is_prose:
+                structure_better = True
+            else:
+                structure_better = _pipe_empty_ratio(new_md) <= old_ratio - _STRUCT_IMPROVE
+            if not structure_better:
                 continue
-            if _pipe_empty_ratio(new_md) > old_ratio - _STRUCT_IMPROVE:
-                continue                                # structure didn't improve
             # value preservation on the DATA (numbers), block↔new: robust to the split-
             # header formatting that made a coverage-vs-find_tables guard reject the fix
             old_nums = _numbers(block)
             if old_nums and len(old_nums & _numbers(new_md)) / len(old_nums) < _NUM_KEEP:
                 continue                                # would drop values → decline
-            tail = '\n' if block.endswith('\n') and not new_md.endswith('\n') else ''
-            edits.append((s, e, new_md + tail))
-            log.info('table-clean p%d: rebuilt grid (empty %.0f%%->%.0f%%, numbers kept)',
-                     pno + 1, 100 * old_ratio, 100 * _pipe_empty_ratio(new_md))
+            # prose replacing a table needs blank-line separation to stay its own block
+            body = ('\n' + new_md + '\n') if new_is_prose else new_md
+            tail = '\n' if block.endswith('\n') and not body.endswith('\n') else ''
+            edits.append((s, e, body + tail))
+            log.info('table-clean p%d: %s (empty %.0f%%%s, numbers kept)', pno + 1,
+                     'un-tabled to prose' if new_is_prose else 'rebuilt grid',
+                     100 * old_ratio,
+                     '->prose' if new_is_prose else '->%.0f%%' % (100 * _pipe_empty_ratio(new_md)))
     finally:
         doc.close()
 
