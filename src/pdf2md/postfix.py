@@ -502,8 +502,10 @@ def _recover_links(qmd_path, out_dir):
     if not source_pdf.exists():
         return 0, 0
 
+    from .verify.checks.link_preservation import _uri_in_qmd
+
     qmd = qmd_path.read_text(encoding='utf-8')
-    despaced = re.sub(r'\s+', '', qmd.lower())
+    qmd_lower = qmd.lower()
 
     pairs, seen = [], set()
     doc = fitz.open(str(source_pdf))
@@ -515,8 +517,12 @@ def _recover_links(qmd_path, out_dir):
                 if not uri or uri in seen:
                     continue
                 seen.add(uri)
-                if re.sub(r'\s+', '', uri.rstrip('/').lower()) in despaced:
-                    continue            # already present, nothing to restore
+                # "present" uses the SAME contiguous match as the verify check — else a
+                # URL wrapped mid-string reads as present here (whitespace-stripped) yet
+                # missing to the check, so it's neither restored nor counted (measured:
+                # 2 reference DOIs on one ATBD were broken across lines and lost this way)
+                if _uri_in_qmd(uri, qmd_lower):
+                    continue            # already present (contiguously), nothing to restore
                 anchor = ' '.join(page.get_textbox(l['from']).split())
                 anchor = anchor.strip(' .,;:)（(')   # keep punctuation outside the link
                 pairs.append((uri, anchor))

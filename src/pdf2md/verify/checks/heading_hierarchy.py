@@ -143,10 +143,14 @@ class HeadingHierarchyCheck:
                 f"{reordered} surviving heading(s) appear out of their source order",
                 "warn", "headings"))
 
-        # ── count mismatch ──
-        if abs(len(qmd_titles) - len(toc_titles)) > max(1, int(len(toc_titles) * _COUNT_TOLERANCE)):
+        # ── count mismatch: only a DEFICIT matters. The .qmd having MORE headings than
+        #    the bookmark outline is normal — the converter adds finer sub-headings the
+        #    outline omits (measured: 53 vs 41 on an ATBD, all legitimate). That is
+        #    structure gained, not lost; warn only on a real shortfall vs the outline. ──
+        deficit = len(toc_titles) - len(qmd_titles)
+        if deficit > max(1, int(len(toc_titles) * _COUNT_TOLERANCE)):
             findings.append(Finding(
-                f"source outline has {len(toc_titles)} heading(s) but the .qmd has "
+                f"source outline has {len(toc_titles)} heading(s) but the .qmd has only "
                 f"{len(qmd_titles)}", "warn", "headings"))
 
         status = "warn" if findings else "ok"
