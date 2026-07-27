@@ -521,3 +521,38 @@ def test_union_match_ignores_non_contributing_tables():
 def test_union_match_empty_source_is_covered():
     matched, content, used = _union_match(set(), [_tokens_of(["x y"])])
     assert content == 1.0 and used == 0 and matched == set()
+
+
+class TestLayoutArtifact:
+    """_is_layout_artifact: drop whole-page prose that find_tables misreads as a table
+    (<=2 populated rows) and printed TOCs, but keep real multi-row full-page tables."""
+
+    class _Page:
+        def __init__(self, text): self._t = text
+        def get_text(self): return self._t
+
+    def test_sidebar_prose_is_rejected(self):
+        # whole page in ~1 populated row (flowing text + grey side column) → artifact
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        prose = ("Users should use the VPP parameter layers together with their "
+                 "corresponding quality assurance layers for most applications.")
+        rows = [[prose, "5.0 Issue 2.0 Copernicus Land Monitoring Service EEA"]]
+        page = self._Page(prose + " 5.0 Issue 2.0 Copernicus Land Monitoring Service EEA")
+        assert _is_layout_artifact(page, rows) is True
+
+    def test_real_full_page_table_is_kept(self):
+        # fills the page BUT has many populated rows → real table, keep it
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        rows = [["Band", "Resolution", "Unit"], ["PPI", "500 m", "index"],
+                ["QFLAG", "500 m", "bitmask"], ["SOSD", "500 m", "day"],
+                ["EOSD", "500 m", "day"], ["MAXV", "500 m", "index"]]
+        page = self._Page("Band Resolution Unit PPI 500 m index QFLAG bitmask SOSD "
+                          "day EOSD MAXV")
+        assert _is_layout_artifact(page, rows) is False
+
+    def test_toc_is_rejected(self):
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        rows = [["1 Introduction ........... 4"], ["2 Product overview ....... 8"],
+                ["3 Algorithm ............. 12"], ["4 File naming ........... 25"]]
+        page = self._Page("contents 1 Introduction 4 2 Product overview 8 3 Algorithm 12")
+        assert _is_layout_artifact(page, rows) is True

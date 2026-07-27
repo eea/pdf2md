@@ -38,14 +38,61 @@ def _is_oversized(rows: list) -> bool:
     return ncols >= _OVERSIZE_COLS or len(rows) * ncols >= _OVERSIZE_CELLS
 
 
+_TOC_LEADER_RE = re.compile(r"[.…]\s*\d{1,4}\s*$")   # "… 25" dotted-leader page ref
+
+
+def _is_toc(rows: list) -> bool:
+    """A Table of Contents region. We deliberately do NOT transcribe the printed TOC
+    (Quarto rebuilds it from headings), so it must not count as a missing source table.
+    Signature: most non-empty lines end in a page number, usually via a dotted leader."""
+    lines = [(" ".join(c.split()) if c else "") for row in rows for c in row]
+    lines = [ln for ln in lines if ln.strip()]
+    if len(lines) < 4:
+        return False
+    hits = sum(1 for ln in lines if _TOC_LEADER_RE.search(ln))
+    return hits / len(lines) >= 0.6
+
+
+def _is_layout_artifact(page, rows: list) -> bool:
+    """True when a find_tables region is not a data table we score against.
+
+    Two disjoint cases, both content we intentionally don't render as a table:
+
+    1. Page-layout false-positive — a sidebar or multi-column page layout that
+       find_tables misreads as a 2-col "table" spanning the whole page (measured: a
+       PUM with a full-height grey side-column scored every page as a phantom table,
+       dragging table coverage 98% -> 16%). Signature: the region's tokens are
+       essentially the whole page AND it has <=2 POPULATED rows — flowing text, not a
+       grid. The populated-row test is what spares a real full-page data table, which
+       fills the page too but has many rows (measured: phantoms 1-2 rows, real tables
+       7-28).
+    2. A printed Table of Contents (see _is_toc) — dropped from the output on purpose.
+    """
+    if _is_toc(rows):
+        return True
+    cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
+    if not cells:
+        return False
+    ctok = {t for c in cells for t in c.split()}
+    ptok = set(normalize(page.get_text()).split())
+    if not ctok or not ptok:
+        return False
+    fills_page = (len(ctok & ptok) / len(ctok) > 0.5
+                  and len(ctok) / len(ptok) > 0.6)
+    populated_rows = sum(1 for row in rows if any(c and normalize(c) for c in row))
+    return fills_page and populated_rows <= 2
+
+
 def _source_grids(pdf_path) -> list:
-    """Extract table grids, excluding running header/footer chrome.
+    """Extract table grids, excluding running header/footer chrome and page-layout
+    false-positives.
 
     Chrome is stripped before conversion, so it must not be scored here — otherwise the
     page footer, which find_tables reports as a table on EVERY page, reads as missing
     content we removed on purpose (measured: 29 of 43 "tables" in one ATBD were footers,
     dragging table coverage from ~97% to 87.8%). The fingerprint heuristic below cannot
-    catch them, because the page number makes every footer unique.
+    catch them, because the page number makes every footer unique. `_is_layout_artifact`
+    additionally drops whole-page prose blocks a sidebar layout makes look like a table.
     """
     from ..textutil import _rect_center_in
 
@@ -62,11 +109,14 @@ def _source_grids(pdf_path) -> list:
         for pno in range(total_pages):
             boxes = chrome.get(pno, [])
             try:
-                for tab in doc[pno].find_tables().tables:
+                page = doc[pno]
+                for tab in page.find_tables().tables:
                     if boxes and _rect_center_in(tab.bbox, boxes):
                         continue
                     rows = tab.extract()
                     if _is_oversized(rows):
+                        continue
+                    if _is_layout_artifact(page, rows):
                         continue
                     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
                     if cells:
