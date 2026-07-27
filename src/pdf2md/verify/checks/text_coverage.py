@@ -47,6 +47,31 @@ _IGNORE_PATTERNS = [
     re.compile(r"^\d+$"),
 ]
 
+# Cover-page metadata and printed TOC/list dumps are dropped from the body on purpose
+# (the template regenerates a title page; Quarto rebuilds the TOC), so the postfix strips
+# them — and they must not then count as "missing" source text here. Same signatures as
+# postfix._strip_front_matter_noise, plus author affiliations (a name trailed by a
+# superscript digit) which are cover-only.
+_COVER_ANCHOR_RE = re.compile(
+    r"^\s*(contact|produced by|disclaimer|project officer|lead service providers?|"
+    r"document version|document date)\b", re.I)
+_COVER_PHRASE_RE = re.compile(
+    r"\ball rights reserved\b|\bno parts? of this document\b", re.I)
+_AFFILIATION_RE = re.compile(r"[A-Za-z]\s*[¹²³⁰-⁹]")  # "Jin¹"
+
+
+def _is_cover_or_toc(sentence: str) -> bool:
+    if _COVER_ANCHOR_RE.match(sentence) or _COVER_PHRASE_RE.search(sentence):
+        return True
+    if len(_AFFILIATION_RE.findall(sentence)) >= 2:      # an author-affiliation line
+        return True
+    toks = sentence.split()
+    if len(toks) >= 8:
+        nums = sum(1 for t in toks if re.fullmatch(r"\d+(\.\d+)*\.?", t))
+        if nums / len(toks) > 0.4:                       # a run-on of section numbers
+            return True
+    return False
+
 
 def _chrome_text_lines_fallback(lines, total_pages: int) -> set:
     """Identical-text fallback: lines that repeat on >= 50% of pages.
@@ -298,7 +323,8 @@ class TextCoverageCheck:
             _strip_structural_markers(txt) for _, txt in lines
             if not _ignored(normalize(txt)) and not _TOC_LEADER_RE.search(txt)
         ])
-        sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
+        sentences = [s for s in split_sentences(source_text)
+                     if len(tokens(s)) >= _MIN_TOKENS and not _is_cover_or_toc(s)]
 
         # STRICT (in-place) coverage: exclude the postfix recovery appendix — recovered
         # content is supplementary, out of document flow, not a faithful in-place match.

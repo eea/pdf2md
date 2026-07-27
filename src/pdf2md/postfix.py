@@ -128,6 +128,15 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'tables: cleaned {} structurally-mangled table(s)'.format(n_mang))
 
+    # Pass 5.5: strip leaked cover-page and TOC noise from the body (deterministic).
+    # Runs after the text passes so a recovered cover paragraph is dropped too.
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+    stripped_text, n_strip = _strip_front_matter_noise(qmd_text)
+    if n_strip:
+        qmd_path.write_text(stripped_text, encoding='utf-8')
+        summary['postfixes_applied'].append(
+            'front-matter: removed {} cover/TOC block(s)'.format(n_strip))
+
     # Pass 6: fence code the converter left unfenced (deterministic, no LLM). Runs LAST
     # so any code the earlier passes recovered into the body is fenced too — else its
     # `$` signs render as inline math.
@@ -475,6 +484,68 @@ _TABLE_ABSENT_MIN = 0.5    # recover when this share of a table's distinctive va
 _TABLE_MIN_DISTINCTIVE = 4  # ignore tables with too little unique data to judge
 _TABLE_MIN_ROWS = 2
 _TABLE_MIN_COLS = 2
+
+
+# ── Strip cover-page and TOC noise the converter left in the body ───────────────
+# The template regenerates a title page from the frontmatter (title/subtitle/date/
+# version), so the source cover's body text (contact, disclaimer, produced-by) is
+# redundant, and the printed TOC/list-of-figures is rebuilt by Quarto. The converter
+# is told to drop both but often leaks them — as cover paragraphs and a run-on line of
+# section numbers. Remove them by unambiguous signature; tables, headings and real
+# prose are kept (measured: a false "Copernicus Land Monitoring Service" phrase match
+# on body prose is why detection is anchor-based, not keyword-anywhere).
+
+_COVER_ANCHOR = re.compile(
+    r'^\s*(contact|produced by|disclaimer|project officer|lead service providers?|'
+    r'document version|document date)\b', re.I)
+_COVER_PHRASE = re.compile(r'\ball rights reserved\b', re.I)
+_TOC_DUMP = re.compile(r'\bcontents\b.*\d|\blist of (figures|tables)\b', re.I)
+
+
+def _is_toc_dump(block):
+    if _TOC_DUMP.search(block):
+        return True
+    toks = block.split()
+    if len(toks) < 8:
+        return False
+    nums = sum(1 for t in toks if re.fullmatch(r'\d+(\.\d+)*\.?', t))
+    return nums / len(toks) > 0.4          # a run-on of section numbers = a TOC dump
+
+
+def _strip_front_matter_noise(text):
+    """Remove leaked cover-page paragraphs and printed TOC/list dumps. Returns
+    (new_text, n_removed). Splits the body into blank-line blocks (code fences kept
+    intact) and drops a block only when it STARTS with a cover anchor, contains
+    'all rights reserved', or is a section-number run-on."""
+    m = re.match(r'^(---\n.*?\n---\n)', text, re.DOTALL)
+    head = m.group(1) if m else ''
+    body = text[len(head):]
+
+    blocks, cur, infence = [], [], False
+    for ln in body.split('\n'):
+        if ln.lstrip().startswith('```'):
+            infence = not infence
+        if not ln.strip() and not infence:
+            blocks.append('\n'.join(cur))
+            cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append('\n'.join(cur))
+
+    kept, removed = [], 0
+    for b in blocks:
+        s = b.strip()
+        if not s:
+            continue
+        first = s.split('\n', 1)[0]
+        if _COVER_ANCHOR.match(first) or _COVER_PHRASE.search(s) or _is_toc_dump(s):
+            removed += 1
+            continue
+        kept.append(b)
+    if not removed:
+        return text, 0
+    return head + '\n\n'.join(kept) + '\n', removed
 
 
 # ── Fence code the converter left unfenced ──────────────────────────────────────

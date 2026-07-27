@@ -528,3 +528,29 @@ def test_breadcrumb_comments_stripped_but_markers_kept():
     assert 'figures detected in Phase 1' not in cleaned
     assert '<!--pdf2md-repair-3-->' in cleaned      # functional marker kept
     assert 'Recovered sentence here.' in cleaned and '## Source links' in cleaned
+
+
+def test_strip_front_matter_noise():
+    from pdf2md.postfix import _strip_front_matter_noise
+    qmd = ("---\ntitle: X\n---\n"
+           "## DOCUMENT CHANGE LOG\n\n"
+           "| Issue | Date |\n|---|---|\n| 1.0 | 2025 |\n\n"
+           "1. Contents 1 1.1 1.2 2 2.1 3 3.1 List of figures Figure 6.\n\n"
+           "Contact:\nCLMS\nProject Officer: Someone\n\n"
+           "Disclaimer:\nAll Rights Reserved.\n\n"
+           "# Introduction\n\nWe deliver phenology products to users.\n")
+    out, n = _strip_front_matter_noise(qmd)
+    assert n == 3                                  # TOC, Contact block, Disclaimer block
+    assert "Contact:" not in out and "Disclaimer:" not in out
+    assert "1. Contents 1 1.1" not in out
+    assert "DOCUMENT CHANGE LOG" in out and "| Issue | Date |" in out  # kept
+    assert "# Introduction" in out and "We deliver phenology" in out    # kept
+
+
+def test_strip_front_matter_keeps_body_prose_mentioning_services():
+    from pdf2md.postfix import _strip_front_matter_noise
+    qmd = ("---\nt: x\n---\n# Intro\n\nWithin this framework, the Copernicus Land "
+           "Monitoring Service (CLMS) and the European Environment Agency (EEA) "
+           "deliver products.\n")
+    out, n = _strip_front_matter_noise(qmd)
+    assert n == 0 and "Within this framework" in out   # body prose untouched
