@@ -557,6 +557,20 @@ def test_strip_front_matter_keeps_body_prose_mentioning_services():
     assert n == 0 and "Within this framework" in out   # body prose untouched
 
 
+def test_strip_heading_numbers():
+    from pdf2md.postfix import _strip_heading_numbers
+    qmd = ("## 1. Introduction\n\n### 1.4.1 Applicable documents\n\n"
+           "text\n\n"
+           "```{=typst}\n#set text(size: 9pt)\n```\n\n"
+           "## 3D reconstruction\n\n## 5\n")
+    out, n = _strip_heading_numbers(qmd)
+    assert n == 2
+    assert "## Introduction" in out and "### Applicable documents" in out
+    assert "#set text(size: 9pt)" in out          # raw-typst line untouched
+    assert "## 3D reconstruction" in out          # not a section number
+    assert "## 5\n" in out                         # number-only heading kept as-is
+
+
 def test_ensure_pipe_table_blanks():
     from pdf2md.postfix import _ensure_pipe_table_blanks
     # header glued to a caption/heading -> blank inserted; already-spaced table untouched

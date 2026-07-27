@@ -155,6 +155,12 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd_text)
     cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # Quarto auto-numbers sections, so a manual number in the heading text renders doubled
+    cleaned, n_headnum = _strip_heading_numbers(cleaned)
+    if n_headnum:
+        summary['postfixes_applied'].append(
+            'headings: removed manual section number from {} heading(s) '
+            '(Quarto auto-numbers)'.format(n_headnum))
     # markdown safety: a pipe table glued to a heading/caption won't render as a table
     cleaned, n_tblblank = _ensure_pipe_table_blanks(cleaned)
     if cleaned != qmd_text:
@@ -505,6 +511,30 @@ def _ensure_pipe_table_blanks(text):
         if is_header and out and out[-1].strip() and not re.match(r'^\s*\|', out[-1]):
             out.append('')
             n += 1
+        out.append(ln)
+    return '\n'.join(out), n
+
+
+_HEADING_NUM_RE = re.compile(r'^(#{1,6})\s+\d+(?:\.\d+)*\.?\s+(\S.*)$')
+_FENCE_RE = re.compile(r'^\s*(```|~~~)')
+
+
+def _strip_heading_numbers(text):
+    """Quarto auto-numbers sections (the render template sets number-sections: true), so
+    a manual '1.'/'2.3' prefix in the heading TEXT renders doubled ('1 1. Introduction').
+    Strip the leading section number from ATX headings, keeping the title. Fence-aware so
+    a raw '#set …' line inside a ```{=typst} block is never mistaken for a heading. A
+    number-only heading ('## 5') has no title after the number, so it's left untouched."""
+    out, in_fence, n = [], False, 0
+    for ln in text.split('\n'):
+        if _FENCE_RE.match(ln):
+            in_fence = not in_fence
+        elif not in_fence:
+            m = _HEADING_NUM_RE.match(ln)
+            if m:
+                out.append('{} {}'.format(m.group(1), m.group(2)))
+                n += 1
+                continue
         out.append(ln)
     return '\n'.join(out), n
 
