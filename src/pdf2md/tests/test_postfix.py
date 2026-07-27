@@ -370,3 +370,195 @@ def test_safe_again_after_table_closes():
 def test_not_safe_inside_an_existing_link():
     t = "see [Convention](http://x) for details"
     assert not _safe_to_inline(t, t.index("Convention"))
+
+
+# ── end-of-pipeline chrome strip (--strip-chrome) ───────────────────────────────
+
+import pytest  # noqa: E402
+
+from pdf2md.postfix import strip_chrome_qmd  # noqa: E402
+
+_HEADER = "ACME Corp Annual Report"
+
+
+def _chrome_source_pdf(out_dir, stem, n_pages=6):
+    """Source PDF with a running header, per-page page number, and unique body."""
+    fitz = pytest.importorskip("fitz", reason="PyMuPDF required")
+    doc = fitz.open()
+    for i in range(n_pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 25), _HEADER, fontsize=9)
+        page.insert_text((50, 400),
+                         f"Genuine paragraph {i} that appears only on this page.",
+                         fontsize=11)
+        page.insert_text((290, 830), str(i + 1), fontsize=9)
+    path = out_dir / f"{stem}.source.pdf"
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_strip_chrome_qmd_drops_headers_and_page_numbers(tmp_path):
+    _chrome_source_pdf(tmp_path, "d")
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text(
+        "---\ntitle: T\n---\n\n"
+        f"# {_HEADER}\n\n"          # heading: must survive (doc title)
+        "Body prose one.\n\n"
+        f"{_HEADER}\n\n"            # running header: dropped
+        "3\n\n"                     # bare page number: dropped
+        "Page 4\n\n"                # page-number variant: dropped
+        "```\n"
+        f"{_HEADER}\n42\n"          # fence interior: untouched
+        "```\n\n"
+        "Body prose two.\n",
+        encoding="utf-8")
+    removed = strip_chrome_qmd(qmd, tmp_path)
+    assert removed == 3
+    text = qmd.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    assert f"# {_HEADER}" in lines                # heading kept
+    assert lines.count(_HEADER) == 1              # only the fence-interior copy left
+    assert "3" not in lines and "Page 4" not in lines
+    assert "42" in lines                          # fence interior kept
+    assert "Body prose one." in lines and "Body prose two." in lines
+    assert "title: T" in lines                    # frontmatter untouched
+    assert "\n\n\n" not in text                   # removals leave no blank runs
+
+
+def test_strip_chrome_qmd_no_chrome_evidence_is_a_no_op(tmp_path):
+    # Two pages of unique prose: no running chrome, so even a bare-digit line
+    # in the .qmd must be presumed content and kept.
+    fitz = pytest.importorskip("fitz", reason="PyMuPDF required")
+    doc = fitz.open()
+    for i in range(2):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((50, 400), f"Only page {i} has this sentence.", fontsize=11)
+    doc.save(str(tmp_path / "d.source.pdf"))
+    doc.close()
+    qmd = tmp_path / "d.qmd"
+    before = "Prose.\n\n7\n\nMore prose.\n"
+    qmd.write_text(before, encoding="utf-8")
+    assert strip_chrome_qmd(qmd, tmp_path) == 0
+    assert qmd.read_text(encoding="utf-8") == before
+
+
+def test_strip_chrome_qmd_without_source_pdf_is_a_no_op(tmp_path):
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Prose.\n", encoding="utf-8")
+    assert strip_chrome_qmd(qmd, tmp_path) == 0
+
+
+# ── iterative repair loop ───────────────────────────────────────────────────────
+
+from pdf2md import postfix as pf  # noqa: E402
+from pdf2md.postfix import run_repair_loop  # noqa: E402
+from pdf2md.verify import CheckResult  # noqa: E402
+
+
+def _tc(metric, status="warn"):
+    """A minimal verify-results list carrying just text_coverage."""
+    return [CheckResult("text_coverage", status, "s", metric=metric)]
+
+
+def _quiet_passes(monkeypatch, det=None, verify_seq=None):
+    """Stub the three fix steps and re-verify. `det` is a callable returning the
+    deterministic pass result; `verify_seq` a list of results consumed in order."""
+    monkeypatch.setattr(pf, "_deterministic_pass",
+                        det or (lambda *a: ([], 0.0)))
+    monkeypatch.setattr(pf, "_llm_text_pass", lambda *a: ([], 0.0, 0))
+    monkeypatch.setattr(pf, "_vision_patch_pass", lambda *a: ([], 0.0))
+    if verify_seq is not None:
+        seq = list(verify_seq)
+        monkeypatch.setattr(pf, "_verify_now", lambda *a: seq.pop(0))
+
+
+def _qmd(tmp_path):
+    q = tmp_path / "doc.qmd"
+    q.write_text("body\n", encoding="utf-8")
+    return q
+
+
+def test_repair_loop_iterates_while_coverage_improves(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch,
+                  det=lambda *a: (["fix"], 0.0),
+                  verify_seq=[_tc(92.0), _tc(94.0), _tc(96.0)])
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=3)
+    assert len(s["iterations"]) == 3
+    assert "max iterations" in s["stop_reason"]
+    covs = [(i["text_cov_before"], i["text_cov_after"]) for i in s["iterations"]]
+    assert covs == [(90.0, 92.0), (92.0, 94.0), (94.0, 96.0)]
+    # every applied fix is recorded with its iteration
+    assert s["postfixes_applied"] == ["[iter 1] fix", "[iter 2] fix", "[iter 3] fix"]
+    assert s["verify_after"] == "warn"
+    assert s["coverage_after"]["text"] == 96.0
+
+
+def test_repair_loop_stops_when_verify_is_clean(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch,
+                  det=lambda *a: (["fix"], 0.0),
+                  verify_seq=[_tc(100.0, status="ok")])
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=3)
+    assert len(s["iterations"]) == 1
+    assert "verify ok" in s["stop_reason"]
+    assert s["verify_after"] == "ok"
+
+
+def test_repair_loop_stops_without_improvement(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch,
+                  det=lambda *a: (["fix"], 0.0),
+                  verify_seq=[_tc(90.0)])       # same coverage as before
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=3)
+    assert len(s["iterations"]) == 1
+    assert "no coverage improvement" in s["stop_reason"]
+
+
+def test_repair_loop_stops_when_nothing_to_fix(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch)                  # every step returns no fixes
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=3)
+    assert len(s["iterations"]) == 1
+    assert "applied no fixes" in s["stop_reason"]
+    assert s["postfixes_applied"] == []
+    assert s["cost_usd"] == 0.0
+    assert "verify_after" not in s              # never re-verified
+
+
+def test_repair_loop_zero_iterations_is_a_no_op(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch)
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=0)
+    assert s["iterations"] == [] and s["postfixes_applied"] == []
+    assert not (tmp_path / "repair_report.md").exists()
+
+
+def test_repair_loop_accumulates_cost_and_items(tmp_path, monkeypatch):
+    monkeypatch.setattr(pf, "_deterministic_pass", lambda *a: (["det"], 0.01))
+    monkeypatch.setattr(pf, "_llm_text_pass",
+                        lambda *a: (["missing_text: 2 items"], 0.02, 2))
+    monkeypatch.setattr(pf, "_vision_patch_pass",
+                        lambda *a: (["vision: 1 patch"], 0.03))
+    monkeypatch.setattr(pf, "_verify_now", lambda *a: _tc(91.0))
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=1)
+    assert abs(s["cost_usd"] - 0.06) < 1e-9
+    assert s["items_recovered"] == 2
+    assert s["iterations"][0]["fixes"] == ["det", "missing_text: 2 items",
+                                           "vision: 1 patch"]
+
+
+def test_repair_loop_writes_repair_report(tmp_path, monkeypatch):
+    _quiet_passes(monkeypatch,
+                  det=lambda *a: (["header_bleed: stripped 2"], 0.0),
+                  verify_seq=[_tc(95.0), _tc(95.0)])   # 2nd iter: no improvement
+    s = run_repair_loop(_qmd(tmp_path), tmp_path, _tc(90.0), "key",
+                        max_iterations=2)
+    report = (tmp_path / "repair_report.md").read_text(encoding="utf-8")
+    assert s["report"] == str(tmp_path / "repair_report.md")
+    assert "| Iteration |" in report            # the improvement table
+    assert "header_bleed: stripped 2" in report
+    assert "90.0%" in report and "95.0%" in report
+    assert "Stopped:" in report

@@ -1,0 +1,88 @@
+# Conversion quality report - MRVPP-ATBD_V5.0_Issue2.0_v2.0
+
+24 Jul 2026 · 46 pages · google/gemini-2.5-pro · conversion €0.60 + repair €0.16
+
+<!-- verify: overall=warn figure_placement=100.0 text_coverage=96.1 table_coverage=97.6 -->
+
+## 🟡 Verdict: good - 3 things worth your attention
+
+| | |
+|---|---|
+| Text | 🟡 96.1% of sentences made it through (19 of 484 didn't) |
+| Tables | 🟢 97.6% of table content present (21 source tables) |
+| Figures | 🟢 14/14 detected figures placed |
+| Look at | Missing text · Footnotes · Heading structure |
+
+The numbers above already include automatic repairs (text 94.6% → 96.1%; tables 85.3% → 97.6%). What the repair pass did: tables: re-emitted 3 missing table(s) from source; links: 0 restored inline, 3 listed; missing_text: 18 items recovered from 16 pages. You don't need to redo any of it.
+
+For everything below: page numbers refer to the **original PDF**, and each item says where in the **converted file** the fix belongs.
+
+## 🟡 1 · Missing text
+
+Most of the 19 missing sentences sit in 1 place. The remaining 4 are scattered half-sentences; their other halves usually survived as rewordings, so check before re-adding anything (full list at the bottom).
+
+### Pages 35-36 (~7 sentences)
+
+> "http://www.informaworld.com/10.1080/014311600209814 Schwartz, M."
+> "https://doi.org/10.1007/BF01404567 Eilers, P."
+
+Open the original at page 35 and find the passage. In the converted file this belongs near the heading **"References"**.
+
+## 🟡 2 · Footnotes
+
+The original uses ~2 superscript footnote marks (pages 39); the converted file has none.
+
+For each mark: note the superscript number and its footnote text at the bottom of that page, then add `[^n]` at the matching spot in the converted file and `[^n]: the text` below the paragraph.
+
+## 🟡 3 · Heading structure
+
+47 heading(s); 0 missing, 5 reordered vs the source outline
+
+- 5 surviving heading(s) appear out of their source order (headings)
+
+Compare the listed headings against the source table of contents and add/reorder the missing ones.
+
+## ⚪ Minor, no action needed
+
+- the .qmd has 51 math block(s) for ~11 source equation region(s) - possible over-detection (math)
+
+---
+
+## ✅ Everything that passed
+
+| Check | Result |
+|---|---|
+| Metadata block | all required fields present |
+| Structure counts | figures 16/14; tables 15 in .qmd (~21 source region(s), rough - see table_coverage) |
+| Figures | 14/14 detected figures placed |
+| Tables | 21 source table(s); word coverage 97.6% (simple avg 98.4%; 97.6% single-table aligned) |
+| Oversized tables | no oversized source tables |
+| Wide tables | no tables shrunk below 8pt |
+| Hyperlinks | 24/24 source link(s) preserved |
+| Equations | ~11 source equation region(s); 51 math block(s) in the .qmd |
+| Code listings | ~4 monospaced source page(s); 2 fenced code block(s) in the .qmd |
+
+<details>
+<summary>Full list of missing sentences</summary>
+
+- ~page 2: "- Denmark https://land.copernicus.eu/ Document version:"
+- ~page 16: "𝑃𝑃𝐼= −𝐾× ln ( 𝑀𝐷𝑉𝐼−𝐷𝑉𝐼 𝑀𝐷𝑉𝐼−𝐷𝑉𝐼𝑠 ) , 𝐸𝑞."
+- "𝐷𝑉𝐼𝑠= min(0.09,𝑀𝐷𝑉𝐼𝑠𝑐𝑒𝑛𝑒/4) , and 𝑀𝐷𝑉𝐼𝑠𝑐𝑒𝑛𝑒= max(𝑀𝐷𝑉𝐼) over a scene."
+- "𝑄𝐸= 𝑑𝑐+ (1 −𝑑𝑐) ∙ 𝐺 cos(𝜃𝑖) , 𝐸𝑞."
+- ~page 17: "𝑑𝑐= 0.0336 + 0.0477 cos(𝜃𝑖) ."
+- "7 where 𝑡𝑖,𝑖= 1,… , 𝑛 is time vector and 𝑦𝑖 are corresponding PPI values."
+- ~page 27: "order differences greater than 1×10-6."
+- ~page 35: "https://doi.org/10.1080/17538947.2010.505664 Bolton, D."
+- ~page 35: "https://doi.org/10.1007/BF01404567 Eilers, P."
+- "https://doi.org/10.1021/ac034173t Fisher, J."
+- "https://doi.org/10.1038/s43247- 023-00960-w Jönsson, P., Cai, Z., Melaas, E., Friedl, M., & Eklundh, L."
+- "http://www.mdpi.com/2072- 4292/10/4/635 Jönsson, P., & Eklundh, L."
+- "https://doi.org/10.1109/Tgrs.2002.802519 Jönsson, P., & Eklundh, L."
+- "<Go to ISI>://WOS:000225367100004 Lieth, H."
+- ~page 35: "http://www.informaworld.com/10.1080/014311600209814 Schwartz, M."
+- ~page 35: "https://doi.org/10.1111/nph.14346 Strahler, A."
+- ~page 36: "https://doi.org/10.1364/AO.16.001151 White, M."
+- ~page 36: "https://doi.org/10.1111/j.1365-2486.2009.01910.x Zhang, X., Friedl, M."
+- ~page 36: "http://www.sciencedirect.com/science/article/B6V6V-478RS7T-1/2/19c385401eecea8964bca155ac01eb71"
+
+</details>

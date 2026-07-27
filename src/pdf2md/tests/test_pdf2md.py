@@ -694,25 +694,25 @@ class TestPageFilter:
         assert 0 in result["skipped"], "thin rule should not trigger the vector signal"
 
     def test_recall_on_real_test_pdf(self, tmp_path):
-        """Pages 8 and 9 of the test PUM must always be candidates."""
+        """Pages 9 (aerial photo) and 11 (vector figure) of the edgecases PDF must be candidates."""
         from pdf2md.chrome import strip_chrome
         from pdf2md.pagefilter import filter_pages
         test_pdf = Path(__file__).resolve().parent / \
-            "fixtures/1990-2018_PUM_v1_short.pdf"
+            "fixtures/pdf2md_edgecases.pdf"
         if not test_pdf.exists():
             pytest.skip("test fixture PDF missing")
         stripped = tmp_path / "stripped.pdf"
         strip_chrome(test_pdf, stripped)
         result = filter_pages(stripped)
-        assert 7 in result["candidates"], "page 8 (Figure 5 raster) must be a candidate"
-        assert 8 in result["candidates"], "page 9 (Figure 6 vector) must be a candidate"
+        assert 8 in result["candidates"], "page 9 (aerial photo raster) must be a candidate"
+        assert 10 in result["candidates"], "page 11 (vector figure) must be a candidate"
 
     def test_skip_rate_on_real_test_pdf(self, tmp_path):
-        """Gate must skip at least 1 page on the 9-page test PUM."""
+        """Gate must skip at least 1 page on the 14-page edgecases PDF."""
         from pdf2md.chrome import strip_chrome
         from pdf2md.pagefilter import filter_pages
         test_pdf = Path(__file__).resolve().parent / \
-            "fixtures/1990-2018_PUM_v1_short.pdf"
+            "fixtures/pdf2md_edgecases.pdf"
         if not test_pdf.exists():
             pytest.skip("test fixture PDF missing")
         stripped = tmp_path / "stripped.pdf"

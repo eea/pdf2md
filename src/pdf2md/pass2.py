@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONVERT_PROMPT = (
     Path(__file__).resolve().parent / "prompt_templates" / "convert_prompt_qmd.md"
 )
-DEFAULT_CATEGORY = "uncategorized"
+DEFAULT_CATEGORY = None  # verbatim 1:1 — no category field
 
 
 def convert_placeholdered(

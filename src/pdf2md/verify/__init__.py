@@ -181,6 +181,22 @@ _CHECK_GUIDE = {
         "Tables too large to transcribe are cropped as figures instead; this checks "
         "none slipped through as broken text.",
         "If one did, replace the mangled text with an image crop of the table."),
+    "yaml_boundary": (
+        "The YAML frontmatter block (between the two `---` lines) should contain only "
+        "metadata fields, not stray body/address text that leaked in during conversion.",
+        "Open the .qmd and move any non-metadata lines out of the frontmatter block, "
+        "into the document body or delete them if they're page-footer boilerplate."),
+    "duplication": (
+        "Looks for paragraphs that are near-duplicates of each other, a sign that "
+        "repair or conversion accidentally copied the same passage twice.",
+        "Compare the flagged paragraphs and delete the redundant copy, keeping "
+        "whichever one is complete/better placed."),
+    "artifacts": (
+        "Looks for leftover Word/Office field-code artifacts (e.g. 'Error! Reference "
+        "source not found.', '#REF!') that indicate a broken cross-reference in the "
+        "source document.",
+        "Find the reference in the source PDF (often a figure/table number) and "
+        "replace the artifact text with the correct reference."),
 }
 
 
@@ -192,6 +208,8 @@ def _display_name(name: str) -> str:
         "footnote_placement": "Footnotes", "link_preservation": "Hyperlinks",
         "heading_hierarchy": "Heading structure", "math_presence": "Equations",
         "code_block_presence": "Code listings", "oversized_tables": "Oversized tables",
+        "yaml_boundary": "Frontmatter boundary", "duplication": "Duplicate paragraphs",
+        "artifacts": "Conversion artifacts",
     }.get(name, name)
 
 
@@ -303,8 +321,18 @@ def write_report(results: list, run_dir: Path, meta: dict = None) -> Path:
         cost_bits.append(f"repair {fmt_eur(meta['cost_repair'])}")
     header_bits = [b for b in (meta.get("date"),
                                f"{meta['pages']} pages" if meta.get("pages") else None,
-                               meta.get("model"),
                                " + ".join(cost_bits) if cost_bits else None) if b]
+    model_bits = []
+    if meta.get("model_cover"):
+        model_bits.append(f"cover: {meta['model_cover']}")
+    if meta.get("model_detect"):
+        model_bits.append(f"detect: {meta['model_detect']}")
+    if meta.get("model_convert"):
+        model_bits.append(f"convert: {meta['model_convert']}")
+    if meta.get("model_repair"):
+        model_bits.append(f"repair: {meta['model_repair']}")
+    if model_bits:
+        header_bits.append(" · ".join(model_bits))
     if header_bits:
         md.append(" · ".join(header_bits))
         md.append("")
