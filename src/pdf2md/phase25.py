@@ -4,8 +4,11 @@ After Phase 2 writes the .qmd, two things can still go wrong:
 (a) Leftover FIG_N tokens the regex didn't catch (bare parens, partial HTML attrs)
 (b) Detected figures the converter never referenced at all
 
-Phase 2.5a resolves (a) deterministically (no LLM cost).
-Phase 2.5b sends a focused LLM call per unreferenced figure to insert it.
+Both are resolved deterministically, no LLM cost:
+Phase 2.5a rewrites leftover FIG_N tokens.
+Phase 2.5b places each unreferenced figure at its transcribed caption (the
+converter drops the ![](FIG_n) token near a long document's end but still writes
+the caption as text), appending any whose caption never reached the body.
 """
 
 import json
@@ -54,140 +57,72 @@ def resolve_leftover_fig_tokens(qmd_text: str, figures: list,
     return new_text, resolved
 
 
-# ── 2.5b: LLM-driven insertion of unreferenced figures ─────────────────────
+# ── 2.5b: Deterministic caption-anchored placement of unreferenced figures ──
+#
+# When the converter drops a figure near the END of a long document (attention
+# drift), it still transcribes the figure's CAPTION as body text — it just omits
+# the ![](FIG_n) token. So the figure belongs exactly where its caption already
+# sits. Rewrite that caption line in place as an image reference. No LLM: the old
+# per-figure LLM rescue saw only the first 8000 chars of the .qmd, so a page-42
+# figure was placed into beginning-of-document context and got cover-page text
+# inserted after the frontmatter (duplicated captions, garbage).
 
-_UNREFERENCED_PROMPT = """You are given a section of a converted markdown document and an image of a figure that was detected on a specific page but NOT placed by the previous converter.
-
-Your task: insert this figure at the MOST appropriate location in the markdown text. The figure appeared on the page shown; use the surrounding text to determine where it belongs.
-
-Rules:
-- Insert the image reference as: ![Figure N: brief caption](IMAGE_PATH)
-- Place it near the text that discusses or references this figure
-- Do NOT modify any existing figures or tables
-- Keep all existing formatting intact
-- Return the COMPLETE section with the figure inserted, not just the insertion
-
-IMAGE_PATH will be replaced with the actual path."""
+_CAP_LABEL_RE = re.compile(r'^\s*(?:fig(?:ure)?\.?|table)\s*\d+', re.I)
+_CAP_NUM_RE = re.compile(r'(?:fig(?:ure)?\.?|table)\s*(\d+)', re.I)
 
 
-def _extract_page_image(working_pdf: Path, page_num: int, out_dir: Path,
-                         stem: str, fig_id: str) -> Path | None:
-    """Extract a single page as a PNG for the LLM to see."""
-    try:
-        import fitz
-        doc = fitz.open(str(working_pdf))
-        if page_num < 0 or page_num >= doc.page_count:
-            doc.close()
-            return None
-        page = doc[page_num]
-        # Render at 150 DPI for a reasonable size/quality balance
-        pix = page.get_pixmap(dpi=150)
-        img_path = out_dir / f'{stem}-media' / f'_rescue_{fig_id}.png'
-        img_path.parent.mkdir(parents=True, exist_ok=True)
-        pix.save(str(img_path))
-        doc.close()
-        return img_path
-    except Exception as e:
-        log.warning('Could not extract page %d for %s: %s', page_num, fig_id, e)
-        return None
+def _place_figures_by_caption(qmd_text, unreferenced, media_dirname):
+    """Rewrite each unreferenced figure's transcribed caption line into an image
+    reference, in place. Returns (new_text, placed_fig_ids). A caption line is the
+    body line that starts with the figure's label ('Figure 10 …') and best matches
+    the detected caption text — a threshold on shared tokens keeps a cross-reference
+    sentence ('see Figure 10') from being mistaken for the caption."""
+    from .verify.textutil import normalize
 
-
-def _insert_unreferenced_figures(qmd_path: Path, unreferenced: list,
-                                  working_pdf: Path, api_key: str,
-                                  model: str = 'google/gemini-2.5-flash',
-                                  timeout: int = 120) -> tuple:
-    """For each unreferenced figure, send a focused LLM call to insert it.
-    Sends the page image via image_url so the model can see the figure.
-    Returns (count inserted, total USD cost)."""
-    if not unreferenced:
-        return 0, 0.0
-
-    import base64
-    from .llm_client import _post_with_retries, _model_max_tokens
-
-    qmd_text = qmd_path.read_text(encoding='utf-8')
-    media_dirname = f'{qmd_path.stem}-media'
-    out_dir = qmd_path.parent
-    inserted = 0
-    cost = 0.0
-
+    lines = qmd_text.split('\n')
+    cand = [i for i, ln in enumerate(lines)
+            if _CAP_LABEL_RE.match(ln) and not ln.lstrip().startswith('![')]
+    placed, used = [], set()
     for fig in unreferenced:
-        fig_id = fig.get('fig_id', '')
-        page = fig.get('page', 0)
-        page_idx = page - 1 if page > 0 else 0
-
-        img_path = _extract_page_image(working_pdf, page_idx, out_dir,
-                                        qmd_path.stem, fig_id)
-        if not img_path:
-            continue
-
-        img_b64 = base64.b64encode(img_path.read_bytes()).decode()
-        img_uri = f'data:image/png;base64,{img_b64}'
-
-        cap = fig.get('caption') or f'Figure {fig_id.replace("FIG_", "")}'
-        img_ref = f'{media_dirname}/{fig["file"]}'
-
-        # Send a focused prompt with just the page image and context
-        user_prompt = (
-            f'A figure was detected on page {page} of the source document but '
-            f'was not placed in the converted markdown below.\n\n'
-            f'Insert this figure reference at the most appropriate location:\n'
-            f'![{cap}]({img_ref})\n\n'
-            f'Return ONLY the markdown section (a few paragraphs) with the figure '
-            f'inserted. Do NOT return the entire document.\n\n'
-            f'--- MARKDOWN ---\n{qmd_text[:8000]}\n--- END ---'
-        )
-
-        payload = {
-            'model': model,
-            'messages': [
-                {'role': 'system', 'content': 'You insert figures into markdown documents at the correct location. Return only the modified section, not the full document.'},
-                {'role': 'user', 'content': [
-                    {'type': 'text', 'text': user_prompt},
-                    {'type': 'image_url', 'image_url': {'url': img_uri}},
-                ]},
-            ],
-            'max_tokens': min(_model_max_tokens(model), 4096),
-        }
-
-        try:
-            text, _usage = _post_with_retries(
-                api_key=api_key, payload=payload,
-                label=f'rescue-{fig_id}', timeout=timeout
-            )
-            cost += (_usage or {}).get('cost', 0.0)
-            # Refresh visible_text (may have been modified by previous insertions)
-            visible_text = re.sub(r'<!--.*?-->', '', qmd_text, flags=re.DOTALL)
-            if text and len(text) > 50:
-                # Skip if the figure image is already in visible qmd text
-                # (exclude HTML comments which list unreferenced figures)
-                if fig.get('file', '') in visible_text:
-                    log.info('Phase 2.5b: %s already placed (dedup)', fig_id)
-                    continue
-                # Append after the frontmatter as a best-effort placement
-                fm_end = qmd_text.find('\n---\n\n')
-                if fm_end < 0:
-                    fm_end = qmd_text.find('\n---\n')
-                if fm_end > 0:
-                    fm_end = qmd_text.find('\n', fm_end + 5) + 1
-                else:
-                    fm_end = 0
-                qmd_text = (qmd_text[:fm_end] +
-                           f'\n\n<!-- Rescue-inserted {fig_id} -->\n\n{text.strip()}\n' +
-                           qmd_text[fm_end:])
-                inserted += 1
-                log.info('Phase 2.5b: inserted %s via LLM', fig_id)
-        except Exception as e:
-            log.warning('Phase 2.5b: failed to insert %s: %s', fig_id, e)
-            continue
-
-    if inserted:
-        qmd_path.write_text(qmd_text, encoding='utf-8')
-
-    return inserted, cost
+        cap = (fig.get('caption') or '').strip()
+        cap_tokens = set(normalize(cap).split())
+        if len(cap_tokens) < 4:
+            continue                        # too short to anchor confidently
+        nm = _CAP_NUM_RE.match(cap)
+        num = nm.group(1) if nm else None
+        best_i, best_score = None, 0
+        for i in cand:
+            if i in used:
+                continue
+            lm = _CAP_NUM_RE.match(lines[i].strip())
+            if num and lm and lm.group(1) != num:
+                continue                    # a different figure number
+            score = len(cap_tokens & set(normalize(lines[i]).split()))
+            if score > best_score:
+                best_i, best_score = i, score
+        if best_i is not None and best_score >= max(4, len(cap_tokens) // 2):
+            cap_line = lines[best_i].strip()
+            alt = cap_line.replace('[', '\\[').replace(']', '\\]')
+            lines[best_i] = f'![{alt}]({media_dirname}/{fig["file"]})'
+            used.add(best_i)
+            placed.append(fig.get('fig_id', ''))
+    return '\n'.join(lines), placed
 
 
-# ── Main entry point ────────────────────────────────────────────────────────
+def _append_unplaced_figures(qmd_text, unplaced, media_dirname):
+    """Safety net for figures whose caption never made it into the body: append the
+    image at the END of the document (near where these late figures belong) rather
+    than dropping the content or splicing it mid-text. Returns (new_text, count)."""
+    if not unplaced:
+        return qmd_text, 0
+    blocks = []
+    for fig in unplaced:
+        cap = (fig.get('caption')
+               or f"Figure {fig.get('fig_id', '').replace('FIG_', '')}").strip()
+        alt = cap.replace('[', '\\[').replace(']', '\\]')
+        blocks.append(f'![{alt}]({media_dirname}/{fig["file"]})')
+    return qmd_text.rstrip() + '\n\n' + '\n\n'.join(blocks) + '\n', len(blocks)
+
 
 def run_phase25(qmd_path: Path, detections_path: Path,
                 working_pdf: Path | None = None,
@@ -240,21 +175,23 @@ def run_phase25(qmd_path: Path, detections_path: Path,
                 continue
             unreferenced.append(fig)
 
-    inserted, rescue_cost = 0, 0.0
-    if unreferenced and working_pdf and working_pdf.exists() and api_key:
-        log.info('Phase 2.5b: %d unreferenced figure(s) to rescue via LLM',
-                 len(unreferenced))
-        inserted, rescue_cost = _insert_unreferenced_figures(
-            qmd_path, unreferenced, working_pdf, api_key,
-            model=rescue_model, timeout=timeout
-        )
-    elif unreferenced:
-        log.info('Phase 2.5b: %d unreferenced figure(s) — skipping LLM rescue '
-                 '(no API key or working PDF)', len(unreferenced))
+    inserted, appended = 0, 0
+    if unreferenced:
+        log.info('Phase 2.5b: %d unreferenced figure(s) to place', len(unreferenced))
+        new_text, placed = _place_figures_by_caption(qmd_text, unreferenced, media_dirname)
+        placed_set = set(placed)
+        remaining = [f for f in unreferenced if f.get('fig_id') not in placed_set]
+        new_text, appended = _append_unplaced_figures(new_text, remaining, media_dirname)
+        if placed or appended:
+            qmd_path.write_text(new_text, encoding='utf-8')
+        inserted = len(placed)
+        log.info('Phase 2.5b: %d placed at caption, %d appended (caption not in body)',
+                 inserted, appended)
 
     return {
         'resolved_2_5a': resolved,
         'unreferenced_count': len(unreferenced),
         'inserted_2_5b': inserted,
-        'cost_usd': rescue_cost,
+        'appended_2_5b': appended,
+        'cost_usd': 0.0,                    # deterministic — no LLM calls
     }
