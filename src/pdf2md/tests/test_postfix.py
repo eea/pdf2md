@@ -402,6 +402,26 @@ def test_postfix_footnotes_converts_orphaned_intable_defs(tmp_path):
     assert "[^9]: A definition" in out              # mark-less orphan left alone
 
 
+def test_recover_links_skips_present_doi_despite_mangled_prefix(tmp_path):
+    """A malformed doubled DOI from the PDF (fitz collapses one slash) must not be
+    re-listed as a lost 'source link' when the reference already carries that DOI."""
+    import fitz
+    from pdf2md.postfix import _recover_links
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "See reference.")
+    page.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(72, 68, 200, 82),
+                      "uri": "https://doi.org/https:/doi.org/10.1016/j.rse.2020.111685"})
+    doc.save(str(tmp_path / "d.source.pdf"))
+    doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Bolton (2020). <https://doi.org/https://doi.org/"
+                   "10.1016/j.rse.2020.111685>\n", encoding="utf-8")
+    inlined, listed = _recover_links(qmd, tmp_path)
+    assert listed == 0                                   # DOI core recognized as present
+    assert "## Source links" not in qmd.read_text(encoding="utf-8")
+
+
 def test_postfix_footnotes_noop_when_all_linked(tmp_path):
     from pdf2md.postfix import _postfix_footnotes
     qmd = tmp_path / "d.qmd"

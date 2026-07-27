@@ -775,6 +775,14 @@ def _recover_links(qmd_path, out_dir):
                 # 2 reference DOIs on one ATBD were broken across lines and lost this way)
                 if _uri_in_qmd(uri, qmd_lower):
                     continue            # already present (contiguously), nothing to restore
+                # DOI fallback: a malformed doubled DOI ("https://doi.org/https:/doi.org/
+                # 10.x/…" — the PDF's own defect, with fitz collapsing one slash) never
+                # matches contiguously against the reference's un-collapsed copy, so it
+                # gets re-listed as a phantom "source link". Match on the bare DOI core,
+                # which is immune to the prefix mangling and unique enough to prove presence.
+                doi = re.search(r'10\.\d{4,}/\S+', uri)
+                if doi and doi.group(0).lower().rstrip('.,;)') in qmd_lower:
+                    continue
                 anchor = ' '.join(page.get_textbox(l['from']).split())
                 anchor = anchor.strip(' .,;:)（(')   # keep punctuation outside the link
                 pairs.append((uri, anchor))
