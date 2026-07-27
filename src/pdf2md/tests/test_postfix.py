@@ -443,3 +443,38 @@ def test_crop_replace_guard():
     assert not _crop_replace_ok(dist, better, merged_block, src)  # multi-page merge
     third_alien = block | {"o1", "o2"}      # ~40% alien: above the 0.25 ceiling
     assert not _crop_replace_ok(dist, better, third_alien, src)
+
+
+# ── structural table cleanup ────────────────────────────────────────────────────
+
+def test_pipe_empty_ratio():
+    from pdf2md.postfix import _pipe_empty_ratio
+    clean = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n"
+    mangled = "| a |  | b |  |  |\n|---|---|---|---|---|\n| 1 |  | 2 |  |  |\n"
+    assert _pipe_empty_ratio(clean) == 0.0
+    assert _pipe_empty_ratio(mangled) > 0.5
+
+
+def test_repair_mangled_declines_when_no_source(tmp_path):
+    # no source pdf → cannot re-crop → no-op, never raises
+    from pdf2md.postfix import _repair_mangled_tables
+    q = tmp_path / "d.qmd"
+    q.write_text("| x |  |  |\n|---|---|---|\n| prose here |  |  |\n", encoding="utf-8")
+    assert _repair_mangled_tables(q, tmp_path, api_key="k") == (0, 0.0)
+
+
+def test_repair_mangled_flags_only_high_empty(monkeypatch, tmp_path):
+    # a clean table must not be flagged; verify the detector gate, not the LLM path
+    import pdf2md.postfix as pf
+    from pdf2md.postfix import _PIPE_BLOCK_RE, _pipe_empty_ratio, _MANGLE_EMPTY_RATIO
+    clean = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n"
+    flagged = [b.group(0) for b in _PIPE_BLOCK_RE.finditer(clean)
+               if b.group(0).count("\n") >= 3
+               and _pipe_empty_ratio(b.group(0)) > _MANGLE_EMPTY_RATIO]
+    assert flagged == []
+
+
+def test_numbers_extraction():
+    from pdf2md.postfix import _numbers
+    n = _numbers("| SOSD | 0.99 | -0.01 | 4.4×10⁷ | 99.54 |")
+    assert "0.99" in n and "-0.01" in n and "99.54" in n

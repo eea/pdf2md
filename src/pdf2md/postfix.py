@@ -117,6 +117,17 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'tables: re-converted {} thin table(s) from focused crops'.format(n_crop))
 
+    # Pass 5: structural cleanup of value-complete but mangled tables (empty filler
+    # columns, or prose wrapped as a table). Runs after Pass 4 — a table Pass 4 already
+    # rebuilt from a crop is clean and won't re-flag. Invisible to the coverage gate,
+    # so it's driven by the .qmd's own table structure, not the check status.
+    if api_key:
+        n_mang, mang_cost = _repair_mangled_tables(qmd_path, out_dir, api_key)
+        summary['cost_usd'] += mang_cost
+        if n_mang:
+            summary['postfixes_applied'].append(
+                'tables: cleaned {} structurally-mangled table(s)'.format(n_mang))
+
     # Re-verify
     if summary['postfixes_applied']:
         try:
@@ -715,12 +726,13 @@ def _crop_replace_ok(dist, new_toks, block_toks, src_toks):
     return len(block_toks - src_toks) <= 0.25 * len(block_toks)
 
 
-def _crop_table_md(api_key, doc, pno, bbox, est_chars):
+def _crop_table_md(api_key, doc, pno, bbox, est_chars, system=None, user=None):
     """One focused vision call: render the table bbox at 300 dpi and transcribe it.
     max_tokens is PROPORTIONAL to the table's own text volume — ~est_chars/4 source
     tokens with 4x headroom gives cap ≈ est_chars — clamped to [2000, 16000]: big
     enough that no legitimate table clips, small enough that a repetition runaway
-    fails fast and cheap."""
+    fails fast and cheap. `system`/`user` override the prompt (the structural pass
+    passes a variant that may return prose)."""
     import base64
     import fitz
     from .llm_client import call_vision
@@ -731,8 +743,9 @@ def _crop_table_md(api_key, doc, pno, bbox, est_chars):
     cap = max(2000, min(16000, int(est_chars)))
     try:
         md, usage = call_vision(
-            api_key=api_key, model=_REPAIR_MODEL, system_instruction=_TBL_CROP_SYS,
-            user_prompt='Transcribe the table in this cropped image.',
+            api_key=api_key, model=_REPAIR_MODEL,
+            system_instruction=system or _TBL_CROP_SYS,
+            user_prompt=user or 'Transcribe the table in this cropped image.',
             image_data_uris=[uri], timeout=120, max_tokens=cap,
             response_format=None, return_usage=True)
     except RuntimeError as e:               # truncation / API failure → decline
@@ -896,6 +909,129 @@ def _repair_thin_tables(qmd_path, out_dir, api_key):
         qmd_text = qmd_text[:s] + md + qmd_text[e:]
     qmd_path.write_text(qmd_text, encoding='utf-8')
     log.info('postfix: re-converted %d thin table(s) from focused crops', len(edits))
+    return len(edits), cost
+
+
+# ── Structural table cleanup (value-complete but mangled grids) ──────────────────
+# Some tables keep all their VALUES (so they pass Pass 4's coverage gate) yet render
+# badly: whole-doc conversion pads a wide table with empty filler columns and splits
+# headers, or wraps a bordered prose callout in `| paragraph |  |` table syntax. The
+# value-coverage metric is blind to this. Detect it structurally (high empty-cell
+# ratio), re-convert from a focused crop that self-corrects to a clean grid OR to
+# prose, and replace only when structure improves AND no source value is lost.
+
+_MANGLE_EMPTY_RATIO = 0.35     # a pipe table with more blank cells than this is suspect
+_STRUCT_IMPROVE = 0.15         # the re-conversion must beat the old empty-ratio by this
+_NUM_KEEP = 0.9                # the rebuild must retain this share of the table's numbers
+_TBL_CLEAN_SYS = (
+    'You transcribe a table region from an image to Markdown. Preserve EVERY value '
+    'exactly. Emit a CLEAN grid: exactly one column per real column, NO empty filler '
+    'columns, and join any header split across lines. If the region is actually '
+    'running prose or a note (not tabular data), return it as plain paragraph text, '
+    'NOT a table. Output ONLY the result.')
+_PIPE_BLOCK_RE = re.compile(r'(?m)(?:^\|[^\n]*\|[ \t]*\n?)+')
+_NUM_RE = re.compile(r'-?\d+(?:\.\d+)?')
+
+
+def _numbers(text):
+    """Numeric tokens (integers/decimals) in raw text — the table's actual DATA. Unlike
+    word tokens, numbers are stable across formatting, so they are the reliable signal
+    that a rebuild didn't drop a row or value (a split header like MAXV→M,AXV is not a
+    number, so fixing the split doesn't read as data loss)."""
+    return set(_NUM_RE.findall(text))
+
+
+def _pipe_empty_ratio(block):
+    """Fraction of a pipe table's data cells that are blank (divider rows ignored)."""
+    cells = []
+    for ln in block.splitlines():
+        s = ln.strip()
+        if not (s.startswith('|') and s.endswith('|')):
+            continue
+        if set(s) <= set('|-: '):           # header/body divider row
+            continue
+        cells += [c.strip() for c in s.strip('|').split('|')]
+    return (sum(1 for c in cells if not c) / len(cells)) if cells else 0.0
+
+
+def _repair_mangled_tables(qmd_path, out_dir, api_key):
+    """Re-convert value-complete but structurally-mangled pipe tables from focused
+    crops. Replaces a flagged table only when the re-conversion (a) improves structure
+    — a much lower empty-cell ratio, or it turns out to be prose — AND (b) loses no
+    source distinctive value (coverage does not drop vs the mangled version). Worst
+    case is keeping the original, so the pass can only improve. Returns (n, llm_cost)."""
+    import fitz
+    from .verify.textutil import normalize
+
+    stem = qmd_path.stem
+    source_pdf = _body_pdf(out_dir, stem)
+    if not source_pdf.exists():
+        return 0, 0.0
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+
+    flagged = [(m.start(), m.end(), m.group(0)) for m in _PIPE_BLOCK_RE.finditer(qmd_text)
+               if m.group(0).count('\n') >= 3
+               and _pipe_empty_ratio(m.group(0)) > _MANGLE_EMPTY_RATIO]
+    if not flagged:
+        return 0, 0.0
+
+    try:
+        src = _scan_source_tables(source_pdf)[0]        # (pno, bbox, rows, ctx)
+    except Exception as e:                              # noqa: BLE001
+        log.warning('Mangled-table repair: could not scan source: %s', e)
+        return 0, 0.0
+    regions = []
+    for pno, bbox, rows, _ctx in src:
+        toks = {t for r in rows for c in r if c for t in normalize(c).split()}
+        est = sum(len(c) + 1 for r in rows for c in r if c)
+        if toks:
+            regions.append((pno, bbox, toks, est))
+    if not regions:
+        return 0, 0.0
+
+    doc = fitz.open(str(source_pdf))
+    edits, cost = [], 0.0
+    try:
+        for s, e, block in flagged:
+            btoks = _tbl_md_tokens(block)
+            # locate the source region this mangled table came from (best overlap)
+            best = max(regions, key=lambda r: len(btoks & r[2]), default=None)
+            if best is None or len(btoks & best[2]) < 5:
+                continue                                # can't confidently place it
+            pno, bbox, _rtoks, est = best
+            old_ratio = _pipe_empty_ratio(block)
+            new_md, c = _crop_table_md(api_key, doc, pno, bbox, est * 3,
+                                       system=_TBL_CLEAN_SYS,
+                                       user='Transcribe the table in this cropped image '
+                                            'to a clean Markdown table, or to prose if '
+                                            'it is not tabular.')
+            cost += c
+            if not new_md:
+                continue
+            # v1: only REBUILD real tables; do not un-table prose (that fights the
+            # coverage metric, which counts find_tables-detected prose as tables)
+            if '|' not in new_md and '<table' not in new_md.lower():
+                continue
+            if _pipe_empty_ratio(new_md) > old_ratio - _STRUCT_IMPROVE:
+                continue                                # structure didn't improve
+            # value preservation on the DATA (numbers), block↔new: robust to the split-
+            # header formatting that made a coverage-vs-find_tables guard reject the fix
+            old_nums = _numbers(block)
+            if old_nums and len(old_nums & _numbers(new_md)) / len(old_nums) < _NUM_KEEP:
+                continue                                # would drop values → decline
+            tail = '\n' if block.endswith('\n') and not new_md.endswith('\n') else ''
+            edits.append((s, e, new_md + tail))
+            log.info('table-clean p%d: rebuilt grid (empty %.0f%%->%.0f%%, numbers kept)',
+                     pno + 1, 100 * old_ratio, 100 * _pipe_empty_ratio(new_md))
+    finally:
+        doc.close()
+
+    if not edits:
+        return 0, cost
+    for s, e, md in sorted(edits, reverse=True):
+        qmd_text = qmd_text[:s] + md + qmd_text[e:]
+    qmd_path.write_text(qmd_text, encoding='utf-8')
+    log.info('postfix: cleaned %d structurally-mangled table(s)', len(edits))
     return len(edits), cost
 
 
