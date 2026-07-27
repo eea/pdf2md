@@ -128,6 +128,16 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             summary['postfixes_applied'].append(
                 'tables: cleaned {} structurally-mangled table(s)'.format(n_mang))
 
+    # Pass 6: fence code the converter left unfenced (deterministic, no LLM). Runs LAST
+    # so any code the earlier passes recovered into the body is fenced too — else its
+    # `$` signs render as inline math.
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+    fenced_text, n_fenced = _fence_unfenced_code(qmd_text)
+    if n_fenced:
+        qmd_path.write_text(fenced_text, encoding='utf-8')
+        summary['postfixes_applied'].append(
+            'code: fenced {} unfenced code block(s)'.format(n_fenced))
+
     # Re-verify
     if summary['postfixes_applied']:
         try:
@@ -454,6 +464,73 @@ _TABLE_ABSENT_MIN = 0.5    # recover when this share of a table's distinctive va
 _TABLE_MIN_DISTINCTIVE = 4  # ignore tables with too little unique data to judge
 _TABLE_MIN_ROWS = 2
 _TABLE_MIN_COLS = 2
+
+
+# ── Fence code the converter left unfenced ──────────────────────────────────────
+# A shell/script listing emitted as raw markdown renders badly: Quarto pairs its `$`
+# signs as inline math, so `${var}` and `$(cmd)` mangle into equations (measured: a
+# whole bash processing script rendered as broken math on one ATBD). Wrap runs of
+# unfenced code so `$` stays literal. Conservative: a run must be dense with code and
+# carry at least two UNAMBIGUOUS shell signals, so prose is never wrapped.
+
+_CODE_STRONG = re.compile(r'#!|\$\{|\$\(|;\s*do\b|\bdone\b|\bfi\b|\bthen\b|\besac\b')
+_CODE_WEAK = re.compile(
+    r'^\s*(for|while|if|elif|else|case|function|do|then|fi|done|esac|continue|break|'
+    r'return|exit|local)\b'
+    r'|^\s*[A-Za-z_][\w-]*=(?!=)'                       # VAR=... assignment
+    r'|^\s*set -[eux]'
+    r'|\b(mkdir|echo|find|rm|cp|mv|seq|export|read|awk|sed|grep|cat|sort|uniq'
+    r'|gdal\w+|ogr\w+)\b'
+    r'|^\s*#\s')                                        # shell comment
+
+
+def _code_line_score(line):
+    """2 = an unambiguous code line, 1 = a weak code signal, 0 = blank, -1 = prose."""
+    if not line.strip():
+        return 0
+    if _CODE_STRONG.search(line):
+        return 2
+    if _CODE_WEAK.search(line):
+        return 1
+    return -1
+
+
+def _fence_unfenced_code(text):
+    """Wrap runs of unfenced code in ```` ```bash ````. A run is a maximal block of
+    non-fence lines that are code-or-blank, bounded by prose; it is fenced only when it
+    has >= 2 strong shell signals and >= 3 code lines. Returns (new_text, n_fenced)."""
+    lines = text.split('\n')
+    inside, infence = False, []
+    for ln in lines:
+        if ln.lstrip().startswith('```'):
+            infence.append(True)
+            inside = not inside
+        else:
+            infence.append(inside)
+
+    blocks, i, n = [], 0, len(lines)
+    while i < n:
+        if infence[i] or _code_line_score(lines[i]) <= 0:
+            i += 1
+            continue
+        j = i
+        while j < n and not infence[j] and _code_line_score(lines[j]) >= 0:
+            j += 1
+        blk = lines[i:j]
+        strong = sum(1 for l in blk if _CODE_STRONG.search(l))
+        code = sum(1 for l in blk if _code_line_score(l) > 0)
+        if strong >= 2 and code >= 3:
+            end = j
+            while end > i and not lines[end - 1].strip():
+                end -= 1                                # trim trailing blanks
+            blocks.append((i, end))
+        i = j
+
+    if not blocks:
+        return text, 0
+    for s, e in sorted(blocks, reverse=True):
+        lines[s:e] = ['```bash'] + lines[s:e] + ['```']
+    return '\n'.join(lines), len(blocks)
 
 
 def _grid_to_markdown(rows):

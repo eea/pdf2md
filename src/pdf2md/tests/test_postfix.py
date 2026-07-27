@@ -478,3 +478,36 @@ def test_numbers_extraction():
     from pdf2md.postfix import _numbers
     n = _numbers("| SOSD | 0.99 | -0.01 | 4.4×10⁷ | 99.54 |")
     assert "0.99" in n and "-0.01" in n and "99.54" in n
+
+
+# ── unfenced-code fencing ───────────────────────────────────────────────────────
+
+def test_fence_unfenced_shell_script():
+    from pdf2md.postfix import _fence_unfenced_code
+    qmd = ("# Method\n\nWe run the following processing script.\n\n"
+           "#!/usr/bin/env bash\nset -euo pipefail\n"
+           'OUTDIR="./out"\nfor p in "${PARAMS[@]}"; do\n'
+           '  f="$(mktemp)"\n  echo "$p"\ndone\n\n'
+           "The output is then aggregated.\n")
+    out, n = _fence_unfenced_code(qmd)
+    assert n == 1
+    assert "```bash\n#!/usr/bin/env bash" in out
+    assert out.count("```") == 2                      # exactly one fenced block
+    assert "We run the following" in out and "The output is then" in out  # prose untouched
+
+
+def test_fence_leaves_prose_and_existing_fences_alone():
+    from pdf2md.postfix import _fence_unfenced_code
+    qmd = ("Normal prose about $x$ and costs of $5 and a price.\n\n"
+           "```bash\necho already fenced ${VAR}\n```\n\n"
+           "More prose with one ${stray} token but no other code signals here.\n")
+    out, n = _fence_unfenced_code(qmd)
+    assert n == 0 and out == qmd                       # nothing to do → unchanged
+
+
+def test_fence_needs_two_strong_signals():
+    from pdf2md.postfix import _fence_unfenced_code
+    # a single ${x} in a prose paragraph must not trigger fencing
+    qmd = "Set the variable ${HOME} in your shell profile before running.\n"
+    out, n = _fence_unfenced_code(qmd)
+    assert n == 0
