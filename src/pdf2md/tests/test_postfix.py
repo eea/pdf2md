@@ -422,6 +422,43 @@ def test_recover_links_skips_present_doi_despite_mangled_prefix(tmp_path):
     assert "## Source links" not in qmd.read_text(encoding="utf-8")
 
 
+def test_recover_links_no_synthetic_section_for_uninlinable(tmp_path):
+    """A link that can't be placed inline (anchor is a bare URL, not present in the body)
+    is left to verify — we no longer append a synthetic '## Source links' section."""
+    import fitz
+    from pdf2md.postfix import _recover_links
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "https://example.org/report")
+    page.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(72, 68, 300, 82),
+                      "uri": "https://example.org/report"})
+    doc.save(str(tmp_path / "d.source.pdf"))
+    doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Body text with no link.\n", encoding="utf-8")
+    inlined, dropped = _recover_links(qmd, tmp_path)
+    assert inlined == 0 and dropped == 1
+    assert "## Source links" not in qmd.read_text(encoding="utf-8")
+
+
+def test_recover_links_inlines_unambiguous_anchor(tmp_path):
+    """Inline restoration still works: a real, once-occurring anchor gets its href."""
+    import fitz
+    from pdf2md.postfix import _recover_links
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "the Copernicus portal")
+    page.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(72, 68, 250, 82),
+                      "uri": "https://land.copernicus.eu/"})
+    doc.save(str(tmp_path / "d.source.pdf"))
+    doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Data comes from the Copernicus portal for Europe.\n", encoding="utf-8")
+    inlined, dropped = _recover_links(qmd, tmp_path)
+    assert inlined == 1
+    assert "[the Copernicus portal](https://land.copernicus.eu/)" in qmd.read_text()
+
+
 def test_postfix_footnotes_noop_when_all_linked(tmp_path):
     from pdf2md.postfix import _postfix_footnotes
     qmd = tmp_path / "d.qmd"
@@ -539,15 +576,15 @@ def test_breadcrumb_comments_stripped_but_markers_kept():
            "Recovered sentence here.\n\n"
            "<!-- figures detected in Phase 1 but not placed\n   FIG_9: x -> y\n-->\n\n"
            "More text.\n\n<!--pdf2md-repair-3-->\n\n"  # functional marker: keep
-           "Tail.\n\n<!-- postfix: source links recovered from PDF annotations -->\n\n"
-           "## Source links\n\n- http://x\n")
+           "Tail.\n\n<!-- postfix: table 2 re-rendered from crop -->\n\n"
+           "## Results\n\n- item\n")
     cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd)
     cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     assert '<!-- postfix:' not in cleaned          # breadcrumbs gone
     assert 'figures detected in Phase 1' not in cleaned
     assert '<!--pdf2md-repair-3-->' in cleaned      # functional marker kept
-    assert 'Recovered sentence here.' in cleaned and '## Source links' in cleaned
+    assert 'Recovered sentence here.' in cleaned and '## Results' in cleaned
 
 
 def test_strip_front_matter_noise():

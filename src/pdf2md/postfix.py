@@ -60,10 +60,10 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # annotation the model never sees, so this is the only way those links can survive.
     link_check = verify_by_name.get('link_preservation')
     if link_check and link_check.status in ('warn', 'fail'):
-        n_in, n_list = _recover_links(qmd_path, out_dir)
-        if n_in or n_list:
+        n_in, _ = _recover_links(qmd_path, out_dir)
+        if n_in:
             summary['postfixes_applied'].append(
-                'links: {} restored inline, {} listed'.format(n_in, n_list))
+                'links: {} restored inline'.format(n_in))
 
     # Pass 1.9: heading restore (deterministic, no LLM)
     head_check = verify_by_name.get('heading_hierarchy')
@@ -741,9 +741,11 @@ def _recover_links(qmd_path, out_dir):
 
     A PDF keeps the href in a link ANNOTATION, not in the page text, so the model cannot
     reproduce it — measured across 6 documents: not one URL reached the .qmd that was not
-    already visible as text. We hold them exactly, so re-attach them: inline when the
-    anchor text occurs exactly once (provably unambiguous), otherwise in a 'Source links'
-    list so no citation is lost. Returns (n_inlined, n_listed).
+    already visible as text. We hold them exactly, so re-attach a target inline when its
+    anchor text occurs exactly once (provably unambiguous). Links we can't place that way
+    are left alone — verify's link_preservation still reports them — rather than dumped
+    into a synthetic 'Source links' section that isn't in the source. Returns
+    (n_inlined, n_not_inlinable).
     """
     try:
         import fitz
@@ -791,9 +793,10 @@ def _recover_links(qmd_path, out_dir):
     if not pairs:
         return 0, 0
 
-    inlined, listed = 0, []
+    inlined, dropped = 0, 0
     for uri, anchor in pairs:
-        # a truncated URL as its own anchor is not prose — list it rather than guess
+        # inline only when the anchor is real prose occurring exactly once (provably
+        # unambiguous). A truncated-URL anchor or an ambiguous one can't be placed.
         usable = (len(anchor) >= _LINK_ANCHOR_MIN
                   and not anchor.lower().startswith(('http', 'www.', 'mailto:')))
         if usable and qmd.count(anchor) == 1:
@@ -802,21 +805,12 @@ def _recover_links(qmd_path, out_dir):
                 qmd = qmd[:pos] + '[{}]({})'.format(anchor, uri) + qmd[pos + len(anchor):]
                 inlined += 1
                 continue
-        listed.append((uri, anchor))
-
-    if listed:
-        def _label(a, u):
-            # a truncated copy of the URL is not a useful label — show the URL alone
-            if not a or a.lower().startswith(('http', 'www.', 'mailto:')):
-                return ''
-            return '{} — '.format(a)
-
-        rows = '\n'.join('- {}{}'.format(_label(a, u), u) for u, a in listed)
-        qmd = (qmd.rstrip() + '\n\n<!-- postfix: source links recovered from PDF '
-               'annotations -->\n\n## Source links\n\n' + rows + '\n')
-    qmd_path.write_text(qmd, encoding='utf-8')
-    log.info('postfix: restored %d link(s) inline, listed %d', inlined, len(listed))
-    return inlined, len(listed)
+        dropped += 1        # can't inline; we no longer append a synthetic "Source
+                            # links" section — verify still reports these as missing
+    if inlined:
+        qmd_path.write_text(qmd, encoding='utf-8')
+    log.info('postfix: restored %d link(s) inline, %d not inlinable', inlined, dropped)
+    return inlined, dropped
 
 
 _TABLE_LLM_MIN_KEEP = 0.98   # LLM rendering is used only if it keeps ~all source values

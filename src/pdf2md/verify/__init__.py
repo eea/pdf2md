@@ -165,8 +165,8 @@ _CHECK_GUIDE = {
     "link_preservation": (
         "Hyperlink targets from the source PDF (including links whose URL is only in "
         "the PDF metadata, invisible in the text) still exist in the .qmd.",
-        "Missing URLs are usually recoverable from the 'Source links' section if "
-        "postfix ran; otherwise copy them from the source PDF's link annotations."),
+        "Postfix re-attaches a target inline when its anchor text is unambiguous; for "
+        "the rest, copy the URL from the source PDF's link annotation onto its anchor."),
     "heading_hierarchy": (
         "The .qmd's heading outline matches the source document's section structure.",
         "Compare the listed headings against the source table of contents and "
