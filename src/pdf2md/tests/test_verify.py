@@ -580,3 +580,26 @@ class TestProseCallout:
         from pdf2md.verify.checks.table_coverage import _is_prose_callout
         rows = [["Band", "Res"], ["PPI", "500m"], ["QA", "500m"]]
         assert _is_prose_callout(rows) is False
+
+
+class TestHeadingOccurrenceMatch:
+    def test_repeated_titles_not_false_reordered(self, tmp_path):
+        # a doc that repeats a section title (ATBD pattern) must not read as reordered
+        import fitz
+        from pdf2md.verify.checks.heading_hierarchy import HeadingHierarchyCheck
+        from pdf2md.verify import VerifyContext
+        doc = fitz.open()
+        for _ in range(8):
+            doc.new_page()
+        doc.set_toc([[1, "Section A", 1], [2, "Retrieval algorithm", 1],
+                     [1, "Section B", 3], [2, "Retrieval algorithm", 3],
+                     [1, "Section C", 5], [2, "Retrieval algorithm", 5]])
+        src = tmp_path / "d.source.pdf"; doc.save(str(src)); doc.close()
+        qmd = ("# Section A\n\n## Retrieval algorithm\n\ntext\n\n"
+               "# Section B\n\n## Retrieval algorithm\n\ntext\n\n"
+               "# Section C\n\n## Retrieval algorithm\n\ntext\n")
+        ctx = VerifyContext(run_dir=tmp_path, original_pdf=src, working_pdf=src,
+                            qmd_path=tmp_path / "d.qmd", qmd_text=qmd,
+                            detections={}, media_dir=tmp_path)
+        r = HeadingHierarchyCheck().run(ctx)
+        assert "0 reordered" in r.summary or "reordered" not in r.summary, r.summary

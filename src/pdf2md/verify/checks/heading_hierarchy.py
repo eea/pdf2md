@@ -107,18 +107,29 @@ class HeadingHierarchyCheck:
 
         findings = []
 
-        # ── map each source heading to its position in the .qmd (first fuzzy
-        #    match, tolerant of section-number and punctuation differences) ──
+        # ── map each source heading to its position in the .qmd, tolerant of
+        #    section-number and punctuation differences. Each .qmd heading is claimed
+        #    AT MOST ONCE: ATBDs repeat a title across sections ("4.2 Retrieval
+        #    algorithm", "5.2 …"), and _fuzzy strips the section number, so plain
+        #    first-match sent every copy to the FIRST .qmd occurrence — reading as huge
+        #    false reordering (measured: 24 "reordered" on one doc, all artefact).
+        #    Matching the first UNUSED occurrence gives the Kth source copy the Kth
+        #    .qmd copy, in order; excess source copies (more than the .qmd has) are
+        #    missing. Consuming positions also avoids the cascade that a monotonic
+        #    pointer would cause (it inflates the missing count instead). ──
         qmd_keys = [_fuzzy(t) for t in qmd_titles]
         matched_positions = []
         missing = []
+        used = set()
         for title in toc_titles:
             key = _fuzzy(title)
-            pos = next((i for i, q in enumerate(qmd_keys) if _similar(key, q)), None)
+            pos = next((i for i, q in enumerate(qmd_keys)
+                        if i not in used and _similar(key, q)), None)
             if pos is None:
                 missing.append(title)
             else:
                 matched_positions.append(pos)
+                used.add(pos)
         for title in missing[:_MAX_LISTED]:
             findings.append(Finding(f"source heading missing from the .qmd: “{title}”",
                                     "warn", "headings"))
