@@ -511,3 +511,20 @@ def test_fence_needs_two_strong_signals():
     qmd = "Set the variable ${HOME} in your shell profile before running.\n"
     out, n = _fence_unfenced_code(qmd)
     assert n == 0
+
+
+def test_breadcrumb_comments_stripped_but_markers_kept():
+    import re
+    qmd = ("# Doc\n\n<!-- postfix: recovered in place (source p4) -->\n\n"
+           "Recovered sentence here.\n\n"
+           "<!-- figures detected in Phase 1 but not placed\n   FIG_9: x -> y\n-->\n\n"
+           "More text.\n\n<!--pdf2md-repair-3-->\n\n"  # functional marker: keep
+           "Tail.\n\n<!-- postfix: source links recovered from PDF annotations -->\n\n"
+           "## Source links\n\n- http://x\n")
+    cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd)
+    cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    assert '<!-- postfix:' not in cleaned          # breadcrumbs gone
+    assert 'figures detected in Phase 1' not in cleaned
+    assert '<!--pdf2md-repair-3-->' in cleaned      # functional marker kept
+    assert 'Recovered sentence here.' in cleaned and '## Source links' in cleaned

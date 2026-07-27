@@ -138,6 +138,17 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
         summary['postfixes_applied'].append(
             'code: fenced {} unfenced code block(s)'.format(n_fenced))
 
+    # Final cleanup: strip author-facing postfix BREADCRUMB comments. They never render
+    # (HTML comments) but clutter the .qmd source, and the report already lists every
+    # repair. NOT touched: the <!--pdf2md-…--> functional markers — if one survives it
+    # means content wasn't recovered, which must stay visible rather than be hidden.
+    qmd_text = qmd_path.read_text(encoding='utf-8')
+    cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd_text)
+    cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    if cleaned != qmd_text:
+        qmd_path.write_text(cleaned, encoding='utf-8')
+
     # Re-verify
     if summary['postfixes_applied']:
         try:
