@@ -554,3 +554,19 @@ def test_strip_front_matter_keeps_body_prose_mentioning_services():
            "deliver products.\n")
     out, n = _strip_front_matter_noise(qmd)
     assert n == 0 and "Within this framework" in out   # body prose untouched
+
+
+def test_ensure_pipe_table_blanks():
+    from pdf2md.postfix import _ensure_pipe_table_blanks
+    # header glued to a caption/heading -> blank inserted; already-spaced table untouched
+    qmd = ("## Document Change Log\n| Issue | Date |\n|---|---|\n| 1.0 | 2025 |\n\n"
+           "Table 1 (Continued).\n| A | B |\n|---|---|\n| x | y |\n\n"
+           "Fine table below.\n\n| C | D |\n|---|---|\n| 1 | 2 |\n")
+    out, n = _ensure_pipe_table_blanks(qmd)
+    assert n == 2                                       # two glued tables fixed
+    assert "## Document Change Log\n\n| Issue | Date |" in out
+    assert "Table 1 (Continued).\n\n| A | B |" in out
+    assert out.count("| C | D |") == 1                 # already-spaced one untouched
+    # idempotent
+    out2, n2 = _ensure_pipe_table_blanks(out)
+    assert n2 == 0

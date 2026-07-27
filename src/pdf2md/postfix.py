@@ -155,8 +155,13 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd_text)
     cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # markdown safety: a pipe table glued to a heading/caption won't render as a table
+    cleaned, n_tblblank = _ensure_pipe_table_blanks(cleaned)
     if cleaned != qmd_text:
         qmd_path.write_text(cleaned, encoding='utf-8')
+    if n_tblblank:
+        summary['postfixes_applied'].append(
+            'tables: separated {} table(s) glued to a caption/heading'.format(n_tblblank))
 
     # Re-verify
     if summary['postfixes_applied']:
@@ -484,6 +489,24 @@ _TABLE_ABSENT_MIN = 0.5    # recover when this share of a table's distinctive va
 _TABLE_MIN_DISTINCTIVE = 4  # ignore tables with too little unique data to judge
 _TABLE_MIN_ROWS = 2
 _TABLE_MIN_COLS = 2
+
+
+def _ensure_pipe_table_blanks(text):
+    """A pipe table must be preceded by a blank line or Markdown parses its header as
+    part of the paragraph above and the table never renders. The converter (and
+    re-emitted tables) sometimes glue the header row straight onto a heading or a
+    'Table N' caption. Insert the missing blank. Returns (new_text, n_fixed)."""
+    lines = text.split('\n')
+    out, n = [], 0
+    for i, ln in enumerate(lines):
+        is_header = (re.match(r'^\s*\|.*\|\s*$', ln)
+                     and i + 1 < len(lines)
+                     and re.match(r'^\s*\|[-: |]+\|\s*$', lines[i + 1]))
+        if is_header and out and out[-1].strip() and not re.match(r'^\s*\|', out[-1]):
+            out.append('')
+            n += 1
+        out.append(ln)
+    return '\n'.join(out), n
 
 
 # ── Strip cover-page and TOC noise the converter left in the body ───────────────
