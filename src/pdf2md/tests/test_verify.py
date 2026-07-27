@@ -581,6 +581,16 @@ class TestProseCallout:
         rows = [["Band", "Res"], ["PPI", "500m"], ["QA", "500m"]]
         assert _is_prose_callout(rows) is False
 
+    def test_change_log_excluded(self):
+        from pdf2md.verify.checks.table_coverage import _is_change_log
+        rows = [["Issue", "Issue date", "Pages affected", "Description"],
+                ["1.0", "2025-01-10", "all", "First issue"],
+                ["1.1", "2025-03-02", "12, 15", "Minor edits"]]
+        assert _is_change_log(rows) is True
+        # a real data table with an "issue" value but no date/pages pairing is kept
+        rows2 = [["Band", "Resolution"], ["PPI", "500m"], ["QA", "500m"]]
+        assert _is_change_log(rows2) is False
+
 
 class TestHeadingOccurrenceMatch:
     def test_repeated_titles_not_false_reordered(self, tmp_path):

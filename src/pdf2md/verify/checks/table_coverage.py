@@ -74,6 +74,18 @@ def _is_prose_callout(rows: list) -> bool:
     return populated_cols <= 1 and median_words >= 12
 
 
+def _is_change_log(rows: list) -> bool:
+    """The document change / revision-history table. It's front matter (absent from the
+    bookmark outline), dropped from the output on purpose, so it must not count as a
+    missing source table. Signature: a header row pairing an issue/version/revision
+    column with a date/pages/change column."""
+    if not rows:
+        return False
+    header = " ".join(normalize(c) for c in rows[0] if c)
+    return bool(re.search(r"\b(issue|revision|version)\b", header)
+                and re.search(r"\b(date|pages?|change|amend)\b", header))
+
+
 def _is_layout_artifact(page, rows: list) -> bool:
     """True when a find_tables region is not a data table we score against.
 
@@ -90,7 +102,7 @@ def _is_layout_artifact(page, rows: list) -> bool:
     2. A printed Table of Contents (see _is_toc) — dropped from the output on purpose.
     3. A prose callout box (see _is_prose_callout) — body text, not a table.
     """
-    if _is_toc(rows) or _is_prose_callout(rows):
+    if _is_toc(rows) or _is_prose_callout(rows) or _is_change_log(rows):
         return True
     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
     if not cells:

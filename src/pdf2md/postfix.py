@@ -523,6 +523,10 @@ _COVER_ANCHOR = re.compile(
     r'document version|document date)\b', re.I)
 _COVER_PHRASE = re.compile(r'\ball rights reserved\b', re.I)
 _TOC_DUMP = re.compile(r'\bcontents\b.*\d|\blist of (figures|tables)\b', re.I)
+# the change-log section is front matter, not a numbered chapter (absent from the
+# bookmark outline), so the converter wrongly renders it as a section before "1
+# Introduction". Drop its heading and the issue-history table that follows.
+_CHANGE_LOG_RE = re.compile(r'^\s*#+\s*document change log\b', re.I)
 
 
 def _is_toc_dump(block):
@@ -557,11 +561,22 @@ def _strip_front_matter_noise(text):
         blocks.append('\n'.join(cur))
 
     kept, removed = [], 0
+    drop_next_table = False
     for b in blocks:
         s = b.strip()
         if not s:
             continue
         first = s.split('\n', 1)[0]
+        if drop_next_table:
+            drop_next_table = False
+            if re.match(r'^\s*\|', s):          # the change-log table (separate block)
+                removed += 1
+                continue
+        if _CHANGE_LOG_RE.match(first):
+            removed += 1
+            if not re.search(r'(?m)^\s*\|', b):  # heading not glued to its table
+                drop_next_table = True
+            continue
         if _COVER_ANCHOR.match(first) or _COVER_PHRASE.search(s) or _is_toc_dump(s):
             removed += 1
             continue

@@ -540,10 +540,11 @@ def test_strip_front_matter_noise():
            "Disclaimer:\nAll Rights Reserved.\n\n"
            "# Introduction\n\nWe deliver phenology products to users.\n")
     out, n = _strip_front_matter_noise(qmd)
-    assert n == 3                                  # TOC, Contact block, Disclaimer block
+    assert n == 5                    # change-log heading + its table, TOC, Contact, Disclaimer
     assert "Contact:" not in out and "Disclaimer:" not in out
     assert "1. Contents 1 1.1" not in out
-    assert "DOCUMENT CHANGE LOG" in out and "| Issue | Date |" in out  # kept
+    # change log is front matter (not in the bookmark outline) -> dropped with its table
+    assert "DOCUMENT CHANGE LOG" not in out and "| Issue | Date |" not in out
     assert "# Introduction" in out and "We deliver phenology" in out    # kept
 
 
