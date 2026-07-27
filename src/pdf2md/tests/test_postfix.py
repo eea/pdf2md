@@ -557,6 +557,19 @@ def test_strip_front_matter_keeps_body_prose_mentioning_services():
     assert n == 0 and "Within this framework" in out   # body prose untouched
 
 
+def test_strip_raw_math_lines():
+    from pdf2md.postfix import _strip_raw_math_lines
+    qmd = ("Prose before.\n\n"
+           "\U0001D444\U0001D438= \U0001D451\U0001D450+ (1) ∙ \U0001D43A cos(\U0001D703), Eq. 4\n\n"
+           "$$\\text{G} = \\text{G_0}, \\quad \\text{Eq. 4}$$\n\n"
+           "Normal prose with an italic $x$ and one stray \U0001D45D symbol stays.\n")
+    out, n = _strip_raw_math_lines(qmd)
+    assert n == 1                                  # only the tofu equation line
+    assert "cos(" not in out                        # tofu line gone
+    assert "$$\\text{G}" in out                     # proper LaTeX kept
+    assert "Normal prose" in out                    # 1 stray math char -> kept
+
+
 def test_strip_heading_numbers():
     from pdf2md.postfix import _strip_heading_numbers
     qmd = ("## 1. Introduction\n\n### 1.4.1 Applicable documents\n\n"

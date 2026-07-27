@@ -154,6 +154,12 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     qmd_text = qmd_path.read_text(encoding='utf-8')
     cleaned = re.sub(r'(?m)^[ \t]*<!-- postfix:[^\n]*-->[ \t]*\n?', '', qmd_text)
     cleaned = re.sub(r'<!-- figures detected in Phase 1.*?-->\n?', '', cleaned, flags=re.DOTALL)
+    # raw text-layer equation dumps render as '?' boxes; drop them (the proper $$…$$
+    # LaTeX the converter emitted alongside is what should render)
+    cleaned, n_tofu = _strip_raw_math_lines(cleaned)
+    if n_tofu:
+        summary['postfixes_applied'].append(
+            'math: removed {} unrenderable raw-equation line(s)'.format(n_tofu))
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     # Quarto auto-numbers sections, so a manual number in the heading text renders doubled
     cleaned, n_headnum = _strip_heading_numbers(cleaned)
@@ -517,6 +523,25 @@ def _ensure_pipe_table_blanks(text):
 
 _HEADING_NUM_RE = re.compile(r'^(#{1,6})\s+\d+(?:\.\d+)*\.?\s+(\S.*)$')
 _FENCE_RE = re.compile(r'^\s*(```|~~~)')
+# Mathematical Alphanumeric Symbols block: 𝐴 𝑄 𝜃 … — the codepoints PDF text
+# extraction uses for equation glyphs. Real math uses ASCII inside $…$, so several of
+# these on a line marks a raw text-layer equation dump.
+_MATH_ALNUM_RE = re.compile(r'[\U0001D400-\U0001D7FF]')
+
+
+def _strip_raw_math_lines(text):
+    """Drop lines dominated by Mathematical Alphanumeric Symbols. The converter sometimes
+    leaves the PDF's raw text-layer equation in the body IN ADDITION to a proper $$…$$
+    LaTeX version; the render font has no glyphs for that block, so it shows as '?' boxes
+    (tofu). Three-plus such codepoints on one line is an unambiguous garbled-dump signal
+    (legitimate prose and LaTeX never use them). Returns (new_text, n_removed)."""
+    out, n = [], 0
+    for ln in text.split('\n'):
+        if len(_MATH_ALNUM_RE.findall(ln)) >= 3:
+            n += 1
+            continue
+        out.append(ln)
+    return '\n'.join(out), n
 
 
 def _strip_heading_numbers(text):
