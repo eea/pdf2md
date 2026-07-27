@@ -1706,3 +1706,19 @@ class TestResolveHtmlImg:
         out, rep = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
         assert 'src="doc-media/img-a.png"' in out
         assert "FIG_1" not in out and rep["resolved"] == ["FIG_1"]
+
+    def test_prepends_figure_label_from_detection(self, tmp_path):
+        # converter dropped the 'Figure N' label; detection kept it -> restore it
+        from pdf2md.resolve import resolve_fig_tokens
+        figs = [{"fig_id": "FIG_1", "file": "img-aaa.png",
+                 "caption": "Figure 1. MODIS tile layout: 23 tiles over EEA-39."}]
+        body = "![MODIS tile layout: 23 tiles over EEA-39.](FIG_1)\n"
+        out, _ = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
+        assert "![Figure 1. MODIS tile layout: 23 tiles over EEA-39.](doc-media/img-aaa.png)" in out
+
+    def test_keeps_existing_figure_label(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        figs = [{"fig_id": "FIG_2", "file": "img-bbb.png", "caption": "Figure 2. Flowchart."}]
+        body = "![Figure 2. Flowchart.](FIG_2)\n"
+        out, _ = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
+        assert out.count("Figure 2.") == 1          # no double label

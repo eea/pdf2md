@@ -24,6 +24,23 @@ def _rel(file_name: str, qmd_path: Path, media_dirname: str) -> str:
     return f"{media_dirname}/{file_name}"
 
 
+_FIG_LABEL_RE = re.compile(r"^\s*(fig(?:ure)?\.?\s*\d+|table\s*\d+)", re.I)
+
+
+def _ensure_caption_label(caption: str, detection_caption: str) -> str:
+    """Keep the figure's 'Figure N' label. The converter often writes a descriptive
+    alt ('MODIS tile layout …') and drops the label, so with plain ![](img) (no Quarto
+    crossref) the figure renders unnumbered. Detection captured the label verbatim
+    ('Figure 1. MODIS tile layout …'), so prepend it when the alt lacks one."""
+    if _FIG_LABEL_RE.match(caption):
+        return caption
+    m = _FIG_LABEL_RE.match(detection_caption or "")
+    if not m:
+        return caption
+    label = m.group(1).rstrip(". ")
+    return f"{label}. {caption}" if caption else label
+
+
 def resolve_fig_tokens(body: str, figures: list, qmd_path: Path, media_dirname: str) -> tuple:
     """Replace FIG_n image tokens with real media paths.
 
@@ -42,7 +59,7 @@ def resolve_fig_tokens(body: str, figures: list, qmd_path: Path, media_dirname: 
         if fig and fig.get("file"):
             resolved.append(token)
             rel = _rel(fig["file"], qmd_path, media_dirname)
-            return f"![{caption}]({rel})"
+            return f"![{_ensure_caption_label(caption, fig.get('caption', ''))}]({rel})"
         # referenced but no matching detection; leave a render-safe marker
         hallucinated.append(token)
         marker = f"figure not found: {caption}" if caption else f"figure not found ({token})"
