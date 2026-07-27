@@ -160,6 +160,13 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     if n_tofu:
         summary['postfixes_applied'].append(
             'math: removed {} unrenderable raw-equation line(s)'.format(n_tofu))
+    # an underscore inside \text{} breaks KaTeX (HTML) but not Typst (PDF); escaping it
+    # renders identically in both instead of dumping raw LaTeX into the HTML
+    cleaned, n_uscore = _escape_text_underscores(cleaned)
+    if n_uscore:
+        summary['postfixes_applied'].append(
+            'math: escaped underscores in {} \\text{{}} group(s) for HTML math'.format(
+                n_uscore))
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     # Quarto auto-numbers sections, so a manual number in the heading text renders doubled
     cleaned, n_headnum = _strip_heading_numbers(cleaned)
@@ -527,6 +534,28 @@ _FENCE_RE = re.compile(r'^\s*(```|~~~)')
 # extraction uses for equation glyphs. Real math uses ASCII inside $…$, so several of
 # these on a line marks a raw text-layer equation dump.
 _MATH_ALNUM_RE = re.compile(r'[\U0001D400-\U0001D7FF]')
+
+
+_TEXT_GROUP_RE = re.compile(r'\\text\{[^{}]*\}')
+
+
+def _escape_text_underscores(text):
+    r"""An underscore inside a math \text{…} group is invalid in KaTeX (the HTML math
+    renderer) — it 'can't use _ in text mode', so it gives up and prints the raw LaTeX
+    source into the page. Typst (PDF) instead renders \text{NIR_R} as the literal string
+    'NIR_R'. Escaping the underscore (\text{NIR\_R}) is valid KaTeX AND yields the exact
+    same Typst (upright("NIR_R")), so HTML matches the PDF and neither changes shape.
+    \text{…} only occurs in math, so a global pass is safe. Returns (new_text, n)."""
+    n = 0
+
+    def fix(m):
+        nonlocal n
+        fixed = re.sub(r'(?<!\\)_', r'\\_', m.group(0))
+        if fixed != m.group(0):
+            n += 1
+        return fixed
+
+    return _TEXT_GROUP_RE.sub(fix, text), n
 
 
 def _strip_raw_math_lines(text):

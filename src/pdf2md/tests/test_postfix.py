@@ -614,6 +614,22 @@ def test_strip_front_matter_keeps_body_prose_mentioning_services():
     assert n == 0 and "Within this framework" in out   # body prose untouched
 
 
+def test_escape_text_underscores():
+    from pdf2md.postfix import _escape_text_underscores
+    src = r"$$\text{DVI} = \text{NIR_R} - \text{RED_R}, \quad \text{Eq. 2}$$"
+    out, n = _escape_text_underscores(src)
+    assert n == 2                                   # NIR_R and RED_R
+    assert r"\text{NIR\_R}" in out and r"\text{RED\_R}" in out
+    assert r"\text{DVI}" in out                      # untouched groups stay
+    # a real subscript OUTSIDE \text{} must not be escaped
+    src2 = r"$\text{MINV}_{\text{extrema}}$"
+    out2, n2 = _escape_text_underscores(src2)
+    assert n2 == 0 and out2 == src2
+    # idempotent: already-escaped stays put
+    out3, n3 = _escape_text_underscores(out)
+    assert n3 == 0 and out3 == out
+
+
 def test_strip_raw_math_lines():
     from pdf2md.postfix import _strip_raw_math_lines
     qmd = ("Prose before.\n\n"
