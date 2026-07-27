@@ -199,7 +199,16 @@ def run_phase1(
     )
     others = [r for r in regions if r.rtype != "figure"] + excluded_tables
 
-    inject_placeholders(working_pdf, figures, placeholders_pdf)
+    # table placeholders: box substantial table regions like figures, so the
+    # whole-doc pass emits markers and Pass 2 fills them from focused crops
+    from .tableslots import build_table_slots
+    try:
+        table_slots, tbl_boxes = build_table_slots(working_pdf, figures, excluded_tables)
+    except Exception as e:                  # noqa: BLE001 — never abort Phase 1
+        log.warning("table-slot scan failed (%s) — tables stay inline", e)
+        table_slots, tbl_boxes = [], []
+
+    inject_placeholders(working_pdf, figures + tbl_boxes, placeholders_pdf)
     size_mb = placeholders_pdf.stat().st_size / 1e6
     if size_mb > 20:
         log.warning(
@@ -207,7 +216,7 @@ def run_phase1(
             "base64) — the conversion upload may be rejected. Large undetected "
             "rasters (full-page maps, backgrounds) are the usual cause.",
             size_mb, size_mb * 1.37)
-    write_sidecar(sidecar, figures, others, cover=cover_block)
+    write_sidecar(sidecar, figures, others, cover=cover_block, table_slots=table_slots)
 
     summary = {
         "chrome_images_removed": chrome_report["images_removed"],

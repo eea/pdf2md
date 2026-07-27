@@ -144,17 +144,20 @@ def materialize_figures(
 
 
 def write_sidecar(path: Path, figures: list, others: list = None,
-                  cover: dict = None) -> None:
+                  cover: dict = None, table_slots: list = None) -> None:
     """Write detections.json.
 
     `figures` are the materialized FIG_<n> regions. `others` are non-figure detections
     (tables/chrome), recorded so the Phase-1 review can catch a figure misclassified as
     a table. `cover` is the optional ``{"is_cover": bool, "fields": {...}}`` block.
+    `table_slots` are the TBL_<k> placeholder regions Pass 2 fills from focused crops.
     """
     payload = {
         "figures": [asdict(r) for r in figures],
         "other_detections": [asdict(r) for r in (others or [])],
     }
+    if table_slots:
+        payload["table_slots"] = table_slots
     if cover is not None:
         payload["cover"] = cover
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

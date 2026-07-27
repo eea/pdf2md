@@ -41,6 +41,7 @@ def run_phase2(
         raise FileNotFoundError(f"no detections.json in {run_dir} — run Phase 1 first")
     sidecar = json.loads(detections_path.read_text(encoding="utf-8"))
     figures = sidecar.get("figures", [])
+    table_slots = sidecar.get("table_slots", [])
     cover_block = sidecar.get("cover")
     cover_fields = cover_block.get("fields") if cover_block and cover_block.get("is_cover") else None
 
@@ -62,6 +63,7 @@ def run_phase2(
         template_path=template_path,
         on_delta=on_delta,
         timeout=timeout,
+        table_slots=table_slots,
     )
 
     fig = result["figures"]

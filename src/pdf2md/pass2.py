@@ -53,6 +53,7 @@ def convert_placeholdered(
     on_delta=None,
     timeout: int = 300,
     max_tokens: int = None,
+    table_slots: list = None,
 ) -> dict:
     """Convert a placeholdered PDF to .qmd and resolve its FIG_n tokens.
 
@@ -78,6 +79,13 @@ def convert_placeholdered(
     if use_template:
         system_instruction = inject_template_frontmatter(system_instruction, template_path)
         log.info("[Pass 2] Template injected — prompt is %d chars", len(system_instruction))
+
+    if table_slots:
+        from .tableslots import PROMPT_SECTION
+        system_instruction += PROMPT_SECTION.format(nfig=len(figures),
+                                                    ntbl=len(table_slots))
+        log.info("[Pass 2] %d table slot(s) placeholdered — expecting markers",
+                 len(table_slots))
 
     # Placeholders PDF is small (figures/chrome stripped), so inline base64 fits any
     # page count; the re-sent PDF prefix is billed at the implicit-cache rate.
@@ -122,6 +130,12 @@ def convert_placeholdered(
     adopted = adopt_unstamped_figures(text, figures, crop_src, run_dir / media_dirname)
     text, fig_report = resolve_fig_tokens(text, figures, out_qmd, media_dirname)
     fig_report["adopted"] = adopted
+    # fill table-slot markers from focused crops BEFORE the table sanitizers below,
+    # so filled tables get the same caption-lift/border/entity treatment
+    tbl_report = {}
+    if table_slots and crop_src:
+        from .tableslots import fill_table_slots
+        text, tbl_report = fill_table_slots(text, table_slots, crop_src, api_key)
     text, n_folded = fold_figure_captions(text)
     if n_folded:
         log.info("[Pass 2] Folded %d stray 'Figure N:' caption line(s) back into the "
@@ -160,4 +174,5 @@ def convert_placeholdered(
     log.info("[Pass 2] Wrote %s", out_qmd.name)
 
     from .cost import usage_cost
-    return {"qmd": out_qmd, "figures": fig_report, "cost_usd": usage_cost(usage)}
+    return {"qmd": out_qmd, "figures": fig_report, "table_slots": tbl_report,
+            "cost_usd": usage_cost(usage) + tbl_report.get("cost", 0.0)}
