@@ -79,6 +79,12 @@ def inject_template_frontmatter(system_instruction: str, template_path) -> str:
     yaml_body = extract_template_frontmatter(tp)
     if not yaml_body:
         return system_instruction
+    # Indent the YAML block to match the prompt's own frontmatter-example style
+    # (a 4-space display block); keep blank lines blank.
+    indented = "\n".join(
+        ("    " + line) if line.strip() else line
+        for line in yaml_body.splitlines()
+    )
     replacement = (
         "FRONTMATTER:\n"
         "Begin the output with this EXACT YAML frontmatter block, filling in the\n"
@@ -86,12 +92,19 @@ def inject_template_frontmatter(system_instruction: str, template_path) -> str:
         "replace placeholder values with actual document metadata.\n"
         "Do NOT add, remove, or rename any keys.\n\n"
         "    ---\n"
-        f"{yaml_body}\n"
+        f"{indented}\n"
         "    ---\n\n"
         "Leave the structure intact — only update the VALUES."
     )
-    pattern = r"(FRONTMATTER:.*?)(?=\n\n[A-Z][A-Z]+:|\Z)"
-    return re.sub(pattern, replacement, system_instruction, flags=re.DOTALL)
+    # Replace the FRONTMATTER: section up to the next ALL-CAPS section header
+    # (e.g. OUTPUT:, DOCUMENT BODY:). The blank line before that header is left
+    # outside the match so the replacement stays cleanly separated.
+    # If no following header is found, make NO change rather than risk swallowing
+    # the rest of the prompt to \Z.
+    pattern = r"^FRONTMATTER:.*?(?=\n\n[A-Z][A-Z ]*[A-Z]:)"
+    new, n = re.subn(pattern, replacement, system_instruction,
+                     count=1, flags=re.DOTALL | re.MULTILINE)
+    return new if n else system_instruction
 
 
 

@@ -12,15 +12,18 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .cost import fmt_eur
 from .cover import DEFAULT_COVER_MODEL
 from .estimate import estimate_file, load_calibration
+from .llm_client import check_model_fit
+from .lint import lint_qmd
 from .phase1 import run_phase1
 from .phase2 import run_phase2
-from .postfix import run_postfix
+from .postfix import run_repair_loop, strip_chrome_qmd
 from .tablefix import run_phase_tablefix
 from .phase25 import run_phase25
 from .verify import VerifyContext, overall_status, run_verify, write_report
@@ -30,7 +33,20 @@ log = logging.getLogger(__name__)
 _TOOL_DIR = Path(__file__).resolve().parent
 _RENDER_ASSETS = _TOOL_DIR / "render_assets"
 
-DEFAULT_MODEL = "google/gemini-2.5-pro"
+# Canonical config location (app_cli imports these; keep the definition here since
+# app_cli already depends on app, and _find_quarto below reads the same file).
+CONFIG_DIR = Path.home() / ".pdf2md"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Validated best cost/quality for table-heavy docs (MODEL_EVALUATION.md); override with --model.
+DEFAULT_MODEL = "google/gemini-2.5-flash"
+
+# Pre-flight large-doc guard. With tail-only output continuation the binding wall is the
+# source PDF fitting the model's context window (its text footprint ≈ text_chars/4 tokens),
+# not the output length. Tied to gemini-2.5-flash's ~1M-token window; conservative so we
+# warn with headroom before the ~1200-page hard wall. Warn only — no split fallback.
+_CONTEXT_WINDOW_TOKENS = 1_000_000
+_LARGE_DOC_TOKENS = int(0.7 * _CONTEXT_WINDOW_TOKENS)
 
 
 @dataclass
@@ -49,8 +65,12 @@ class FileResult:
     verify_issues: list = field(default_factory=list)  # non-ok checks: {name, status, summary}
     postfixes_applied: list = field(default_factory=list)
     postfix_items: int = 0   # postfix passes that ran
-    text_cov: float = None
+    text_cov: float = None                # final in-place (strict) text coverage %
+    text_cov_before: float = None         # text coverage before post-fixes (for the delta)
+    text_cov_effective: float = None      # text coverage counting recovered appendix
+    postfix_recovered: int = 0            # source gaps the recovery appendix now covers
     table_cov: float = None
+    table_cov_before: float = None        # table coverage before post-fixes
     cover: dict = None
     qmd: Path = None
     pdf_out: Path = None
@@ -58,7 +78,10 @@ class FileResult:
     cost_usd: float = 0.0
     phase_cost: dict = field(default_factory=dict)
     tablefix: dict = None        # Phase 2.5 summary; kept for dry-run replay
+    repair_iterations: list = field(default_factory=list)  # per-iteration repair stats
     timing: dict = field(default_factory=dict)   # phase -> seconds
+    lint_fixes: list = field(default_factory=list)     # emit-time hazards auto-repaired
+    lint_failures: list = field(default_factory=list)  # unfixable hazards -> status fail
 
 
 class Events:
@@ -74,6 +97,7 @@ class Events:
     # per file
     def file_start(self, pdf, index, total): ...
     def estimate_done(self, est): ...
+    def model_notes(self, notes): ...
     def file_done(self, result): ...
     # phase 1
     def chrome_done(self, report): ...
@@ -124,12 +148,11 @@ def _ensure_scaffolding(out_root: Path) -> None:
 def _find_quarto() -> str | None:
     """Find the Quarto binary: config override > PATH > common install locations."""
     import shutil as _shutil, json as _json
-    
+
     # 1. Config override
-    cfg_path = Path.home() / ".pdf2md" / "config.json"
-    if cfg_path.exists():
+    if CONFIG_FILE.exists():
         try:
-            cfg = _json.loads(cfg_path.read_text())
+            cfg = _json.loads(CONFIG_FILE.read_text())
             qp = cfg.get("quarto_path", "")
             if qp and Path(qp).exists():
                 return qp
@@ -157,9 +180,9 @@ def _find_quarto() -> str | None:
     return None
 
 
-def _render(out_dir: Path, stem: str, quarto_path: str | None = None) -> tuple:
+def _render(out_dir: Path, stem: str) -> tuple:
     """Render <stem>.qmd to <stem>.pdf via Quarto/Typst. Returns (ok, log_text)."""
-    quarto = quarto_path or _find_quarto()
+    quarto = _find_quarto()
     if not quarto:
         return False, "Quarto not found. Install from https://quarto.org or set quarto_path in ~/.pdf2md/config.json"
     
@@ -177,7 +200,7 @@ def _render(out_dir: Path, stem: str, quarto_path: str | None = None) -> tuple:
         return False, "render timed out (300s)"
 
 
-def _run_verify(out_dir: Path, stem: str) -> list:
+def _run_verify(out_dir: Path, stem: str, meta: dict = None) -> list:
     detections_path = out_dir / "detections.json"
     detections = json.loads(detections_path.read_text()) if detections_path.exists() else {"figures": []}
     qmd_path = out_dir / f"{stem}.qmd"
@@ -195,7 +218,7 @@ def _run_verify(out_dir: Path, stem: str) -> list:
         rendered_pdf=rendered if rendered.exists() else None,
     )
     results = run_verify(ctx)
-    write_report(results, out_dir)
+    write_report(results, out_dir, meta=meta)
     return results
 
 
@@ -220,10 +243,11 @@ def _count_tables(qmd_path: Path) -> int:
 
 
 def _cleanup_artifacts(out_dir: Path) -> None:
-    """Remove intermediate files, keeping only the final outputs and the
-    result.json (needed for dry-run replay)."""
-    for pattern in ["*.working.pdf", "*.placeholders.pdf", "detections.json",
-                     "phase1.json", "verify.json"]:
+    """Remove intermediate files, keeping the final outputs, result.json (dry-run
+    replay), detections.json (figure inventory) and the chrome-stripped working.pdf
+    (the body-text copy the .qmd derives from — repairs anchor against it so context
+    matches the conversion instead of re-stripping chrome from the raw source)."""
+    for pattern in ["*.placeholders.pdf", "phase1.json", "verify.json"]:
         for f in out_dir.glob(pattern):
             try:
                 f.unlink()
@@ -253,109 +277,13 @@ def _persist_result(result: "FileResult") -> None:
         log.debug("could not persist result.json: %s", exc)
 
 
-def _split_convert(pdf_path: Path, out_dir: Path, stem: str, api_key: str, 
-                   model: str, cover_fields: dict, default_date: str,
-                   format: str, figures: list, template_path, events) -> tuple:
-    """Split a too-large placeholder PDF into chunks, convert each, concatenate."""
-    import fitz
-    doc = fitz.open(str(pdf_path))
-    total = doc.page_count
-    # Chunk size: aim for ~25 pages per chunk (fits 16K token limit with margin)
-    # Dynamic chunk size: scale to the model's max_tokens
-    # ~650 completion tokens/page (observed avg for technical docs),
-    # use 60% of max_tokens as safety margin
-    from .llm_client import _model_max_tokens
-    max_tok = _model_max_tokens(model)
-    chunk_size = max(10, int(max_tok * 0.6 / 650))
-    chunks = list(range(0, total, chunk_size))
-    if len(chunks) == 1:
-        # shouldn't happen -- caller should only invoke this on failure
-        return None, None
-    
-    log.info("Auto-splitting %s: %d pages → %d chunks of ~%d pages each", 
-             pdf_path.name, total, len(chunks), chunk_size)
-    
-    from .phase2 import run_phase2
-    bodies = []
-    total_cost = 0.0
-    _chunk_temp_dirs = []  # track temp dirs for cleanup
-
-    try:
-        for i, start in enumerate(chunks):
-            end = min(start + chunk_size, total)
-            # Create chunk PDF
-            chunk_doc = fitz.open()
-            for p in range(start, end):
-                chunk_doc.insert_pdf(doc, from_page=p, to_page=p)
-            # Use a local temp dir for chunks
-            import tempfile as _tempfile
-            chunk_dir = Path(_tempfile.mkdtemp(prefix=f"pdf2md_chunk{i}_"))
-            _chunk_temp_dirs.append(chunk_dir)
-            chunk_pdf = chunk_dir / f"{stem}_chunk{i}.placeholders.pdf"
-            chunk_doc.save(str(chunk_pdf))
-            chunk_doc.close()
-            
-            # Copy detections sidecar
-            import shutil
-            det = out_dir / "detections.json"
-            if det.exists():
-                shutil.copy2(str(det), str(chunk_dir / "detections.json"))
-            
-            events.convert_start()
-            p2 = run_phase2(chunk_dir, api_key=api_key, model=model,
-                            template_path=template_path,
-                            default_date=default_date, format=format)
-            events.convert_done()
-            
-            chunk_qmd = chunk_dir / f"{stem}_chunk{i}.qmd" if format == "qmd" else chunk_dir / f"{stem}_chunk{i}.md"
-            if not chunk_qmd.exists():
-                raise RuntimeError(f"Chunk {i} conversion produced no output")
-            
-            chunk_text = chunk_qmd.read_text(encoding="utf-8")
-            # Strip frontmatter from chunks 1+
-            if i > 0:
-                import re
-                m = re.match(r"^---\s*\n.*?\n---\s*\n?", chunk_text, re.DOTALL)
-                if m:
-                    chunk_text = chunk_text[m.end():]
-            
-            bodies.append(chunk_text.lstrip())
-            total_cost += p2.get("cost_usd", 0.0)
-        
-        # Concatenate bodies
-        full_body = "\n\n".join(bodies)
-        ext = "qmd" if format == "qmd" else "md"
-        out_qmd = out_dir / f"{stem}.{ext}"
-        
-        # If first chunk had frontmatter, it's in bodies[0]; otherwise add it
-        if not bodies[0].startswith("---"):
-            from .resolve import normalize_frontmatter
-            from .pass2 import DEFAULT_CATEGORY
-            full_body = normalize_frontmatter(full_body, DEFAULT_CATEGORY, default_date, cover_fields)
-        
-        # Rewrite chunk-specific media paths to the main {stem}-media/ dir
-        for i in range(len(chunks)):
-            full_body = full_body.replace(
-                f"{stem}_chunk{i}-media/", f"{stem}-media/"
-            )
-
-        out_qmd.write_text(full_body, encoding="utf-8")
-    finally:
-        doc.close()
-        # Always clean up chunk temp dirs, even on failure
-        for chunk_dir in _chunk_temp_dirs:
-            if chunk_dir.exists():
-                shutil.rmtree(str(chunk_dir), ignore_errors=True)
-    
-    log.info("Auto-split done: %d chunks → %s", len(chunks), out_qmd.name)
-    return out_qmd, total_cost
-
 def convert_one(
     pdf: Path,
     out_root: Path,
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
@@ -366,10 +294,10 @@ def convert_one(
     events: Events = None,
     index: int = 1,
     total: int = 1,
-    format: str = "qmd", strip_headers: bool = None,
+    format: str = "qmd", strip_chrome: bool = False,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
     template: str = None,               # path to a .qmd template for YAML frontmatter
-    postfix_passes: int = 1,
+    postfix_passes: int = 3,           # max iterations of the repair loop (0 = off)
     improve_only: bool = False,
     json_report: bool = False,
 ) -> FileResult:
@@ -392,33 +320,38 @@ def convert_one(
         if det_path.exists():
             import json as _json
             detections = _json.loads(det_path.read_text())
+        # no conversion in this run, so no conversion cost — repair cost is added
+        # to the report by run_repair_loop itself
+        report_meta = {"stem": stem,
+                       "date": datetime.date.today().strftime("%d %b %Y")}
         events.verify_start()
-        results = _run_verify(out_dir, stem)
+        results = _run_verify(out_dir, stem, meta=report_meta)
         result.verify_status = overall_status(results)
         events.verify_done(result.verify_status)
         result.text_cov = _metric(results, "text_coverage")
         result.table_cov = _metric(results, "table_coverage")
-        result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+        result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary, "problem": r.problem}
                                 for r in results if r.status in ("warn", "fail")]
         result.verify_report = out_dir / "verify_report.md"
         if postfix_passes > 0 and results:
-            postfix_summary = run_postfix(
-                result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes,
+            repair_summary = run_repair_loop(
+                result.qmd, out_dir, results, api_key,
+                max_iterations=postfix_passes, meta=report_meta,
             )
-            result.phase_cost["postfix"] = postfix_summary.get("cost_usd", 0.0)
+            result.phase_cost["postfix"] = repair_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
-            if postfix_summary.get("postfixes_applied"):
-                result.postfixes_applied = postfix_summary["postfixes_applied"]
-                log.info("Postfix applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
-                if postfix_summary.get("verify_after"):
-                    result.verify_status = postfix_summary["verify_after"]
+            result.repair_iterations = repair_summary.get("iterations", [])
+            if repair_summary.get("postfixes_applied"):
+                result.postfixes_applied = repair_summary["postfixes_applied"]
+                log.info("Repair applied: %s", ", ".join(repair_summary["postfixes_applied"]))
+                if repair_summary.get("verify_after"):
+                    result.verify_status = repair_summary["verify_after"]
         result.status = "warn" if result.verify_status in ("warn", "fail") else "ok"
         events.file_done(result)
         return result
 
-    # resume: a completed .qmd means this file is done. checked before estimating
-    # so a resume run doesn't even estimate files it'll skip.
+    # resume: a completed .qmd means this file is done (use --improve to re-run
+    # verify + the repair loop on existing output).
     if out_dir.exists() and (out_dir / f"{stem}.{ext}").exists() and not force:
         log.info("Skipping %s — %s already exists (use force to overwrite)", pdf.name, out_dir)
         result.status = "ok"
@@ -443,6 +376,30 @@ def convert_one(
                  pdf.name, fmt_eur(estimate["expected_usd"]),
                  fmt_eur(estimate["low_usd"]), fmt_eur(estimate["high_usd"]),
                  estimate.get("pages", 0), estimate.get("candidate_pages", 0))
+        # Pre-flight: a document whose text won't fit the context window may convert
+        # incompletely (verify's text_coverage will flag the gap). Warn upfront; the
+        # only real fix past the ceiling is splitting the source into sections.
+        est_doc_tokens = estimate.get("text_chars", 0) / 4
+        if est_doc_tokens > _LARGE_DOC_TOKENS:
+            log.warning(
+                "%s is very large (~%d pages, ~%dk tokens of text) — it may exceed the "
+                "model's context window and convert incompletely. If the output looks "
+                "truncated, split the source into sections and convert each.",
+                pdf.name, estimate.get("pages", 0), int(est_doc_tokens / 1000))
+
+        # pre-flight model check: tell the user upfront instead of failing mid-run
+        notes = check_model_fit(model, estimate.get("pages", 0))
+        if notes:
+            events.model_notes(notes)
+            for n in notes:
+                (log.error if n["level"] == "error" else
+                 log.warning if n["level"] == "warn" else log.info)("%s", n["msg"])
+            blockers = [n["msg"] for n in notes if n["level"] == "error"]
+            if blockers:
+                result.status = "skip"
+                result.error = blockers[0]
+                events.file_done(result)
+                return result
         if (max_cost_per_file is not None and not allow_over_budget
                 and estimate["expected_usd"] > max_cost_per_file):
             result.status = "skip"
@@ -453,16 +410,27 @@ def convert_one(
             events.file_done(result)
             return result
 
+    # ---- Temp-dir redirect (avoids Deno KV disk I/O on synced FS) ----
+    real_out_root = out_root
+    _temp_root = None
+    if not improve_only:
+        _temp_root = Path(tempfile.mkdtemp(prefix="pdf2md-"))
+        out_root = _temp_root
+        out_dir = out_root / stem
+        result.out_dir = out_dir
+
     try:
         import time as _time
         t0 = _time.perf_counter()
         if do_render: _ensure_scaffolding(out_root)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Phase 1 — detect
-        do_strip = strip_headers
-        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
-                        do_strip_chrome=do_strip,
+        # Phase 1 — detect. 1:1 by default: the working PDF keeps its running
+        # headers/footers unless --strip-chrome asked for them to go.
+        # Uses figure_llm for figure-detection when set, falling back to the
+        # main conversion model.
+        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=figure_llm or model,
+                        do_strip_chrome=strip_chrome,
                         cover_model=cover_model, events=events,
                         detect_workers=detect_workers)
         result.figures = p1.get("figures", 0)
@@ -480,30 +448,10 @@ def convert_one(
         t_conv = _time.perf_counter()
         on_delta = events.convert_delta if events.wants_stream else None
         fallback_date = datetime.date.today().isoformat()
-        try:
-            p2 = run_phase2(out_dir, api_key=api_key, model=model,
-                            default_date=fallback_date, on_delta=on_delta, format=format,
-                            template_path=template)
-        except RuntimeError as e:
-            if "Output truncated" in str(e) or "too long" in str(e) or "output-token limit" in str(e):
-                log.warning("Output truncated — attempting auto-split")
-                figures = []
-                det_path = out_dir / "detections.json"
-                if det_path.exists():
-                    import json as _json
-                    figures = _json.loads(det_path.read_text()).get("figures", [])
-                split_qmd, split_cost = _split_convert(
-                    out_dir / f"{stem}.placeholders.pdf", out_dir, stem,
-                    api_key, model, result.cover, fallback_date, format, figures, template, events)
-                if split_qmd:
-                    p2 = {"cost_usd": split_cost or 0.0}
-                    result.qmd = split_qmd
-                    events.convert_done()
-                    # skip the normal result.qmd assignment below
-                else:
-                    raise
-            else:
-                raise
+        # Long docs stream output across continuation calls, not source slicing (see llm_client).
+        p2 = run_phase2(out_dir, api_key=api_key, model=model,
+                        default_date=fallback_date, on_delta=on_delta, format=format,
+                        template_path=template)
         ext = "qmd" if format == "qmd" else "md"
         if not result.qmd:
             result.qmd = out_dir / f"{stem}.{ext}"
@@ -521,7 +469,8 @@ def convert_one(
             working_pdf=out_dir / f'{stem}.working.pdf',
             api_key=api_key,
         )
-        result.phase_cost['rescue'] = 0.0  # LLM costs tracked separately for now
+        result.phase_cost['rescue'] = p25.get('cost_usd', 0.0)
+        result.cost_usd = sum(result.phase_cost.values())
         figures_rescued = p25.get('resolved_2_5a', 0) + p25.get('inserted_2_5b', 0)
         if figures_rescued:
             log.info('Phase 2.5 rescued %d figure(s)', figures_rescued)
@@ -533,6 +482,18 @@ def convert_one(
             result.qmd, source_pdf=out_dir / f"{stem}.source.pdf", events=events)
         result.timing["phase25"] = round(_time.perf_counter() - t_phase25, 3)
         result.tables = _count_tables(result.qmd)
+
+        # Phase 2.9 — pre-render sanitize. Phase 2 / rescue / tablefix can leave
+        # nested image markdown (`![](![alt](path))`) in the .qmd; Quarto turns
+        # that literally into `image("![alt](path)")` in the Typst output instead
+        # of failing, so it must be cleaned BEFORE render, not just at the final
+        # lint gate (Phase 4.6) which runs after render/verify/postfix. The final
+        # gate still runs afterward since postfix can reintroduce the hazard.
+        if format == "qmd" and result.qmd and Path(result.qmd).exists():
+            pre_lint_res = lint_qmd(Path(result.qmd))
+            if pre_lint_res.fixes:
+                log.info("Pre-render lint sanitized: %s",
+                         "; ".join(i.message for i in pre_lint_res.fixes))
 
         # Phase 3 — render. A render failure is a warn; the .qmd is still produced.
         render_failed = False
@@ -552,34 +513,101 @@ def convert_one(
         # Phase 4 — verify
         results = []
         t_verify = _time.perf_counter()
+        report_meta = {"stem": stem, "date": _time.strftime("%d %b %Y"),
+                       "pages": (estimate or {}).get("pages"),
+                       "model": model,
+                       "model_cover": cover_model,
+                       "model_detect": figure_llm or model,
+                       "model_convert": model,
+                       "model_repair": "google/gemini-2.5-flash",
+                       "cost_convert": round(sum(result.phase_cost.values()), 4)}
         if do_verify and format == "qmd":
             events.verify_start()
-            results = _run_verify(out_dir, stem)
+            results = _run_verify(out_dir, stem, meta=report_meta)
             result.verify_status = overall_status(results)
             events.verify_done(result.verify_status)
             result.text_cov = _metric(results, "text_coverage")
             result.table_cov = _metric(results, "table_coverage")
-            result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+            result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary, "problem": r.problem}
                                     for r in results if r.status in ("warn", "fail")]
             result.verify_report = out_dir / "verify_report.md"
             result.timing["verify"] = round(_time.perf_counter() - t_verify, 3)
 
-# Phase 4.5 -- postfix (surgical fixes driven by verify results)
+        # Phase 4.5 — iterative repair loop (deterministic fixes → LLM missing-text
+        # → vision patches → re-verify, cycling until stable or the iteration
+        # budget is spent)
         t_postfix = _time.perf_counter()
         if postfix_passes > 0 and results:
-            postfix_summary = run_postfix(
-                result.qmd, results, out_dir,
-                api_key=api_key, passes=postfix_passes,
+            # snapshot pre-fix coverage so the single report can show the before→after
+            # delta inline (the numbers it prints are the post-repair final state)
+            result.text_cov_before = result.text_cov
+            result.table_cov_before = result.table_cov
+            report_meta["text_cov_before"] = result.text_cov
+            report_meta["table_cov_before"] = result.table_cov
+            repair_summary = run_repair_loop(
+                result.qmd, out_dir, results, api_key,
+                max_iterations=postfix_passes, meta=report_meta,
             )
-            result.phase_cost["repair"] = postfix_summary.get("cost_usd", 0.0)
+            result.phase_cost["repair"] = repair_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
-            result.postfix_items = postfix_summary.get("items_recovered", 0)
-            if postfix_summary.get("postfixes_applied"):
-                result.postfixes_applied = postfix_summary["postfixes_applied"]
-                log.info("Repair applied: %s", ", ".join(postfix_summary["postfixes_applied"]))
-                if postfix_summary.get("verify_after"):
-                    result.verify_status = postfix_summary["verify_after"]
+            result.postfix_items = repair_summary.get("items_recovered", 0)
+            result.repair_iterations = repair_summary.get("iterations", [])
+            if repair_summary.get("postfixes_applied"):
+                result.postfixes_applied = repair_summary["postfixes_applied"]
+                log.info("Repair applied: %s", ", ".join(repair_summary["postfixes_applied"]))
+                if repair_summary.get("verify_after"):
+                    result.verify_status = repair_summary["verify_after"]
+                # adopt the post-fix coverage as the final numbers (in-place + effective)
+                ca = repair_summary.get("coverage_after") or {}
+                if ca.get("text") is not None:
+                    result.text_cov = ca["text"]
+                    result.text_cov_effective = ca.get("text_effective")
+                    result.postfix_recovered = ca.get("text_recovered", 0)
+                if ca.get("table") is not None:
+                    result.table_cov = ca["table"]
             result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
+
+        # Phase 4.6 — emit-time lint gate. Deterministic, no LLM. The repair passes
+        # above can re-introduce structural hazards after pass2's write (one stray
+        # fence inverts every downstream "``` parity" check), so this is the LAST
+        # touch: sanitize the single-correct-repair hazards, fail only on the rest.
+        if format == "qmd" and result.qmd and Path(result.qmd).exists():
+            lint_res = lint_qmd(Path(result.qmd))
+            if lint_res.fixes:
+                result.lint_fixes = [i.message for i in lint_res.fixes]
+                log.info("Lint sanitized: %s", "; ".join(result.lint_fixes))
+            for w in lint_res.warnings:
+                log.warning("Lint: %s", w.message)
+            if lint_res.failures:
+                result.lint_failures = [i.message for i in lint_res.failures]
+                for f in lint_res.failures:
+                    log.error("Lint FAIL: %s", f.message)
+                result.verify_status = "fail"
+                result.verify_issues = list(result.verify_issues) + [
+                    {"name": "lint", "status": "fail", "summary": f.message}
+                    for f in lint_res.failures
+                ]
+
+        # Phase 5.5 — deterministic chrome strip (--strip-chrome). Runs LAST so
+        # verify/review judged the chrome-complete 1:1 content; whole-line
+        # removals only, so it cannot break fence parity or table markup.
+        if strip_chrome and format == "qmd" and result.qmd and Path(result.qmd).exists():
+            n_chrome = strip_chrome_qmd(Path(result.qmd), out_dir)
+            if n_chrome:
+                result.postfixes_applied = list(result.postfixes_applied) + [
+                    f"chrome: stripped {n_chrome} running header/footer line(s)"]
+                if do_verify:
+                    # re-verify to confirm coverage held (chrome is excluded from
+                    # text_coverage, so removals must not regress it)
+                    events.verify_start()
+                    results = _run_verify(out_dir, stem, meta=report_meta)
+                    result.verify_status = overall_status(results)
+                    events.verify_done(result.verify_status)
+                    result.text_cov = _metric(results, "text_coverage")
+                    result.table_cov = _metric(results, "table_coverage")
+                    result.verify_issues = [{"name": r.name, "status": r.status, "summary": r.summary}
+                                            for r in results if r.status in ("warn", "fail")]
+
         result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)
         sev = {"ok": 0, "warn": 1, "fail": 2}
@@ -594,6 +622,25 @@ def convert_one(
     if out_dir.exists():
         _persist_result(result)
         _cleanup_artifacts(out_dir)
+
+    # ---- Copy from temp dir to real output (undo the temp-dir redirect) ----
+    if _temp_root is not None:
+        src = out_dir
+        dst = real_out_root / stem
+        if dst.exists():
+            shutil.rmtree(dst)
+        if src.exists():
+            shutil.copytree(src, dst)
+            result.out_dir = dst
+            if result.qmd:
+                result.qmd = dst / result.qmd.name
+            if result.pdf_out:
+                result.pdf_out = dst / result.pdf_out.name
+            if result.verify_report:
+                result.verify_report = dst / result.verify_report.name
+        shutil.rmtree(_temp_root, ignore_errors=True)
+        _temp_root = None
+
     events.file_done(result)
     return result
 
@@ -604,6 +651,7 @@ def convert_batch(
     *,
     api_key: str,
     model: str = DEFAULT_MODEL,
+    figure_llm: str = None,               # None = use model (main model)
     cover_model: str = DEFAULT_COVER_MODEL,
     do_render: bool = False,
     do_verify: bool = True,
@@ -613,9 +661,9 @@ def convert_batch(
     allow_over_budget: bool = False,   # override both gates
     events: Events = None,
     detect_workers: int = 8,           # concurrent per-page detection calls (Phase 1; see README)
-    format: str = "qmd", strip_headers: bool = None,
+    format: str = "qmd", strip_chrome: bool = False,
     template: str = None,               # path to a .qmd template for YAML frontmatter
-    postfix_passes: int = 1,
+    postfix_passes: int = 3,           # max iterations of the repair loop (0 = off)
     improve_only: bool = False,
     json_report: bool = False,
 ) -> list:
@@ -667,10 +715,11 @@ def convert_batch(
             r = convert_one(
                 pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
                 do_render=do_render, do_verify=do_verify, force=force,
-                max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
+                max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_chrome=strip_chrome,
                 estimate=est, events=events, index=i, total=len(pdfs), template=template,
                 detect_workers=detect_workers,
                 postfix_passes=postfix_passes,
+                improve_only=improve_only,
                 json_report=json_report,
             )
             results.append(r)

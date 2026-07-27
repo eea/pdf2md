@@ -49,7 +49,13 @@ def _try_source_titles(ctx) -> tuple:
 
 def _qmd_headings(qmd_text: str) -> list:
     body = _FRONTMATTER_RE.sub("", qmd_text, count=1)
-    return [normalize(m.group(2)) for m in _HEADING_RE.finditer(body) if normalize(m.group(2))]
+    out = []
+    for m in _HEADING_RE.finditer(body):
+        # drop Quarto anchor attrs ("Scope {#sec-1-2}") — they'd pollute matching
+        t = normalize(re.sub(r"\{[^}]*\}", " ", m.group(2)))
+        if t:
+            out.append(t)
+    return out
 
 
 def _fuzzy(text: str) -> str:
@@ -135,8 +141,17 @@ class HeadingHierarchyCheck:
         status = "warn" if findings else "ok"
         summary = (f"{len(qmd_titles)} heading(s); {len(missing)} missing, "
                    f"{reordered} reordered vs the source outline")
+        # terse line leads with the reliable, actionable signal (missing count);
+        # "reordered" is noisy so it's the fallback only when nothing is missing
+        if missing:
+            problem = f"{len(missing)} heading{'s' if len(missing) != 1 else ''} missing"
+        elif reordered:
+            problem = f"{reordered} heading(s) out of order"
+        else:
+            problem = "heading count differs from source"
         return CheckResult(
             self.name, status, summary,
+            problem=problem if findings else None,
             metric=f"{len(qmd_titles)} headings, {reordered} reordered",
             findings=findings,
         )

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf2md"
-version = "0.2.1"
+version = "0.3.0"
 description = "Convert PDF to Markdown/Quarto .md/.qmd (detect, transcribe, render, verify)"
 readme = "README.md"
 authors = [
@@ -16,7 +16,7 @@ classifiers = [
     "License :: OSI Approved :: European Union Public Licence 1.2 (EUPL 1.2)",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "PyMuPDF>=1.26",
     "requests>=2.32",

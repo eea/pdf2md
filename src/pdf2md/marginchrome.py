@@ -189,6 +189,12 @@ def detect_running_chrome(pdf_path: Path, *, skip_pages=()) -> dict:
         page_h = doc[pno].rect.height or 1.0
         body_ys_top, body_ys_bot = [], []
         for e in page_elements[pno]:
+            # A lone page-number block is neither chrome (it is kept out of chrome_keys
+            # because its digits differ per page) nor body. Counting it as body pushed
+            # the no-cross guard BELOW the footer, so the whole bottom band was discarded
+            # and footers were never stripped — treat it as neutral instead.
+            if e["sig"] == "__digits__":
+                continue
             if (e["sig"], e["band"]) not in chrome_keys:
                 if e["band"] == "top" or e["band"] is None:
                     body_ys_top.append(e["y0"])

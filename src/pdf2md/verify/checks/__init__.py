@@ -16,3 +16,6 @@ from . import link_preservation   # noqa: F401
 from . import heading_hierarchy   # noqa: F401
 from . import math_presence       # noqa: F401
 from . import code_block_presence  # noqa: F401
+from . import yaml_boundary       # noqa: F401
+from . import duplication         # noqa: F401
+from . import artifacts           # noqa: F401

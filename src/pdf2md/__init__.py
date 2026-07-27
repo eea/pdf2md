@@ -10,7 +10,7 @@ Run:  python3 tools/pdf2md/pdf2md.py FILE.pdf
 
 import logging
 
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 
 # configure logging once on first import; modules use logging.getLogger(__name__)
 logging.basicConfig(

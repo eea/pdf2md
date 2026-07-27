@@ -204,11 +204,20 @@ def _extract_excluded_tables(text: str) -> list:
     return []
 
 
-def _box_to_region(box: dict, page, page_idx: int) -> Region:
+def _box_to_region(box: dict, page, page_idx: int):
     """Convert one model box (normalized 0-1000 bbox) to a Region in PDF points on
-    `page_idx` (the page we sent)."""
+    `page_idx`. Returns None for a malformed bbox (not exactly 4 numbers) — some
+    models occasionally emit those, and one bad box must not crash detection."""
+    coords = box.get("bbox")
+    if not isinstance(coords, (list, tuple)) or len(coords) != 4:
+        log.warning("page %d: skipping figure with malformed bbox %r", page_idx + 1, coords)
+        return None
     pw, ph = page.rect.width, page.rect.height
-    x0, y0, x1, y1 = (float(v) for v in box["bbox"])
+    try:
+        x0, y0, x1, y1 = (float(v) for v in coords)
+    except (TypeError, ValueError):
+        log.warning("page %d: skipping figure with non-numeric bbox %r", page_idx + 1, coords)
+        return None
     bx0, bx1 = sorted((x0, x1))
     by0, by1 = sorted((y0, y1))
     bbox = (bx0 / _NORM * pw, by0 / _NORM * ph, bx1 / _NORM * pw, by1 / _NORM * ph)
@@ -269,9 +278,10 @@ def detect_figures(
         boxes = None
         response = None
         page_cost = 0.0
+        api_error = None
         # up to 2 attempts: models emit malformed JSON intermittently. a page that
         # still fails (after the client's own network retries) is skipped, not
-        # fatal to the run.
+        # fatal to the run — unless EVERY page fails on an API error (see below).
         for attempt in (1, 2):
             try:
                 response, usage = call_vision(
@@ -288,16 +298,20 @@ def detect_figures(
                     i + 1, attempt, exc,
                 )
             except RuntimeError as exc:
+                api_error = str(exc)
                 log.warning("page %d: detection call failed (attempt %d/2): %s", i + 1, attempt, exc)
         if boxes is None:
-            return {"i": i, "ok": False, "cost": page_cost, "regions": [], "excluded": 0}
+            return {"i": i, "ok": False, "cost": page_cost, "regions": [],
+                    "excluded": 0, "api_error": api_error}
         excluded = _extract_excluded_tables(response)
         with _fitz_lock:
-            page_regions = [_box_to_region(b, doc[i], i) for b in boxes]
+            page_regions = [r for b in boxes
+                            if (r := _box_to_region(b, doc[i], i)) is not None]
         return {"i": i, "ok": True, "cost": page_cost,
                 "regions": page_regions, "excluded": len(excluded)}
 
     results_by_page: dict = {}
+    api_errors: list = []
 
     def _drain(res: dict) -> None:
         """Apply one page result. Calling thread only, so event/cost/log/region
@@ -307,6 +321,8 @@ def detect_figures(
         i = res["i"]
         if not res["ok"]:
             failed_pages.append(i + 1)
+            if res.get("api_error"):
+                api_errors.append(res["api_error"])
             if events:
                 events.detect_page(i, 0)
             return
@@ -346,6 +362,14 @@ def detect_figures(
             regions.extend(results_by_page.get(i, []))
     finally:
         doc.close()
+
+    # every page failed and at least one failure was an API error (auth, credits,
+    # network): "detected 0 figures" would silently ship the full-size PDF to the
+    # conversion call — abort loudly instead so the real error reaches the user
+    if indices and api_errors and len(failed_pages) == len(indices):
+        raise RuntimeError(
+            f"figure detection failed on all {len(indices)} page(s) — aborting this "
+            f"document rather than converting with no figures. Last error: {api_errors[-1]}")
 
     if failed_pages:
         failed_pages.sort()          # drain order non-deterministic under workers>1

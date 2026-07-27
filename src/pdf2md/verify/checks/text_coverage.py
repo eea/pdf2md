@@ -19,7 +19,20 @@ from ..textutil import normalize, pdf_lines, qmd_to_plain, shingles, split_sente
 _MIN_TOKENS = 5
 # a sentence is "covered" if this fraction of its shingles appear in the .qmd
 _SHINGLE_HIT = 0.5
+# a sentence whose words nearly all appear SOMEWHERE in the .qmd (but not in order or
+# locally) is present-but-restructured — reported separately, not a real gap.
+_REWORD_HIT = 0.9
 _MAX_LISTED = 40
+
+
+def _ld_split(toks: list) -> list:
+    """Split letter↔digit runs ("zone1" → "zone","1"). Local to this check — the shared
+    normalize() must stay as-is (table_coverage's weighting depends on it)."""
+    out = []
+    for t in toks:
+        parts = re.findall(r"[a-z]+|[0-9]+", t)
+        out.extend(parts if parts else [t])
+    return out
 
 # short sentences (<= this many tokens) are too small for reliable 4-gram shingle
 # overlap — one missing/extra token tanks the ratio. For them, use anchored-window
@@ -76,6 +89,164 @@ def _short_line_covered(toks, qmd_tokens, positions) -> bool:
     return False
 
 
+_PFX_RECOVERY_RE = re.compile(
+    r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*', re.DOTALL)
+
+
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[•·▪◦‣∙*+-]|o)\s+(?=\S)", re.IGNORECASE)
+_SECTION_NO_RE = re.compile(r"^\s*\d+(?:\.\d+)+\.?\s+(?=\D)")
+
+# table-of-contents entries ("2.1 Scope ......... 12") are never transcribed —
+# Quarto regenerates the TOC — so they must not count as missing text
+_TOC_LEADER_RE = re.compile(r"\.{4,}\s*\d+\s*$")
+# a heading-like line: section-numbered, or a shouty all-caps run — kept as its
+# own unit, never glued to the paragraph that follows
+_HEADING_LIKE_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?\s+\S|[A-Z0-9][A-Z0-9 :\-]{6,}$)")
+
+
+def _join_wrapped(lines: list) -> str:
+    """Join PDF line-wrap continuations into flowing sentences.
+
+    A PDF line that doesn't end a clause continues on the next line; splitting
+    at every line break turned each wrap into its own "sentence" fragment, and
+    fragment shingles misreport reworded prose as missing. Heading-like lines
+    stay on their own — gluing "4.2.2 Results" onto the next paragraph would
+    break its match against the .qmd (which strips section numbers)."""
+    out, buf = [], ""
+    for s in lines:
+        s = s.strip()
+        if not s:
+            continue
+        if _HEADING_LIKE_RE.match(s):
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(s)
+            continue
+        buf = f"{buf} {s}".strip()
+        if re.search(r"[.!?;:]\s*$", s):
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return "\n".join(out)
+
+
+_CLUSTER_GAP = 2      # pages this close belong to the same cluster
+_CLUSTER_MIN = 3      # smaller groups stay in the scattered remainder
+
+
+def _cluster_by_page(located, qmd_text, lines):
+    """Group (page, sentence) misses into page-range clusters for the report.
+
+    Each cluster carries up to two sample sentences and, where it can be worked
+    out, the .qmd heading the content belongs under: we look for a surviving
+    source line from the same pages inside the .qmd and take the heading above
+    it. When nothing nearby survived the heading stays None and the report
+    falls back to the page reference alone.
+    """
+    paged = sorted((p, m) for p, m in located if p is not None)
+    clusters, cur = [], None
+    for p, m in paged:
+        if cur and p - cur["pages"][1] <= _CLUSTER_GAP:
+            cur["pages"][1] = p
+            cur["items"].append(m)
+        else:
+            cur = {"pages": [p, p], "items": [m]}
+            clusters.append(cur)
+    out = []
+    hay = qmd_text.lower()
+    for c in clusters:
+        if len(c["items"]) < _CLUSTER_MIN:
+            continue
+        heading = None
+        page_texts = [t for pg, t in lines if c["pages"][0] <= pg + 1 <= c["pages"][1]]
+        for t in page_texts:
+            probe = " ".join(t.split())[:60].lower()
+            if len(probe) < 40:
+                continue
+            i = hay.find(probe)
+            if i != -1 and hay.find(probe, i + 1) == -1:
+                heads = re.findall(r"^#{1,6}\s+(.+?)\s*$", qmd_text[:i], re.MULTILINE)
+                if heads:
+                    heading = heads[-1].strip()
+                break
+        out.append({"pages": tuple(c["pages"]), "count": len(c["items"]),
+                    "samples": [m[:150] for m in c["items"][:2]], "qmd_heading": heading})
+    out.sort(key=lambda c: -c["count"])
+    scattered = len(paged) - sum(c["count"] for c in out)
+    return {"clusters": out, "scattered": max(scattered, 0)}
+
+
+def _strip_structural_markers(line: str) -> str:
+    """Drop leading list bullets and source section numbers before comparing.
+
+    Neither is content. The PDF renders list bullets as a literal 'o' (a Word-export
+    artifact) while the converter emits a markdown bullet, and source numbering like
+    '3.3.2.2.2' is dropped because Quarto numbers headings itself. Compared as words,
+    both make identical content read as missing.
+
+    The section-number pattern requires at least one dot, so a line opening with a bare
+    year ('2018 Land cover…') keeps its number.
+    """
+    return _SECTION_NO_RE.sub("", _LIST_MARKER_RE.sub("", line, count=1), count=1)
+
+
+def _table_regions(pdf_path) -> dict:
+    """page -> [table bbox, …] via PyMuPDF find_tables.
+
+    Table cells are measured by table_coverage, which tolerates the converter
+    re-segmenting a row into cells. Scoring them again as prose double-counts them
+    and punishes that legitimate re-segmentation: a row like "484 small/ 471 medium/
+    482 large" split across cells fails the local-window check and reads as missing
+    even though every value is present. So prose scoring skips table regions.
+    """
+    regions = defaultdict(list)
+    try:
+        import fitz
+    except ImportError:
+        return regions
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:                       # noqa: BLE001 — exclusion is best-effort
+        return regions
+    try:
+        for pno in range(doc.page_count):
+            try:
+                for t in doc[pno].find_tables().tables:
+                    regions[pno].append(tuple(t.bbox))
+            except Exception:               # noqa: BLE001 — one bad page must not abort
+                continue
+    finally:
+        doc.close()
+    return regions
+
+
+def _index(qmd_text: str):
+    """Tokenise a .qmd into the lookup structures the classifier needs."""
+    toks = _ld_split(tokens(qmd_to_plain(qmd_text)))
+    pos = defaultdict(list)
+    for i, t in enumerate(toks):
+        pos[t].append(i)
+    return toks, shingles(toks), set(toks), pos
+
+
+def _classify(stoks, idx) -> str:
+    """One source sentence vs an indexed .qmd → covered | reworded | missing | skip."""
+    qtoks, qsh, qset, qpos = idx
+    if len(stoks) <= _SHORT_MAX_TOKENS:
+        return "covered" if _short_line_covered(stoks, qtoks, qpos) else "missing"
+    sh = shingles(stoks)
+    if not sh:
+        return "skip"
+    if len(sh & qsh) / len(sh) >= _SHINGLE_HIT or _short_line_covered(stoks, qtoks, qpos):
+        return "covered"
+    uniq = set(stoks)
+    if uniq and len(uniq & qset) / len(uniq) >= _REWORD_HIT:
+        return "reworded"
+    return "missing"
+
+
 @register
 class TextCoverageCheck:
     name = "text_coverage"
@@ -91,19 +262,23 @@ class TextCoverageCheck:
         for f in ctx.figures:
             exclude[f["page"]].append(tuple(f["bbox"]))
 
+        # table cells — scored by table_coverage, not double-counted here
+        for pno, boxes in _table_regions(ctx.reference_pdf).items():
+            exclude[pno].extend(boxes)
+
         # running header/footer chrome via the shared region detector
         is_cover = (ctx.detections or {}).get("cover", {}).get("is_cover", False)
         skip_pages = {0} if is_cover else set()
         try:
             from ...marginchrome import detect_running_chrome
-            chrome_regions = detect_running_chrome(ctx.original_pdf,
+            chrome_regions = detect_running_chrome(ctx.reference_pdf,
                                                    skip_pages=skip_pages)
             for pno, region_list in chrome_regions.items():
                 exclude[pno].extend(region_list)
         except Exception:
             chrome_regions = {}
 
-        lines = pdf_lines(ctx.original_pdf, exclude_boxes_by_page=dict(exclude))
+        lines = pdf_lines(ctx.reference_pdf, exclude_boxes_by_page=dict(exclude))
         # the cover page isn't transcribed into the body (the Typst template rebuilds
         # the title page from frontmatter), so its text would falsely read as missing
         if is_cover:
@@ -119,52 +294,82 @@ class TextCoverageCheck:
                 or any(p.match(norm_line) for p in _IGNORE_PATTERNS)
             )
 
-        source_text = "\n".join(
-            txt for _, txt in lines if not _ignored(normalize(txt))
-        )
+        source_text = _join_wrapped([
+            _strip_structural_markers(txt) for _, txt in lines
+            if not _ignored(normalize(txt)) and not _TOC_LEADER_RE.search(txt)
+        ])
         sentences = [s for s in split_sentences(source_text) if len(tokens(s)) >= _MIN_TOKENS]
 
-                # Strip postfix recovery section so it doesn't skew the metric
-        # (recovered content is supplementary, not a match for source text)
-        import re as _re
-        _pfx_pattern = _re.compile(
-            r'<!-- (?:repair|postfix): missing-text (?:recovery|rescue) -->.*',
-            _re.DOTALL
-        )
-        clean_qmd = _pfx_pattern.sub('', ctx.qmd_text)
-        qmd_tokens = tokens(qmd_to_plain(clean_qmd))
-        qmd_shingles = shingles(qmd_tokens)
-        # token -> sorted positions in the .qmd token stream, for the short-line path
-        positions = defaultdict(list)
-        for i, t in enumerate(qmd_tokens):
-            positions[t].append(i)
+        # STRICT (in-place) coverage: exclude the postfix recovery appendix — recovered
+        # content is supplementary, out of document flow, not a faithful in-place match.
+        clean_qmd = _PFX_RECOVERY_RE.sub('', ctx.qmd_text)
+        strict_idx = _index(clean_qmd)
 
-        missing = []
+        # Three outcomes per source sentence: covered | reworded | missing.
+        missing, reworded = [], []
         for s in sentences:
-            stoks = tokens(s)
-            if len(stoks) <= _SHORT_MAX_TOKENS:
-                # short line: 4-gram shingles are too brittle — use windowed containment
-                if not _short_line_covered(stoks, qmd_tokens, positions):
-                    missing.append(s)
-                continue
-            sh = shingles(stoks)
-            if not sh:
-                continue
-            hit = len(sh & qmd_shingles) / len(sh)
-            if hit < _SHINGLE_HIT:
+            cat = _classify(_ld_split(tokens(s)), strict_idx)
+            if cat == "missing":
                 missing.append(s)
+            elif cat == "reworded":
+                reworded.append(s)
 
         total = len(sentences)
-        covered = total - len(missing)
-        coverage = round(100 * covered / total, 1) if total else 100.0
+        present = total - len(missing)     # covered + reworded both count as present
+        coverage = round(100 * present / total, 1) if total else 100.0
 
-        findings = [Finding(f"missing: {m[:120]}", "warn") for m in missing[:_MAX_LISTED]]
+        # EFFECTIVE coverage: does the recovery appendix (excluded above) cover any of the
+        # strict gaps? Re-test only the missing sentences against the FULL .qmd. When there
+        # is no recovery block, effective == strict (recovered_gaps stays 0).
+        recovered_gaps = 0
+        if missing and clean_qmd != ctx.qmd_text:
+            full_idx = _index(ctx.qmd_text)
+            recovered_gaps = sum(1 for m in missing
+                                 if _classify(_ld_split(tokens(m)), full_idx) == "covered")
+        effective = round(100 * (present + recovered_gaps) / total, 1) if total else 100.0
+
+        # map each flagged sentence back to a source page so the reader can find it
+        norm_lines = [(pg, normalize(txt)) for pg, txt in lines]
+
+        def _page_of(sent):
+            key = normalize(sent)[:40]
+            if not key:
+                return None
+            for pg, nl in norm_lines:
+                if key in nl or (len(nl) >= 15 and nl in normalize(sent)):
+                    return f"~page {pg + 1}"
+            return None
+
+        # cluster the missing sentences by source page, so the report can say
+        # "pages 87-90 (~18 sentences)" instead of listing forty fragments
+        located = []
+        for m in missing:
+            loc = _page_of(m)
+            located.append((int(loc.rsplit(" ", 1)[1]) if loc else None, m))
+        clusters = _cluster_by_page(located, ctx.qmd_text, lines)
+
+        findings = [Finding(f"missing: {m[:120]}", "warn", _page_of(m))
+                    for m in missing[:_MAX_LISTED]]
         if len(missing) > _MAX_LISTED:
-            findings.append(Finding(f"… and {len(missing) - _MAX_LISTED} more", "info"))
+            findings.append(Finding(f"… and {len(missing) - _MAX_LISTED} more missing", "info"))
+        for m in reworded[:_MAX_LISTED]:
+            findings.append(Finding(f"reworded (present, not verbatim): {m[:110]}",
+                                    "info", _page_of(m)))
+        if len(reworded) > _MAX_LISTED:
+            findings.append(Finding(f"… and {len(reworded) - _MAX_LISTED} more reworded", "info"))
 
         status = "ok" if not missing else "warn"
+        reworded_note = f", {len(reworded)} reworded" if reworded else ""
+        eff_note = (f"; {effective}% incl. {recovered_gaps} recovered"
+                    if recovered_gaps else "")
         return CheckResult(
             self.name, status,
-            f"text coverage {coverage}% ({covered}/{total} sentences; {len(missing)} missing)",
+            f"text coverage {coverage}% in-place ({present}/{total} present; "
+            f"{len(missing)} missing{reworded_note}){eff_note}",
+            problem=(f"{len(missing)} sentence{'s' if len(missing) != 1 else ''} missing"
+                     if missing else None),
             metric=coverage, findings=findings,
+            detail={"effective": effective, "recovered": recovered_gaps,
+                    "missing_count": len(missing), "reworded_count": len(reworded),
+                    "total": total, "present": present, **clusters},
         )

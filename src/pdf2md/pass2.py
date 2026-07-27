@@ -14,6 +14,7 @@ from pathlib import Path
 from .llm_client import call_openrouter
 from .prompt import build_user_prompt, inject_template_frontmatter, parse_prompt_file
 from .resolve import (
+    adopt_unstamped_figures,
     close_unbalanced_fences,
     drop_empty_table_rows,
     fix_invalid_entities,
@@ -32,7 +33,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONVERT_PROMPT = (
     Path(__file__).resolve().parent / "prompt_templates" / "convert_prompt_qmd.md"
 )
-DEFAULT_CATEGORY = "uncategorized"
+DEFAULT_CATEGORY = None  # verbatim 1:1 — no category field
 
 
 def convert_placeholdered(
@@ -69,15 +70,25 @@ def convert_placeholdered(
         system_instruction, user_template = parse_prompt_file(prompt_file)
     user_prompt = build_user_prompt(user_template, placeholders_pdf.name)
 
-    # Inject template frontmatter if provided
-    if template_path is not None:
-        log.info("[Pass 2] Injecting template from %s", template_path)
+    # --template only applies to Quarto output (frontmatter is a .qmd concept, and
+    # only qmd is wired for render/verify). Ignore it for md/gfm, but say so.
+    use_template = template_path is not None and format == "qmd"
+    if template_path is not None and format != "qmd":
+        log.warning("--template is ignored for --format %s (Quarto .qmd only)", format)
+    if use_template:
         system_instruction = inject_template_frontmatter(system_instruction, template_path)
         log.info("[Pass 2] Template injected — prompt is %d chars", len(system_instruction))
 
-    # working PDF is small (chrome stripped), so inline base64 is fine
+    # Placeholders PDF is small (figures/chrome stripped), so inline base64 fits any
+    # page count; the re-sent PDF prefix is billed at the implicit-cache rate.
     b64 = base64.b64encode(placeholders_pdf.read_bytes()).decode("ascii")
     file_data = "data:application/pdf;base64," + b64
+
+    try:
+        import fitz
+        total_pages = fitz.open(str(placeholders_pdf)).page_count
+    except Exception:                       # noqa: BLE001 — page count is a hint, not required
+        total_pages = 0
 
     log.info("[Pass 2] Converting %s → .qmd …", placeholders_pdf.name)
     raw, usage = call_openrouter(
@@ -90,6 +101,7 @@ def convert_placeholdered(
         filename=placeholders_pdf.name,
         timeout=timeout,
         max_tokens=max_tokens,
+        total_pages=total_pages,
         return_usage=True,
         stream=on_delta is not None,
         on_delta=on_delta,
@@ -100,7 +112,16 @@ def convert_placeholdered(
     if fence_closed:
         log.warning("[Pass 2] Converter left a fenced block unterminated — appended a closing ``` "
                     "(an unclosed ```{=html} table renders as plain text)")
+    # the model references images detection never stamped (e.g. colour swatches
+    # in tables) by inventing FIG numbers past the detected range — crop and
+    # adopt those before resolution so they place like any detected figure
+    run_dir = out_qmd.parent
+    stem = placeholders_pdf.name[: -len(".placeholders.pdf")]
+    crop_src = next((p for p in (run_dir / f"{stem}.working.pdf",
+                                 run_dir / f"{stem}.source.pdf") if p.exists()), None)
+    adopted = adopt_unstamped_figures(text, figures, crop_src, run_dir / media_dirname)
     text, fig_report = resolve_fig_tokens(text, figures, out_qmd, media_dirname)
+    fig_report["adopted"] = adopted
     text, n_folded = fold_figure_captions(text)
     if n_folded:
         log.info("[Pass 2] Folded %d stray 'Figure N:' caption line(s) back into the "
@@ -126,7 +147,9 @@ def convert_placeholdered(
     if n_hr:
         log.info("[Pass 2] Converted %d body '---' rule(s) to '***' "
                  "(a body '---…---' block is misread by Quarto as a YAML metadata block)", n_hr)
-    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields, keep_template_fields=template_path)
+    # pass the real path (gated to qmd) so the template-merge post-process can read it
+    text = normalize_frontmatter(text, category, default_date, cover_fields=cover_fields,
+                                 keep_template_fields=template_path if use_template else None)
 
     out_qmd.parent.mkdir(parents=True, exist_ok=True)
     # atomic write: resume keys off the .qmd's existence, so a Ctrl-C mid-write must

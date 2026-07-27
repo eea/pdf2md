@@ -35,10 +35,17 @@ def _parse_verify_report(path: Path) -> dict:
         return out
     text = path.read_text(encoding="utf-8")
     import re
+    # current format: one machine-readable comment near the top
+    mc = re.search(r"<!-- verify: overall=(\w+)((?:\s+[\w_]+=[-\d.]+)*)\s*-->", text)
+    if mc:
+        out["status"] = mc.group(1)
+        for name, val in re.findall(r"([\w_]+)=([-\d.]+)", mc.group(2)):
+            out["metrics"][name] = float(val)
+        return out
+    # older reports: parse the section headers
     m = re.search(r"\*\*Overall:\s*(\w+)\*\*", text)
     if m:
         out["status"] = m.group(1).lower()
-    # "## <icon> <name> — <status>" with a "_metric: <float>_" somewhere in the block
     for hm in re.finditer(r"^##\s+\S+\s+(\w+)\s+—.*?(?=^##|\Z)", text, re.S | re.M):
         block = hm.group(0)
         name = hm.group(1)
@@ -55,7 +62,11 @@ def _load_result(out_dir: Path, stem: str) -> FileResult:
         for k in ("pdf", "out_dir", "qmd", "pdf_out", "verify_report"):
             if rj.get(k):
                 rj[k] = Path(rj[k])
-        return FileResult(**rj)
+        # drop fields a newer/older pdf2md wrote that this FileResult no longer has
+        # (e.g. the removed "review" summary), so old snapshots stay replayable
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(FileResult)}
+        return FileResult(**{k: v for k, v in rj.items() if k in known})
 
     # no result.json: derive from detections.json + verify_report.md
     det = _read_json(out_dir / "detections.json") or {}

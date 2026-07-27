@@ -8,3 +8,10 @@ dist/
 *.fixed
 *_backup.py
 build/
+
+# local test corpus & model-comparison outputs (not part of the product)
+eea-in/
+model_compare/
+verify.json
+/*.pdf
+sonnet_clc-backbone.*

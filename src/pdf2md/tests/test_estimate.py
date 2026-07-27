@@ -53,6 +53,39 @@ class TestCalibration:
         calib = estimate.load_calibration(tmp_path)
         assert calib["n_calibration_docs"] == 0
 
+    def test_calibrates_from_result_json_alone(self, tmp_path):
+        # phase1.json is deleted by cleanup; calibration must still work from the
+        # `est` block that survives inside result.json
+        d = tmp_path / "doc"
+        d.mkdir()
+        (d / "result.json").write_text(json.dumps({
+            "est": {"pages": 10, "candidate_pages": 4},
+            "phase_cost": {"detect": 0.40, "convert": 1.00},
+        }))
+        calib = estimate.load_calibration(tmp_path)
+        assert calib["n_calibration_docs"] == 1
+        assert abs(calib["detect_usd_per_candidate"] - 0.10) < 1e-9
+        assert abs(calib["convert_usd_per_page"] - 0.10) < 1e-9
+
+    def test_skips_zero_spend_runs(self, tmp_path):
+        # a failed/skipped doc (0 cost) must not drag the per-unit average to zero
+        good = tmp_path / "good"; good.mkdir()
+        (good / "result.json").write_text(json.dumps({
+            "est": {"pages": 10, "candidate_pages": 4},
+            "phase_cost": {"detect": 0.40, "convert": 1.00}}))
+        failed = tmp_path / "failed"; failed.mkdir()
+        (failed / "result.json").write_text(json.dumps({
+            "est": {"pages": 20, "candidate_pages": 8},
+            "phase_cost": {"detect": 0.0, "convert": 0.0}}))
+        calib = estimate.load_calibration(tmp_path)
+        assert calib["n_calibration_docs"] == 1                       # only the good one
+        assert abs(calib["convert_usd_per_page"] - 0.10) < 1e-9
+
+    def test_seeds_are_realistic_for_current_model(self):
+        # guardrail: the old seeds were ~15-25x too high; keep them near real costs
+        assert estimate.SEED_DETECT_USD_PER_CANDIDATE < 0.005
+        assert estimate.SEED_CONVERT_USD_PER_PAGE < 0.005
+
 
 class TestEstimateFile:
     def test_structure_and_band(self, tmp_path):

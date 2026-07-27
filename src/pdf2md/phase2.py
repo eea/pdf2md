@@ -65,6 +65,11 @@ def run_phase2(
     )
 
     fig = result["figures"]
+    # adoption grew the figure list mid-conversion — persist it so the sidecar
+    # stays the single source of truth for verify/rescue/replay
+    if fig.get("adopted"):
+        sidecar["figures"] = figures
+        detections_path.write_text(json.dumps(sidecar, indent=1), encoding="utf-8")
     summary = {
         "qmd": out_qmd,
         "figures_total": len(figures),

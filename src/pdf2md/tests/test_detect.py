@@ -49,6 +49,22 @@ def _run(pdf, workers, **kw):
     return detect.detect_figures(pdf, api_key="k", model="m", workers=workers, **kw)
 
 
+class TestAllPagesFailing:
+    def test_all_api_failures_raise(self, tmp_path, monkeypatch):
+        # every page 402s (credits/auth): "0 figures" must not be the outcome
+        import pytest
+        pdf = _make_pdf(tmp_path / "d.pdf", 3)
+        _patch(monkeypatch, fail_pages={0, 1, 2})
+        with pytest.raises(RuntimeError, match="all 3 page"):
+            _run(pdf, 1)
+
+    def test_partial_failure_still_returns(self, tmp_path, monkeypatch):
+        pdf = _make_pdf(tmp_path / "d.pdf", 3)
+        _patch(monkeypatch, fail_pages={1})
+        regions, _ = _run(pdf, 1)
+        assert [r.page for r in regions] == [0, 2]
+
+
 class TestDetectWorkers:
     def test_sequential_baseline(self, tmp_path, monkeypatch):
         pdf = _make_pdf(tmp_path / "d.pdf", 5)
