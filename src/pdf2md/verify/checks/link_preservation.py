@@ -21,6 +21,13 @@ _MAX_LISTED = 30
 # collapsing one slash). Postfix collapses these in the .qmd, so normalise the annotation
 # URI the same way before matching — else a repaired body still reads as "missing".
 _DOUBLED_DOI_RE = re.compile(r"(https?://doi\.org/)(?:https?:/{1,2}doi\.org/)+", re.I)
+# Diagram-EDITOR links (draw.io / diagrams.net) embedded behind a figure image — the URL
+# opens the figure's editable source, it is NOT a citation and has no visible anchor text.
+# We intentionally don't embed them, so they must not count as "missing" source links.
+_EDITOR_LINK_RE = re.compile(r"\b(?:app\.|www\.|viewer\.)?(?:diagrams\.net|draw\.io)\b", re.I)
+# The DOI at the core of a URL, immune to host (proxy mirrors like
+# doi-org.insu.bib.cnrs.fr/10.x) and prefix differences.
+_DOI_CORE_RE = re.compile(r"10\.\d{4,}/\S+")
 
 
 @lru_cache(maxsize=8)
@@ -32,7 +39,8 @@ def _source_uris(pdf_str: str, mtime: float) -> tuple:
         for pno in range(doc.page_count):
             for link in doc[pno].get_links():
                 uri = (link.get("uri") or "").strip()
-                if uri and uri.lower().startswith(_URI_SCHEMES) and uri not in seen:
+                if (uri and uri.lower().startswith(_URI_SCHEMES) and uri not in seen
+                        and not _EDITOR_LINK_RE.search(uri)):
                     seen.append(uri)
     finally:
         doc.close()
@@ -54,7 +62,12 @@ def _uri_in_qmd(uri: str, qmd_lower: str) -> bool:
         return True
     # tolerate the .qmd dropping the scheme (e.g. "www.foo.org" or "foo.org/x")
     stripped = re.sub(r"^\w+://", "", u)
-    return bool(stripped) and stripped in qmd_lower
+    if stripped and stripped in qmd_lower:
+        return True
+    # DOI fallback: match on the bare DOI core so a proxy-host mirror
+    # (doi-org.insu.bib.cnrs.fr/10.x) or a different prefix still counts as present
+    doi = _DOI_CORE_RE.search(u)
+    return bool(doi) and doi.group(0) in qmd_lower
 
 
 @register

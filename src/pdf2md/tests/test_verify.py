@@ -641,3 +641,17 @@ def test_is_cover_or_toc_catches_midsentence_and_plaindigit_affiliations():
         "The project officer roles are defined in section 2, and the model runs daily.") is False
     assert _is_cover_or_toc(
         "We fit a spline to the PPI time series to reduce noise across seasons.") is False
+
+
+def test_link_preservation_skips_editor_links_and_matches_doi_core():
+    from pdf2md.verify.checks.link_preservation import _EDITOR_LINK_RE, _uri_in_qmd
+    # #1 draw.io / diagrams.net editor links are excluded (figure-editor, not citations)
+    assert _EDITOR_LINK_RE.search("https://app.diagrams.net/?page-id=x#Gabc")
+    assert _EDITOR_LINK_RE.search("https://www.draw.io/?page-id=x#Gabc")
+    assert not _EDITOR_LINK_RE.search("https://land.copernicus.eu/products/x")
+    # #2 proxy-host DOI matches on the bare core present in the body
+    ann = "https://doi-org.insu.bib.cnrs.fr/10.1016/0034-4257(89)90101-6"
+    body = "see https://doi.org/10.1016/0034-4257(89)90101-6 for details".lower()
+    assert _uri_in_qmd(ann, body) is True
+    # a genuinely-absent URL still reports missing
+    assert _uri_in_qmd("https://example.org/gone", body) is False
