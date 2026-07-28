@@ -49,7 +49,9 @@ image reference EXACTLY in this form, on its own line:
 DOCUMENT BODY:
 
 - Transcribe EVERY line of body text — do not omit any sentence, list item, or
-  note. When in doubt, include it.
+  note. When in doubt, include it. This includes the LAST row of a table, even
+  when its cells are long or it sits alone at a page boundary — never truncate a
+  table early.
 - Produce clean Quarto/GitHub-flavored Markdown.
 - Headings: use #, ##, ### following the document's heading hierarchy. Include
   EVERY heading of the document — especially top-level chapter headings, which
@@ -94,12 +96,33 @@ If the document contains a printed TABLE OF CONTENTS (a page listing section tit
 with page numbers), do NOT transcribe it either — the rendering template builds its
 own TOC automatically from the headings you produce. Transcribing the printed TOC
 would produce a duplicate and garbled page-number references.
+Skip ONLY the contents listing itself — the lines that pair a section title with a
+page number. If any OTHER content shares that page — a table (or a row of one
+continued from the previous page), a heading, or a paragraph — you MUST still
+transcribe it. Never discard a whole page just because it also holds the TOC.
 
-Everything else — including the document-history table, introduction, and all body
-sections — is normal content and MUST be transcribed.
+Everything else — including the document-history / revision table, approval and
+distribution tables, introduction, and all body sections — is normal content and
+MUST be transcribed. Only the cover page and the printed TOC listing are dropped.
 
 TABLES (read carefully — classify each table first):
 Tables are TEXT, never figures. Never reference a table as FIG_n.
+
+CONTINUED AND ADJACENT TABLES (applies to BOTH pipe and HTML tables — decide this
+FIRST, before transcribing):
+- A table can continue onto the next page. You recognise a continuation because it
+  RESUMES the same columns with NO header row of its own (the header appeared on the
+  previous page). Treat it as ONE table: emit the header and its separator line
+  ONCE, then append the continuation rows. NEVER repeat the header row, and NEVER
+  emit a second separator (|---|) partway down — a separator in the middle of a
+  table breaks the rendering and splits it in two.
+- Two tables that sit next to each other are SEPARATE when the second has its OWN
+  header row OR a DIFFERENT number of columns. Put a blank line between them and
+  give each its own header + separator; never let one table's rows flow into the
+  next. (Document-control / front-matter pages often stack several small tables of
+  different widths back-to-back — keep each as its own table.)
+- Decide merge-vs-separate by HEADER PRESENCE and COLUMN COUNT, not by whether the
+  values happen to look similar.
 
 Decide whether the table is SIMPLE or COMPLEX before transcribing it.
 
