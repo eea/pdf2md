@@ -74,22 +74,32 @@ def _is_prose_callout(rows: list) -> bool:
     return populated_cols <= 1 and median_words >= 12
 
 
-def _is_change_log(rows: list) -> bool:
-    """The document change / revision-history table. It's front matter (absent from the
-    bookmark outline), dropped from the output on purpose, so it must not count as a
-    missing source table. Signature: a header row pairing an issue/version/revision
-    column with a date/pages/change column."""
-    if not rows:
+_EQ_LABEL_RE = re.compile(r"\(\s*eq(?:uation)?\.?\s*\d+\s*\)", re.I)
+
+
+def _is_formula(rows: list) -> bool:
+    """A find_tables region that is really a numbered equation, not a data table. The
+    converter renders these as $$…$$ math (scored by the equations check), so counting
+    them as tables understates coverage (measured: 4 spectral-index formulas on the ice
+    ATBD scored 26–51% while the equations were 100% present). Signature: a cell is an
+    equation label '(Eq. N)', or the region is a single line dominated by math — an '='
+    plus several fraction/relational operators — rather than tabular values."""
+    text = " ".join((c or "") for row in rows for c in row).strip()
+    if not text:
         return False
-    header = " ".join(normalize(c) for c in rows[0] if c)
-    return bool(re.search(r"\b(issue|revision|version)\b", header)
-                and re.search(r"\b(date|pages?|change|amend)\b", header))
+    if _EQ_LABEL_RE.search(text):
+        return True
+    populated_rows = sum(1 for row in rows if any((c or "").strip() for c in row))
+    if populated_rows <= 1 and "=" in text:
+        ops = sum(text.count(ch) for ch in "=/+()")
+        return ops >= 4          # operator-dense; a 2-value data row is not
+    return False
 
 
 def _is_layout_artifact(page, rows: list) -> bool:
     """True when a find_tables region is not a data table we score against.
 
-    Three disjoint cases, all content we intentionally don't render as a table:
+    Four disjoint cases, none a data table we score against:
 
     1. Page-layout false-positive — a sidebar or multi-column page layout that
        find_tables misreads as a 2-col "table" spanning the whole page (measured: a
@@ -101,8 +111,12 @@ def _is_layout_artifact(page, rows: list) -> bool:
        7-28).
     2. A printed Table of Contents (see _is_toc) — dropped from the output on purpose.
     3. A prose callout box (see _is_prose_callout) — body text, not a table.
+    4. A numbered equation (see _is_formula) — rendered as $$…$$ math, not a table.
+
+    NOTE: revision/change-log tables are NOT excluded — they are kept in the output and
+    counted like any other table (policy: convert as much as possible).
     """
-    if _is_toc(rows) or _is_prose_callout(rows) or _is_change_log(rows):
+    if _is_toc(rows) or _is_prose_callout(rows) or _is_formula(rows):
         return True
     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
     if not cells:

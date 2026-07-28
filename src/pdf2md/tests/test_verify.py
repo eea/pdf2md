@@ -581,15 +581,17 @@ class TestProseCallout:
         rows = [["Band", "Res"], ["PPI", "500m"], ["QA", "500m"]]
         assert _is_prose_callout(rows) is False
 
-    def test_change_log_excluded(self):
-        from pdf2md.verify.checks.table_coverage import _is_change_log
-        rows = [["Issue", "Issue date", "Pages affected", "Description"],
-                ["1.0", "2025-01-10", "all", "First issue"],
-                ["1.1", "2025-03-02", "12, 15", "Minor edits"]]
-        assert _is_change_log(rows) is True
-        # a real data table with an "issue" value but no date/pages pairing is kept
-        rows2 = [["Band", "Resolution"], ["PPI", "500m"], ["QA", "500m"]]
-        assert _is_change_log(rows2) is False
+    def test_formula_region_excluded(self):
+        from pdf2md.verify.checks.table_coverage import _is_formula
+        # a numbered equation find_tables misreads as a 1-row 2-col "table"
+        assert _is_formula([["NDSI= (P_green - P_SWIR1)/(P_green + P_SWIR1).", "(Eq. 2)"]]) is True
+        # operator-dense single line without a label still recognised
+        assert _is_formula([["BSI = ((a+b)-(c+d))/((a+b)+(c+d))"]]) is True
+        # a real 2-column data table is NOT a formula
+        assert _is_formula([["Band", "Resolution"], ["PPI", "500m"], ["QA", "500m"]]) is False
+        # a revision/change-log table is NOT excluded anymore (kept + counted)
+        assert _is_formula([["Ed.", "Rev.", "Date", "Purpose"],
+                            ["1", "0", "28/01/2020", "Creation"]]) is False
 
 
 class TestHeadingOccurrenceMatch:
