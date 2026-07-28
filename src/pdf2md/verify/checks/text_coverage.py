@@ -57,13 +57,24 @@ _COVER_ANCHOR_RE = re.compile(
     r"document version|document date)\b", re.I)
 _COVER_PHRASE_RE = re.compile(
     r"\ball rights reserved\b|\bno parts? of this document\b", re.I)
+# a labelled cover field ("… Project Officer: …", "… Disclaimer:") anywhere in the
+# sentence — cover blocks often reach the sentence splitter run together, so the marker
+# is mid-string, not at the start. The colon keeps this to genuine labels, not prose.
+_COVER_LABEL_RE = re.compile(
+    r"\b(project officer|disclaimer|document version|document date|"
+    r"lead service providers?)\s*:", re.I)
 _AFFILIATION_RE = re.compile(r"[A-Za-z]\s*[¹²³⁰-⁹]")  # "Jin¹"
+# author-affiliation footnote list, plain-digit form: "1) ULUND, 2) VITO"
+_AFFIL_LIST_RE = re.compile(r"\d\)\s*[A-Z][A-Za-z]")
 
 
 def _is_cover_or_toc(sentence: str) -> bool:
     if _COVER_ANCHOR_RE.match(sentence) or _COVER_PHRASE_RE.search(sentence):
         return True
-    if len(_AFFILIATION_RE.findall(sentence)) >= 2:      # an author-affiliation line
+    if _COVER_LABEL_RE.search(sentence):
+        return True
+    if (len(_AFFILIATION_RE.findall(sentence)) >= 2      # superscript affiliations
+            or len(_AFFIL_LIST_RE.findall(sentence)) >= 2):  # "1) Org, 2) Org"
         return True
     toks = sentence.split()
     if len(toks) >= 8:

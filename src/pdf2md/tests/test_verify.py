@@ -625,3 +625,19 @@ def test_uri_in_qmd_normalizes_doubled_doi():
     assert _uri_in_qmd(ann, body) is True
     # a genuinely-absent link still reports missing
     assert _uri_in_qmd("https://example.org/gone", body) is False
+
+
+def test_is_cover_or_toc_catches_midsentence_and_plaindigit_affiliations():
+    from pdf2md.verify.checks.text_coverage import _is_cover_or_toc
+    # actual MRVPP page-2 cover sentences that leaked into "missing text"
+    s1 = ("Copernicus Land Monitoring Service (CLMS) Project Officer: Luca Battistella "
+          "European Environment Agency (EEA) Kongens Nytorv 6 - 1050 Copenhagen K.")
+    s2 = ("Hongxiao Jin1, Zhanzhang Cai1, Lars Eklundh1, Else Swinnen2, Walter Horsten2, "
+          "Tim Ng2 1) ULUND, 2) VITO Disclaimer:")
+    assert _is_cover_or_toc(s1) is True      # mid-sentence "Project Officer:"
+    assert _is_cover_or_toc(s2) is True      # "1) ULUND, 2) VITO" + "Disclaimer:"
+    # body prose must NOT be filtered
+    assert _is_cover_or_toc(
+        "The project officer roles are defined in section 2, and the model runs daily.") is False
+    assert _is_cover_or_toc(
+        "We fit a spline to the PPI time series to reduce noise across seasons.") is False
