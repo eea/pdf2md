@@ -704,6 +704,26 @@ def test_strip_raw_math_lines():
     assert "Normal prose" in out                    # 1 stray math char -> kept
 
 
+def test_fix_midtable_separators():
+    from pdf2md.postfix import _fix_midtable_separators
+    # SAME width -> spurious continuation separator dropped, one table kept
+    cont = ("| RD | Reference document |\n| RLIE | River and Lake Ice Extent |\n"
+            "| :--- | :--- |\n| S1 | Sentinel-1 |\n")
+    out, n = _fix_midtable_separators(cont)
+    assert n == 1 and "| :--- | :--- |" not in out
+    assert "| RLIE | River and Lake Ice Extent |\n| S1 | Sentinel-1 |" in out
+    # DIFFERENT width -> new table's header glued on, split with a blank line
+    glued = ("| Approved by: | J D | MAG | 2022 | |\n| Document reference : | COSIMS |\n"
+             "| :--- | :--- |\n| Edition.Revision : | 2.6 |\n")
+    out2, n2 = _fix_midtable_separators(glued)
+    assert n2 == 1
+    assert "| Approved by: | J D | MAG | 2022 | |\n\n| Document reference : | COSIMS |" in out2
+    # a normal table (header+separator preceded by blank) is untouched
+    ok = "text\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+    out3, n3 = _fix_midtable_separators(ok)
+    assert n3 == 0 and out3 == ok
+
+
 def test_strip_heading_numbers():
     from pdf2md.postfix import _strip_heading_numbers
     qmd = ("## 1. Introduction\n\n### 1.4.1 Applicable documents\n\n"

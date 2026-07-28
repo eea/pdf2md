@@ -181,11 +181,16 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             'headings: marked {} front-matter heading(s) unnumbered'.format(n_unnum))
     # markdown safety: a pipe table glued to a heading/caption won't render as a table
     cleaned, n_tblblank = _ensure_pipe_table_blanks(cleaned)
-    if cleaned != qmd_text:
-        qmd_path.write_text(cleaned, encoding='utf-8')
     if n_tblblank:
         summary['postfixes_applied'].append(
             'tables: separated {} table(s) glued to a caption/heading'.format(n_tblblank))
+    # markdown safety: a |---| separator mid-table (glued/continued tables) breaks rendering
+    cleaned, n_midsep = _fix_midtable_separators(cleaned)
+    if n_midsep:
+        summary['postfixes_applied'].append(
+            'tables: repaired {} mid-table separator(s)'.format(n_midsep))
+    if cleaned != qmd_text:
+        qmd_path.write_text(cleaned, encoding='utf-8')
 
     # Re-verify
     if summary['postfixes_applied']:
@@ -529,6 +534,38 @@ def _ensure_pipe_table_blanks(text):
         if is_header and out and out[-1].strip() and not re.match(r'^\s*\|', out[-1]):
             out.append('')
             n += 1
+        out.append(ln)
+    return '\n'.join(out), n
+
+
+_PIPE_ROW_RE = re.compile(r'^\s*\|.*\|\s*$')
+_PIPE_SEP_RE = re.compile(r'^\s*\|[-: |]+\|\s*$')
+
+
+def _pipe_ncols(row):
+    return row.strip().count('|') - 1          # well-formed |a|b| row; escapes are rare
+
+
+def _fix_midtable_separators(text):
+    """Repair a separator line (|---|) that lands in the MIDDLE of a pipe table — invalid
+    Markdown that breaks the render. The converter produces these when it glues tables
+    together: a page-break continuation gets a repeated separator, or a different table is
+    run straight on. Decide by column count of the row just above the separator vs the row
+    above THAT: same width -> the separator is a spurious continuation marker, drop it and
+    keep one table; different width -> the row above the separator is a NEW table's header
+    glued on, insert a blank line to split them. Returns (new_text, n_fixed)."""
+    out, n = [], 0
+    for ln in text.split('\n'):
+        if (_PIPE_SEP_RE.match(ln) and len(out) >= 2
+                and _PIPE_ROW_RE.match(out[-1]) and not _PIPE_SEP_RE.match(out[-1])
+                and _PIPE_ROW_RE.match(out[-2])):
+            if _pipe_ncols(out[-1]) == _pipe_ncols(out[-2]):
+                n += 1
+                continue                       # drop the spurious continuation separator
+            header = out.pop()                 # a new table's header was glued on
+            out += ['', header, ln]            # split: blank line, then header + separator
+            n += 1
+            continue
         out.append(ln)
     return '\n'.join(out), n
 
