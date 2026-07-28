@@ -60,10 +60,10 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # annotation the model never sees, so this is the only way those links can survive.
     link_check = verify_by_name.get('link_preservation')
     if link_check and link_check.status in ('warn', 'fail'):
-        n_in, _ = _recover_links(qmd_path, out_dir)
-        if n_in:
+        n_fixed, _ = _recover_links(qmd_path, out_dir)
+        if n_fixed:
             summary['postfixes_applied'].append(
-                'links: {} restored inline'.format(n_in))
+                'links: {} repaired (inline / de-spaced / doubled-DOI)'.format(n_fixed))
 
     # Pass 1.9: heading restore (deterministic, no LLM)
     head_check = verify_by_name.get('heading_hierarchy')
@@ -752,6 +752,33 @@ def _grid_to_markdown(rows):
 
 _LINK_ANCHOR_MIN = 10        # shorter anchor text is too ambiguous to link safely
 
+# A doubled DOI prefix — the PDF's own authoring defect, e.g.
+# "https://doi.org/https://doi.org/10.x" (and fitz collapses one slash to
+# "https://doi.org/https:/doi.org/…"). A doubled scheme is never valid, so collapsing
+# repeated "…doi.org/https?:/…doi.org/" down to a single prefix is unambiguous.
+_DOUBLED_DOI_RE = re.compile(r'(https?://doi\.org/)(?:https?:/{1,2}doi\.org/)+', re.I)
+
+
+def _collapse_doubled_doi(text):
+    """Collapse doubled-DOI prefixes anywhere in `text`. Returns (new_text, n)."""
+    return _DOUBLED_DOI_RE.subn(r'\1', text)
+
+
+def _despace_url(clean_url, qmd):
+    """Locate `clean_url` in `qmd` tolerating up to 2 whitespace chars between each
+    character — this finds a copy broken by a line-wrap space (`…/2072-␣4292/…`) that a
+    contiguous search misses. If the found span actually contains whitespace, rewrite it
+    to the clean URL in place (a URL can't legally contain whitespace, so the match is
+    unambiguous). ≤2 per gap bounds the search so URL characters scattered across prose
+    can't false-match. Returns (new_qmd, fixed?)."""
+    if not clean_url:
+        return qmd, False
+    pat = r'\s{0,2}'.join(re.escape(c) for c in clean_url)
+    m = re.search(pat, qmd)
+    if m and m.group(0) != clean_url:          # found, and it was broken by whitespace
+        return qmd[:m.start()] + clean_url + qmd[m.end():], True
+    return qmd, False
+
 
 def _safe_to_inline(text, pos):
     """True when `pos` is in ordinary prose — not inside a code fence, an HTML table,
@@ -769,12 +796,22 @@ def _recover_links(qmd_path, out_dir):
     """Restore hyperlink targets the converter never saw.
 
     A PDF keeps the href in a link ANNOTATION, not in the page text, so the model cannot
-    reproduce it — measured across 6 documents: not one URL reached the .qmd that was not
-    already visible as text. We hold them exactly, so re-attach a target inline when its
-    anchor text occurs exactly once (provably unambiguous). Links we can't place that way
-    are left alone — verify's link_preservation still reports them — rather than dumped
-    into a synthetic 'Source links' section that isn't in the source. Returns
-    (n_inlined, n_not_inlinable).
+    reproduce it. We recover it from the annotation, normalizing BOTH sides (the PDF's
+    URL and the .qmd's copy) so malformed-but-present links are repaired in place rather
+    than reported lost:
+
+      • doubled DOIs ("https://doi.org/https://doi.org/10.x") — collapsed to a single
+        valid prefix, on the annotation URI and anywhere in the body.
+      • line-wrap-broken URLs ("…/2072-␣4292/…") — the annotation URI is the clean, whole
+        URL, so we locate its space-broken copy with a whitespace-tolerant match and
+        de-space it in place.
+      • a URL the text never carried (anchor is prose) — re-attached inline as
+        [anchor](uri) when the anchor occurs exactly once (provably unambiguous).
+
+    Fixing the OUTPUT means verify's contiguous match then passes on its own — no metric
+    special-casing. Links we still can't place are left for link_preservation to report,
+    not dumped into a synthetic 'Source links' section absent from the source. Returns
+    (n_repaired, n_not_placed).
     """
     try:
         import fitz
@@ -788,6 +825,8 @@ def _recover_links(qmd_path, out_dir):
     from .verify.checks.link_preservation import _uri_in_qmd
 
     qmd = qmd_path.read_text(encoding='utf-8')
+    # collapse doubled DOIs the converter transcribed from the source into the body
+    qmd, repaired = _collapse_doubled_doi(qmd)
     qmd_lower = qmd.lower()
 
     pairs, seen = [], set()
@@ -800,29 +839,25 @@ def _recover_links(qmd_path, out_dir):
                 if not uri or uri in seen:
                     continue
                 seen.add(uri)
-                # "present" uses the SAME contiguous match as the verify check — else a
-                # URL wrapped mid-string reads as present here (whitespace-stripped) yet
-                # missing to the check, so it's neither restored nor counted (measured:
-                # 2 reference DOIs on one ATBD were broken across lines and lost this way)
+                uri = _DOUBLED_DOI_RE.sub(r'\1', uri)   # normalize the PDF-side mangling
+                # "present" uses the SAME contiguous match as the verify check, so a
+                # repair here is a repair there too.
                 if _uri_in_qmd(uri, qmd_lower):
-                    continue            # already present (contiguously), nothing to restore
-                # DOI fallback: a malformed doubled DOI ("https://doi.org/https:/doi.org/
-                # 10.x/…" — the PDF's own defect, with fitz collapsing one slash) never
-                # matches contiguously against the reference's un-collapsed copy, so it
-                # gets re-listed as a phantom "source link". Match on the bare DOI core,
-                # which is immune to the prefix mangling and unique enough to prove presence.
-                doi = re.search(r'10\.\d{4,}/\S+', uri)
-                if doi and doi.group(0).lower().rstrip('.,;)') in qmd_lower:
+                    continue            # already present (contiguously), nothing to do
+                # line-wrap-broken copy in the body? de-space it in place using the clean
+                # URI as the search key (no boundary-guessing — the URI defines the span).
+                qmd, fixed = _despace_url(uri, qmd)
+                if fixed:
+                    qmd_lower = qmd.lower()
+                    repaired += 1
                     continue
                 anchor = ' '.join(page.get_textbox(l['from']).split())
                 anchor = anchor.strip(' .,;:)（(')   # keep punctuation outside the link
                 pairs.append((uri, anchor))
     finally:
         doc.close()
-    if not pairs:
-        return 0, 0
 
-    inlined, dropped = 0, 0
+    dropped = 0
     for uri, anchor in pairs:
         # inline only when the anchor is real prose occurring exactly once (provably
         # unambiguous). A truncated-URL anchor or an ambiguous one can't be placed.
@@ -832,14 +867,13 @@ def _recover_links(qmd_path, out_dir):
             pos = qmd.find(anchor)
             if _safe_to_inline(qmd, pos):
                 qmd = qmd[:pos] + '[{}]({})'.format(anchor, uri) + qmd[pos + len(anchor):]
-                inlined += 1
+                repaired += 1
                 continue
-        dropped += 1        # can't inline; we no longer append a synthetic "Source
-                            # links" section — verify still reports these as missing
-    if inlined:
+        dropped += 1        # can't place; verify's link_preservation still reports these
+    if repaired:
         qmd_path.write_text(qmd, encoding='utf-8')
-    log.info('postfix: restored %d link(s) inline, %d not inlinable', inlined, dropped)
-    return inlined, dropped
+    log.info('postfix: repaired %d link(s), %d not placed', repaired, dropped)
+    return repaired, dropped
 
 
 _TABLE_LLM_MIN_KEEP = 0.98   # LLM rendering is used only if it keeps ~all source values

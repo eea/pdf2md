@@ -402,9 +402,33 @@ def test_postfix_footnotes_converts_orphaned_intable_defs(tmp_path):
     assert "[^9]: A definition" in out              # mark-less orphan left alone
 
 
-def test_recover_links_skips_present_doi_despite_mangled_prefix(tmp_path):
-    """A malformed doubled DOI from the PDF (fitz collapses one slash) must not be
-    re-listed as a lost 'source link' when the reference already carries that DOI."""
+def test_collapse_doubled_doi():
+    from pdf2md.postfix import _collapse_doubled_doi
+    # double-slash (as the LLM transcribes it) and fitz's single-slash variant both collapse
+    for src in ("<https://doi.org/https://doi.org/10.1016/j.rse.2020.111685>",
+                "https://doi.org/https:/doi.org/10.1002/ecm.1337"):
+        out, n = _collapse_doubled_doi(src)
+        assert n == 1 and "doi.org/https" not in out
+        assert out.count("doi.org/") == 1
+    # a clean DOI is untouched
+    out, n = _collapse_doubled_doi("https://doi.org/10.3390/rs9121271")
+    assert n == 0
+
+
+def test_despace_url():
+    from pdf2md.postfix import _despace_url
+    qmd = "Ref. http://www.mdpi.com/2072- 4292/10/4/635 end."
+    out, fixed = _despace_url("http://www.mdpi.com/2072-4292/10/4/635", qmd)
+    assert fixed and "http://www.mdpi.com/2072-4292/10/4/635 end." in out
+    assert "2072- 4292" not in out
+    # already contiguous -> no change
+    out2, fixed2 = _despace_url("http://www.mdpi.com/2072-4292/10/4/635", out)
+    assert not fixed2 and out2 == out
+
+
+def test_recover_links_collapses_doubled_doi_in_body(tmp_path):
+    """A doubled DOI the converter transcribed into the body is collapsed to a valid,
+    matchable link — repaired in the OUTPUT, so verify then finds it on its own."""
     import fitz
     from pdf2md.postfix import _recover_links
     doc = fitz.open()
@@ -417,9 +441,32 @@ def test_recover_links_skips_present_doi_despite_mangled_prefix(tmp_path):
     qmd = tmp_path / "d.qmd"
     qmd.write_text("Bolton (2020). <https://doi.org/https://doi.org/"
                    "10.1016/j.rse.2020.111685>\n", encoding="utf-8")
-    inlined, listed = _recover_links(qmd, tmp_path)
-    assert listed == 0                                   # DOI core recognized as present
-    assert "## Source links" not in qmd.read_text(encoding="utf-8")
+    repaired, dropped = _recover_links(qmd, tmp_path)
+    body = qmd.read_text(encoding="utf-8")
+    assert "<https://doi.org/10.1016/j.rse.2020.111685>" in body   # collapsed in place
+    assert "doi.org/https" not in body and dropped == 0
+    assert "## Source links" not in body
+
+
+def test_recover_links_despaces_wrapped_url(tmp_path):
+    """A URL broken by a line-wrap space is de-spaced in place, using the clean
+    annotation URI as the search key (no boundary guessing)."""
+    import fitz
+    from pdf2md.postfix import _recover_links
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "reference line")
+    page.insert_link({"kind": fitz.LINK_URI, "from": fitz.Rect(72, 68, 260, 82),
+                      "uri": "http://www.mdpi.com/2072-4292/10/4/635"})
+    doc.save(str(tmp_path / "d.source.pdf"))
+    doc.close()
+    qmd = tmp_path / "d.qmd"
+    qmd.write_text("Jönsson et al. http://www.mdpi.com/2072- 4292/10/4/635\n",
+                   encoding="utf-8")
+    repaired, dropped = _recover_links(qmd, tmp_path)
+    body = qmd.read_text(encoding="utf-8")
+    assert "http://www.mdpi.com/2072-4292/10/4/635" in body         # space closed
+    assert "2072- 4292" not in body and repaired == 1 and dropped == 0
 
 
 def test_recover_links_no_synthetic_section_for_uninlinable(tmp_path):
