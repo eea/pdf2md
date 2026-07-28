@@ -615,3 +615,13 @@ class TestHeadingOccurrenceMatch:
                             detections={}, media_dir=tmp_path)
         r = HeadingHierarchyCheck().run(ctx)
         assert "0 reordered" in r.summary or "reordered" not in r.summary, r.summary
+
+
+def test_uri_in_qmd_normalizes_doubled_doi():
+    from pdf2md.verify.checks.link_preservation import _uri_in_qmd
+    # fitz's single-slash doubled-DOI annotation matches a collapsed body
+    ann = "https://doi.org/https:/doi.org/10.1016/j.rse.2020.111685"
+    body = "see <https://doi.org/10.1016/j.rse.2020.111685>.".lower()
+    assert _uri_in_qmd(ann, body) is True
+    # a genuinely-absent link still reports missing
+    assert _uri_in_qmd("https://example.org/gone", body) is False

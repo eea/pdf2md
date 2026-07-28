@@ -17,6 +17,10 @@ except ImportError:
 
 _URI_SCHEMES = ("http://", "https://", "ftp://", "mailto:", "www.")
 _MAX_LISTED = 30
+# The PDF's own doubled-DOI defect ("https://doi.org/https://doi.org/10.x", with fitz
+# collapsing one slash). Postfix collapses these in the .qmd, so normalise the annotation
+# URI the same way before matching — else a repaired body still reads as "missing".
+_DOUBLED_DOI_RE = re.compile(r"(https?://doi\.org/)(?:https?:/{1,2}doi\.org/)+", re.I)
 
 
 @lru_cache(maxsize=8)
@@ -45,7 +49,7 @@ def _try_source_uris(ctx) -> tuple:
 
 
 def _uri_in_qmd(uri: str, qmd_lower: str) -> bool:
-    u = uri.rstrip("/").lower()
+    u = _DOUBLED_DOI_RE.sub(r"\1", uri).rstrip("/").lower()
     if u in qmd_lower:
         return True
     # tolerate the .qmd dropping the scheme (e.g. "www.foo.org" or "foo.org/x")

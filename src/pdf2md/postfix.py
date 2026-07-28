@@ -160,6 +160,11 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     if n_tofu:
         summary['postfixes_applied'].append(
             'math: removed {} unrenderable raw-equation line(s)'.format(n_tofu))
+    # a formula the model left as bare text with only an {#eq..} label renders as text
+    cleaned, n_eqwrap = _wrap_labeled_equations(cleaned)
+    if n_eqwrap:
+        summary['postfixes_applied'].append(
+            'math: wrapped {} labelled equation(s) in $$'.format(n_eqwrap))
     # an underscore inside \text{} breaks KaTeX (HTML) but not Typst (PDF); escaping it
     # renders identically in both instead of dumping raw LaTeX into the HTML
     cleaned, n_uscore = _escape_text_underscores(cleaned)
@@ -168,6 +173,13 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             'math: escaped underscores in {} \\text{{}} group(s) for HTML math'.format(
                 n_uscore))
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    # collapse doubled DOIs LAST: _recover_links collapses them early, but the missing-text
+    # recovery re-inserts reference entries from the source (doubled) afterwards, so a final
+    # text-only pass is what actually persists in the output
+    cleaned, n_doi = _collapse_doubled_doi(cleaned)
+    if n_doi:
+        summary['postfixes_applied'].append(
+            'links: collapsed {} doubled DOI(s)'.format(n_doi))
     # Quarto auto-numbers sections, so a manual number in the heading text renders doubled
     cleaned, n_headnum = _strip_heading_numbers(cleaned)
     if n_headnum:
@@ -598,6 +610,28 @@ def _escape_text_underscores(text):
         return fixed
 
     return _TEXT_GROUP_RE.sub(fix, text), n
+
+
+_EQ_LABELED_LINE = re.compile(r'^(\s*)(\S.*?\S)\s*\{#eq[:-]([^}\s]+)\}\s*$')
+
+
+def _wrap_labeled_equations(text):
+    r"""The model sometimes emits a formula as BARE TEXT carrying only a Quarto equation
+    label and no $$ — e.g. `NDSI= (Pgreen-PSWIR1)/(Pgreen+PSWIR1). {#eq:eq2}` — which
+    renders as literal text with a dangling label. Wrap such a line in $$…$$ (and fix the
+    crossref id to Quarto's `eq-` form) so it typesets as math. Conservative: only a line
+    that already carries an {#eq…} label AND contains '=' is touched — never plain prose.
+    (The subscript structure the model flattened can't be recovered here; the prompt is the
+    real fix. This is the render backstop.) Returns (new_text, n)."""
+    out, n = [], 0
+    for ln in text.split('\n'):
+        m = _EQ_LABELED_LINE.match(ln)
+        if m and '$$' not in ln and '=' in m.group(2):
+            out.append('{}$$ {} $$ {{#eq-{}}}'.format(m.group(1), m.group(2), m.group(3)))
+            n += 1
+        else:
+            out.append(ln)
+    return '\n'.join(out), n
 
 
 def _strip_raw_math_lines(text):

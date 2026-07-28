@@ -691,6 +691,19 @@ def test_escape_text_underscores():
     assert n3 == 0 and out3 == out
 
 
+def test_wrap_labeled_equations():
+    from pdf2md.postfix import _wrap_labeled_equations
+    src = "NDSI= (Pgreen-PSWIR1)/(Pgreen +PSWIR1). {#eq:eq2}\n"
+    out, n = _wrap_labeled_equations(src)
+    assert n == 1
+    assert out.startswith("$$ NDSI= (Pgreen-PSWIR1)/(Pgreen +PSWIR1). $$ {#eq-eq2}")
+    # already-math or unlabelled lines untouched
+    for keep in ("$$\\text{x}=1$$ {#eq-1}\n", "Normal prose with an = sign.\n",
+                 "See section {#sec-3}.\n"):
+        o, k = _wrap_labeled_equations(keep)
+        assert k == 0 and o == keep
+
+
 def test_strip_raw_math_lines():
     from pdf2md.postfix import _strip_raw_math_lines
     qmd = ("Prose before.\n\n"
