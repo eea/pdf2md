@@ -57,6 +57,16 @@ DOCUMENT BODY:
   EVERY heading of the document — especially top-level chapter headings, which
   often sit alone on a page or in decorative layout; skipping one orphans its
   whole chapter. Do NOT keep manual section numbers (e.g. "6.1") in the heading text — Quarto numbers sections.
+- REPEATED STRUCTURE: many documents repeat the same sub-section skeleton across
+  several parent sections — e.g. several products or algorithms each with its own
+  "Assumptions", "Input data", "Output data", "Methodology", "Limitations". You MUST
+  emit the heading for EVERY occurrence, in EVERY parent section, even though the
+  titles repeat verbatim. Repetition is EXPECTED and REQUIRED — never skip a heading
+  because you already wrote the same title for an earlier section, and never merge a
+  section's text into the previous one to avoid repeating its heading. Each occurrence
+  marks a distinct section and must keep its own heading. This matters most deep into a
+  long document, where it is tempting to drop a heading you have written many times
+  before — do not.
 - Tables: see the dedicated TABLES section below. Tables are TEXT, not figures —
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
@@ -83,6 +93,12 @@ DOCUMENT BODY:
   This applies ONLY to genuine mathematical expressions. Ordinary units and labels
   in prose (e.g. km², CO₂, "Level 2", "Strahler 2-9") stay as normal text or
   <sup>/<sub> — do NOT wrap those in math.
+  A NUMBERED or LABELLED equation MUST still be wrapped in $$…$$. Never emit a formula
+  as bare text carrying only a Quarto label — e.g. `NDSI= (Pgreen-PSWIR1)/(Pgreen+PSWIR1). {#eq:eq2}`
+  is WRONG (renders as literal text, subscripts lost, the label dangles). Write it as
+  `$$\text{NDSI} = (\rho_{green} - \rho_{SWIR1})/(\rho_{green} + \rho_{SWIR1})$$ {#eq-2}`.
+  Any standalone line that is a formula (has `=` with fractions, ρ/σ/µ, or sub/superscripts)
+  goes in $$…$$.
 - Preserve links as Markdown links.
 - Do NOT transcribe running headers/footers or page numbers.
 
