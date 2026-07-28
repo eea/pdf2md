@@ -644,12 +644,26 @@ def test_strip_front_matter_noise():
            "Disclaimer:\nAll Rights Reserved.\n\n"
            "# Introduction\n\nWe deliver phenology products to users.\n")
     out, n = _strip_front_matter_noise(qmd)
-    assert n == 5                    # change-log heading + its table, TOC, Contact, Disclaimer
+    assert n == 3                    # TOC, Contact, Disclaimer — cover/TOC only
     assert "Contact:" not in out and "Disclaimer:" not in out
     assert "1. Contents 1 1.1" not in out
-    # change log is front matter (not in the bookmark outline) -> dropped with its table
-    assert "DOCUMENT CHANGE LOG" not in out and "| Issue | Date |" not in out
+    # policy: keep the change log (convert as much as possible) — only cover/TOC dropped
+    assert "DOCUMENT CHANGE LOG" in out and "| Issue | Date |" in out
     assert "# Introduction" in out and "We deliver phenology" in out    # kept
+
+
+def test_unnumber_frontmatter_headings():
+    from pdf2md.postfix import _unnumber_frontmatter_headings
+    qmd = ("## Document Change Log\n\n| Issue | Date |\n\n"
+           "## Introduction\n\n### Revision History\n")
+    out, n = _unnumber_frontmatter_headings(qmd)
+    assert n == 2
+    assert "## Document Change Log {.unnumbered}" in out
+    assert "### Revision History {.unnumbered}" in out
+    assert "## Introduction\n" in out               # body heading untouched
+    # idempotent: already-attributed heading is left alone
+    out2, n2 = _unnumber_frontmatter_headings(out)
+    assert n2 == 0 and out2 == out
 
 
 def test_strip_front_matter_keeps_body_prose_mentioning_services():
