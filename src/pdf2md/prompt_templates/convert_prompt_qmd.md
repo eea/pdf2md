@@ -56,17 +56,22 @@ DOCUMENT BODY:
 - Headings: use #, ##, ### following the document's heading hierarchy. Include
   EVERY heading of the document — especially top-level chapter headings, which
   often sit alone on a page or in decorative layout; skipping one orphans its
-  whole chapter. Do NOT keep manual section numbers (e.g. "6.1") in the heading text — Quarto numbers sections.
+  whole chapter.
+- KEEP the section number at the START of each heading exactly as printed — write
+  `## 4.2.6 Output data`, not `## Output data`. The number makes each heading UNIQUE,
+  which is essential: without it, repeated sub-section titles ("Output data",
+  "Assumptions", …) become identical and are easy to accidentally drop. A later
+  automated step removes the number for rendering (Quarto adds its own), so you do NOT
+  need to — just copy the number the document shows.
 - REPEATED STRUCTURE: many documents repeat the same sub-section skeleton across
   several parent sections — e.g. several products or algorithms each with its own
-  "Assumptions", "Input data", "Output data", "Methodology", "Limitations". You MUST
-  emit the heading for EVERY occurrence, in EVERY parent section, even though the
-  titles repeat verbatim. Repetition is EXPECTED and REQUIRED — never skip a heading
-  because you already wrote the same title for an earlier section, and never merge a
-  section's text into the previous one to avoid repeating its heading. Each occurrence
-  marks a distinct section and must keep its own heading. This matters most deep into a
-  long document, where it is tempting to drop a heading you have written many times
-  before — do not.
+  "Assumptions", "Input data", "Output data", "Methodology", "Limitations". Because you
+  keep the section numbers (above), each of these is unique (4.2.6 vs 8.2.6). You MUST
+  emit the heading for EVERY occurrence, in EVERY parent section. Repetition is
+  EXPECTED and REQUIRED — never skip a heading because an earlier section had the same
+  title, and never merge a section's text into the previous one to avoid repeating its
+  heading. This matters most deep into a long document, where it is tempting to drop a
+  heading you have written many times before — do not.
 - Tables: see the dedicated TABLES section below. Tables are TEXT, not figures —
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
