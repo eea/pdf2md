@@ -33,10 +33,12 @@ _CODE_MIN_CHARS = 12             # ignore groups smaller than this (stray inline
 _CODE_PROBE_MIN = 8              # min probe length before an in-.qmd presence check counts
 
 
-def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, meta=None):
+def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, meta=None,
+                repair_model=None):
     summary = {'postfixes_applied': [], 'cost_usd': 0.0}
     if passes <= 0 or not verify_results:
         return summary
+    rmodel = repair_model or _REPAIR_MODEL     # LLM model for repair/table-crop calls
 
     verify_by_name = {r.name: r for r in verify_results}
 
@@ -87,7 +89,8 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # Pass 2: missing text rescue
     text_check = verify_by_name.get('text_coverage')
     if text_check and text_check.status in ('warn', 'fail') and api_key:
-        rescued, items, repair_cost = _postfix_missing_text(qmd_path, out_dir, api_key, text_check)
+        rescued, items, repair_cost = _postfix_missing_text(qmd_path, out_dir, api_key,
+                                                            text_check, model=rmodel)
         summary['cost_usd'] += repair_cost   # calls are billed even when nothing lands
         if rescued:
             summary['postfixes_applied'].append(
@@ -101,7 +104,7 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # Not gated on the check's status: whole tables can be absent while the aggregate
     # still reads ok, because a missing table's boilerplate is supplied by its siblings.
     if table_check:
-        n_tbl, tbl_cost = _recover_missing_tables(qmd_path, out_dir, api_key=api_key)
+        n_tbl, tbl_cost = _recover_missing_tables(qmd_path, out_dir, api_key=api_key, model=rmodel)
         summary['cost_usd'] += tbl_cost
         if n_tbl:
             summary['postfixes_applied'].append(
@@ -111,7 +114,7 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # only recovers fully-missing tables — one that survived thin is invisible to it.
     # Also not gated on status: the aggregate can read ok while one table sits at 0%.
     if api_key and table_check and table_check.status != 'skipped':
-        n_crop, crop_cost = _repair_thin_tables(qmd_path, out_dir, api_key)
+        n_crop, crop_cost = _repair_thin_tables(qmd_path, out_dir, api_key, model=rmodel)
         summary['cost_usd'] += crop_cost
         if n_crop:
             summary['postfixes_applied'].append(
@@ -122,7 +125,7 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     # rebuilt from a crop is clean and won't re-flag. Invisible to the coverage gate,
     # so it's driven by the .qmd's own table structure, not the check status.
     if api_key:
-        n_mang, mang_cost = _repair_mangled_tables(qmd_path, out_dir, api_key)
+        n_mang, mang_cost = _repair_mangled_tables(qmd_path, out_dir, api_key, model=rmodel)
         summary['cost_usd'] += mang_cost
         if n_mang:
             summary['postfixes_applied'].append(
@@ -972,7 +975,7 @@ def _table_values(rows, normalize):
     return out
 
 
-def _llm_table_markdown(api_key, doc, pno, rows, normalize):
+def _llm_table_markdown(api_key, doc, pno, rows, normalize, model=_REPAIR_MODEL):
     """Re-convert a table region for STRUCTURE (merged cells, real header, caption), then
     verify it against the deterministic cell values.
 
@@ -994,7 +997,7 @@ def _llm_table_markdown(api_key, doc, pno, rows, normalize):
     try:
         response, usage = _post_with_retries(
             api_key=api_key,
-            payload={'model': _REPAIR_MODEL,
+            payload={'model': model,
                      'messages': [{'role': 'user', 'content': prompt}],
                      'max_tokens': 4096},
             label='postfix-table-p{}'.format(pno + 1), timeout=120,
@@ -1132,7 +1135,8 @@ def _crop_replace_ok(dist, new_toks, block_toks, src_toks):
     return len(block_toks - src_toks) <= 0.25 * len(block_toks)
 
 
-def _crop_table_md(api_key, doc, pno, bbox, est_chars, system=None, user=None):
+def _crop_table_md(api_key, doc, pno, bbox, est_chars, system=None, user=None,
+                   model=_REPAIR_MODEL):
     """One focused vision call: render the table bbox at 300 dpi and transcribe it.
     max_tokens is PROPORTIONAL to the table's own text volume — ~est_chars/4 source
     tokens with 4x headroom gives cap ≈ est_chars — clamped to [2000, 16000]: big
@@ -1149,7 +1153,7 @@ def _crop_table_md(api_key, doc, pno, bbox, est_chars, system=None, user=None):
     cap = max(2000, min(16000, int(est_chars)))
     try:
         md, usage = call_vision(
-            api_key=api_key, model=_REPAIR_MODEL,
+            api_key=api_key, model=model,
             system_instruction=system or _TBL_CROP_SYS,
             user_prompt=user or 'Transcribe the table in this cropped image.',
             image_data_uris=[uri], timeout=120, max_tokens=cap,
@@ -1165,7 +1169,7 @@ def _crop_table_md(api_key, doc, pno, bbox, est_chars, system=None, user=None):
     return (md or None), usage_cost(usage)
 
 
-def _repair_thin_tables(qmd_path, out_dir, api_key):
+def _repair_thin_tables(qmd_path, out_dir, api_key, model=_REPAIR_MODEL):
     """Re-convert partially-mangled tables from focused crops, in place.
 
     Region set = find_tables grids ∪ vision-detected excluded_tables (borderless
@@ -1261,10 +1265,10 @@ def _repair_thin_tables(qmd_path, out_dir, api_key):
 
             def _score(m):
                 return len(dist & _tbl_md_tokens(m)) / len(dist) if m else 0.0
-            md, c1 = _crop_table_md(api_key, doc, pno, bbox, est_chars)
+            md, c1 = _crop_table_md(api_key, doc, pno, bbox, est_chars, model=model)
             cost += c1
             if _score(md) <= inc_cov:       # noisy — one retry before declining
-                md2, c2 = _crop_table_md(api_key, doc, pno, bbox, est_chars)
+                md2, c2 = _crop_table_md(api_key, doc, pno, bbox, est_chars, model=model)
                 cost += c2
                 if _score(md2) > _score(md):
                     md = md2
@@ -1360,7 +1364,7 @@ def _pipe_empty_ratio(block):
     return (sum(1 for c in cells if not c) / len(cells)) if cells else 0.0
 
 
-def _repair_mangled_tables(qmd_path, out_dir, api_key):
+def _repair_mangled_tables(qmd_path, out_dir, api_key, model=_REPAIR_MODEL):
     """Re-convert value-complete but structurally-mangled pipe tables from focused
     crops. Replaces a flagged table only when the re-conversion (a) improves structure
     — a much lower empty-cell ratio, or it turns out to be prose — AND (b) loses no
@@ -1406,7 +1410,7 @@ def _repair_mangled_tables(qmd_path, out_dir, api_key):
                 continue                                # can't confidently place it
             pno, bbox, _rtoks, est = best
             old_ratio = _pipe_empty_ratio(block)
-            new_md, c = _crop_table_md(api_key, doc, pno, bbox, est * 3,
+            new_md, c = _crop_table_md(api_key, doc, pno, bbox, est * 3, model=model,
                                        system=_TBL_CLEAN_SYS,
                                        user='Transcribe the table in this cropped image '
                                             'to a clean Markdown table, or to prose if '
@@ -1449,7 +1453,7 @@ def _repair_mangled_tables(qmd_path, out_dir, api_key):
     return len(edits), cost
 
 
-def _recover_missing_tables(qmd_path, out_dir, api_key=None):
+def _recover_missing_tables(qmd_path, out_dir, api_key=None, model=_REPAIR_MODEL):
     """Re-emit source tables whose data never reached the .qmd. Returns (count, llm_cost).
 
     Values come straight from PyMuPDF find_tables, so they are exact; the LLM is only
@@ -1507,7 +1511,7 @@ def _recover_missing_tables(qmd_path, out_dir, api_key=None):
         if api_key:
             doc2 = fitz.open(str(source_pdf))
             try:
-                md, c = _llm_table_markdown(api_key, doc2, pno, rows, normalize)
+                md, c = _llm_table_markdown(api_key, doc2, pno, rows, normalize, model=model)
                 llm_cost[0] += c
             finally:
                 doc2.close()
@@ -2005,7 +2009,7 @@ def _postfix_footnotes(qmd_path, out_dir):
     return converted
 
 
-def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
+def _postfix_missing_text(qmd_path, out_dir, api_key, text_check, model=_REPAIR_MODEL):
     """Recover dropped body sentences by anchoring each gap on the surviving
     sentence before it and filling a placeholder marker with an LLM-cleaned (raw
     fallback) rendering of the gap's source text. Returns (pages, items, cost)."""
@@ -2062,7 +2066,8 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check):
         marker = _MARKER_TMPL.format(gid)
         qmd_text = qmd_text[:safe] + marker + '\n\n' + qmd_text[safe:]
 
-    rendered, cost = _llm_convert_gaps(api_key, [(gid, raw) for _, gid, _, raw in planned])
+    rendered, cost = _llm_convert_gaps(api_key, [(gid, raw) for _, gid, _, raw in planned],
+                                       model=model)
 
     pages, items = set(), 0
     for _safe, gid, pno, raw in planned:

@@ -132,6 +132,24 @@ def resolve_model(args_model=None):
     return DEFAULT_MODEL
 
 
+def resolve_aux_model(args_val=None, cfg_key=""):
+    """Resolve an auxiliary model (figure / repair): CLI arg -> config file key -> None.
+    None lets the pipeline fall back to its own default (main model for figures, the
+    postfix default for repair)."""
+    if args_val:
+        return args_val
+    if cfg_key and CONFIG_FILE.exists():
+        try:
+            import json as _json
+            cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            m = cfg.get(cfg_key, "").strip()
+            if m:
+                return m
+        except Exception:
+            pass
+    return None
+
+
 def run_setup() -> int:
     """Interactive setup: API key (+ optional Quarto path), saved to ~/.pdf2md/."""
     import json
@@ -191,6 +209,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help=f"OpenRouter model (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
+    p.add_argument("--figure-model", default=None,
+                   help="model for Phase-1 figure detection (default: same as --model)")
+    p.add_argument("--repair-model", default=None,
+                   help="model for repair / table-crop calls (default: google/gemini-2.5-flash)")
     p.add_argument("--template", type=str, default=None, metavar="TEMPLATE",
                    help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
@@ -403,6 +425,8 @@ def main() -> int:
 
     common = dict(
         api_key=api_key, model=model, cover_model=args.cover_model,
+        figure_model=resolve_aux_model(args.figure_model, "figure_model"),
+        repair_model=resolve_aux_model(args.repair_model, "repair_model"),
         do_render=args.render, do_verify=not args.no_verify, force=args.force,
         format=args.format, strip_headers=(not args.keep_headers),
         postfix_passes=args.postfix,

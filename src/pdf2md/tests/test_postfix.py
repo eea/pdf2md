@@ -765,3 +765,21 @@ def test_ensure_pipe_table_blanks():
     # idempotent
     out2, n2 = _ensure_pipe_table_blanks(out)
     assert n2 == 0
+
+
+def test_run_postfix_accepts_repair_model_kwarg(tmp_path):
+    # plumbing: run_postfix takes repair_model; with passes=0 it returns early, no LLM
+    from pdf2md.postfix import run_postfix
+    s = run_postfix(tmp_path / "d.qmd", [], tmp_path, passes=0,
+                    repair_model="google/gemini-2.5-flash")
+    assert s == {'postfixes_applied': [], 'cost_usd': 0.0}
+
+
+def test_cli_parser_has_split_model_flags():
+    from pdf2md.app_cli import _build_parser, resolve_aux_model
+    a = _build_parser().parse_args(
+        ["d.pdf", "--figure-model", "google/x", "--repair-model", "google/y"])
+    assert a.figure_model == "google/x" and a.repair_model == "google/y"
+    # resolve: CLI value wins; unset with no config key -> None (pipeline falls back)
+    assert resolve_aux_model("google/x", "figure_model") == "google/x"
+    assert resolve_aux_model(None, "no_such_key_zzz") is None

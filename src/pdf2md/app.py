@@ -279,6 +279,8 @@ def convert_one(
     api_key: str,
     model: str = DEFAULT_MODEL,
     cover_model: str = DEFAULT_COVER_MODEL,
+    figure_model: str = None,          # Phase-1 figure detection; None → main model
+    repair_model: str = None,          # repair/table-crop LLM; None → postfix default
     do_render: bool = False,
     do_verify: bool = True,
     force: bool = False,
@@ -330,6 +332,7 @@ def convert_one(
             postfix_summary = run_postfix(
                 result.qmd, results, out_dir,
                 api_key=api_key, passes=postfix_passes, meta=report_meta,
+                repair_model=repair_model,
             )
             result.phase_cost["postfix"] = postfix_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
@@ -410,7 +413,7 @@ def convert_one(
 
         # Phase 1 — detect
         do_strip = strip_headers
-        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=model,
+        p1 = run_phase1(pdf, out_dir, api_key=api_key, model=(figure_model or model),
                         do_strip_chrome=do_strip,
                         cover_model=cover_model, events=events,
                         detect_workers=detect_workers)
@@ -509,6 +512,7 @@ def convert_one(
             postfix_summary = run_postfix(
                 result.qmd, results, out_dir,
                 api_key=api_key, passes=postfix_passes, meta=report_meta,
+                repair_model=repair_model,
             )
             result.phase_cost["repair"] = postfix_summary.get("cost_usd", 0.0)
             result.cost_usd = sum(result.phase_cost.values())
@@ -552,6 +556,8 @@ def convert_batch(
     api_key: str,
     model: str = DEFAULT_MODEL,
     cover_model: str = DEFAULT_COVER_MODEL,
+    figure_model: str = None,
+    repair_model: str = None,
     do_render: bool = False,
     do_verify: bool = True,
     force: bool = False,
@@ -613,6 +619,7 @@ def convert_batch(
 
             r = convert_one(
                 pdf, out_root, api_key=api_key, model=model, cover_model=cover_model,
+                figure_model=figure_model, repair_model=repair_model,
                 do_render=do_render, do_verify=do_verify, force=force,
                 max_cost_per_file=max_cost_per_file, allow_over_budget=allow_over_budget, format=format, strip_headers=strip_headers,
                 estimate=est, events=events, index=i, total=len(pdfs), template=template,
