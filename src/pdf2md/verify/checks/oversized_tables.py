@@ -68,7 +68,7 @@ class OversizedTableCheck:
             return CheckResult(
                 self.name, "warn",
                 f"{src} oversized source table(s) found, but none cropped as figures "
-                f"or transcribed — likely DROPPED by the converter",
+                f"or transcribed - likely DROPPED by the converter",
                 findings=[Finding(
                     f"{src} oversized source table(s) appear missing from the output "
                     f"(crop-as-figure did not run or failed)", "warn", "oversized-tables")])

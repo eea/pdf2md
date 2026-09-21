@@ -227,31 +227,58 @@ class TestCallOpenrouter:
         assert result == "real content"
         assert mock_post.call_count == 2
 
-    def test_truncation_hard_fails_no_retry(self):
-        # finish_reason=length with partial content → incomplete doc; must hard-fail
-        # (not return the truncated .qmd as success, not waste retries).
-        import pytest
-        r = MagicMock()
-        r.status_code = 200
-        r.text = "## Section 1\npartial body that stops mid-"
-        r.json.return_value = {"choices": [{
-            "message": {"content": "## Section 1\npartial body that stops mid-"},
-            "finish_reason": "length",
-        }]}
-        with pytest.raises(RuntimeError, match="truncated"):
-            self._call([r])
+    def test_truncation_triggers_continuation_not_failure(self):
+        # finish_reason=length no longer hard-fails: call_openrouter keeps the whole
+        # PDF in context and continues the output across calls. First reply is cut
+        # mid-block (partial trailing block discarded), second completes.
+        trunc = MagicMock()
+        trunc.status_code = 200
+        trunc.text = ""
+        trunc.json.return_value = {"choices": [{
+            "message": {"content": "## Section 1\n\nFull para.\n\npartial mid-"},
+            "finish_reason": "length"}], "usage": {"cost": 0.1}}
+        done = MagicMock()
+        done.status_code = 200
+        done.text = ""
+        done.json.return_value = {"choices": [{
+            "message": {"content": "partial middle done.\n\n## Section 2\n\nEnd.\n"},
+            "finish_reason": "stop"}], "usage": {"cost": 0.1}}
+        result, mock_post = self._call([trunc, done])
+        assert mock_post.call_count == 2
+        assert "Full para." in result and "## Section 2" in result and "End." in result
 
-    def test_truncation_detects_gemini_native_max_tokens(self):
+    def test_gemini_native_max_tokens_triggers_continuation(self):
+        # native_finish_reason=MAX_TOKENS is recognized as truncation → continue.
+        trunc = MagicMock()
+        trunc.status_code = 200
+        trunc.text = ""
+        trunc.json.return_value = {"choices": [{
+            "message": {"content": "Body one.\n\nmore"},
+            "native_finish_reason": "MAX_TOKENS"}]}
+        done = MagicMock()
+        done.status_code = 200
+        done.text = ""
+        done.json.return_value = {"choices": [{
+            "message": {"content": "more content complete.\n"},
+            "finish_reason": "stop"}]}
+        result, mock_post = self._call([trunc, done])
+        assert mock_post.call_count == 2
+        assert "Body one." in result
+
+    def test_truncation_still_hard_fails_without_allow_truncation(self):
+        # detect/postfix/phase25 have small bounded outputs — a truncated JSON/patch
+        # there is a genuine error, so _post_with_retries still raises by default.
         import pytest
+        from pdf2md.llm_client import _post_with_retries
         r = MagicMock()
         r.status_code = 200
         r.text = "partial"
         r.json.return_value = {"choices": [{
-            "message": {"content": "partial"},
-            "native_finish_reason": "MAX_TOKENS",
-        }]}
-        with pytest.raises(RuntimeError, match="truncated"):
-            self._call([r])
+            "message": {"content": "partial"}, "finish_reason": "length"}]}
+        with patch("pdf2md.llm_client.requests.post", side_effect=[r]):
+            with pytest.raises(RuntimeError, match="truncated"):
+                _post_with_retries(api_key="t", payload={"model": "m"},
+                                   label="f", timeout=10)
 
     def test_retry_on_connection_reset(self):
         # a transient connection reset must be retried, not abort the run
@@ -1052,6 +1079,15 @@ class TestResolveFigTokens:
         assert set(rep["resolved"]) == {"FIG_1", "FIG_2"}
         assert rep["hallucinated"] == [] and rep["unreferenced"] == []
 
+    def test_resolves_empty_caption_token(self, tmp_path):
+        # the prompt instructs "![](FIG_n)" for caption-less figures; the resolver
+        # must not require a non-empty alt (it silently skipped these before)
+        from pdf2md.resolve import resolve_fig_tokens
+        body = "Intro\n\n![](FIG_1)\n"
+        out, rep = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert "](doc-media/img-aaa.png)" in out and "(FIG_1)" not in out
+        assert "FIG_1" in rep["resolved"]
+
     def test_hallucinated_token_becomes_marker(self, tmp_path):
         from pdf2md.resolve import resolve_fig_tokens
         body = "![bogus](FIG_9)\n"
@@ -1070,6 +1106,62 @@ class TestResolveFigTokens:
         assert "FIG_2:" in out and "doc-media/img-bbb.png" in out
         assert "<!--" in out and out.rstrip().endswith("-->")
         assert "⚠" not in out                      # no visible warning marker
+
+    def test_unresolvable_html_img_becomes_marker_not_broken_tag(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        body = '| cell <img src="FIG_9" alt="Palette sample"> | 33 |\n'
+        out, rep = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert "<img" not in out                   # whole tag replaced
+        assert "figure not found (FIG_9)" in out
+        assert rep["hallucinated"] == ["FIG_9"]
+
+    def test_resolvable_html_img_keeps_tag(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        body = '| cell <img src="FIG_1" alt="Palette sample"> | 33 |\n'
+        out, _ = resolve_fig_tokens(body, self._figs(), tmp_path / "doc.qmd", "doc-media")
+        assert '<img src="doc-media/img-aaa.png" alt="Palette sample">' in out
+
+
+class TestAdoptUnstampedFigures:
+    def _pdf_with_images(self, path):
+        """One page: some body text plus two small embedded rasters."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 100), "Shrubland palette row with a colour swatch")
+        # build a tiny png to embed
+        pm = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 12, 12))
+        pm.clear_with(90)
+        png = pm.tobytes("png")
+        page.insert_image(fitz.Rect(200, 200, 220, 220), stream=png)   # detected
+        page.insert_image(fitz.Rect(200, 300, 220, 320), stream=png)   # undetected
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def test_adopts_undetected_raster_for_stray_token(self, tmp_path):
+        from pdf2md.resolve import adopt_unstamped_figures, resolve_fig_tokens
+        pdf = self._pdf_with_images(tmp_path / "d.pdf")
+        media = tmp_path / "doc-media"
+        figures = [{"fig_id": "FIG_1", "file": "img-aaa.png", "page": 0,
+                    "bbox": [200, 200, 220, 220]}]
+        body = ('Shrubland palette row with a colour swatch '
+                '<img src="FIG_1" alt="a"> then <img src="FIG_2" alt="b">\n')
+        n = adopt_unstamped_figures(body, figures, pdf, media)
+        assert n == 1
+        assert figures[-1]["fig_id"] == "FIG_2" and figures[-1]["origin"] == "adopted-from-model"
+        assert (media / figures[-1]["file"]).exists()
+        out, rep = resolve_fig_tokens(body, figures, tmp_path / "doc.qmd", "doc-media")
+        assert "FIG_2" not in out and rep["hallucinated"] == []
+
+    def test_no_candidate_leaves_token_for_marker_path(self, tmp_path):
+        from pdf2md.resolve import adopt_unstamped_figures
+        import fitz
+        doc = fitz.open(); doc.new_page(); doc.save(str(tmp_path / "empty.pdf")); doc.close()
+        figures = []
+        n = adopt_unstamped_figures("![x](FIG_3)", figures, tmp_path / "empty.pdf",
+                                    tmp_path / "m")
+        assert n == 0 and figures == []
 
 
 class TestNeutralizeBodyThematicBreaks:
@@ -1121,24 +1213,25 @@ class TestNormalizeFrontmatter:
         from pdf2md.resolve import normalize_frontmatter
         out = normalize_frontmatter("Just body, no frontmatter\n")
         assert out.startswith("---\ncategory: uncategorized\n")
-        assert 'subtitle: ""' in out      # required field always emitted
+        assert "subtitle: ''" in out      # required field always emitted
 
     def test_always_emits_subtitle_when_none_supplied(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\ncategory: uncategorized\n---\nBody\n'
         out = normalize_frontmatter(qmd)   # no cover subtitle
-        assert 'subtitle: ""' in out
+        assert "subtitle: ''" in out
 
     def test_nonempty_cover_subtitle_wins(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\n---\nBody\n'
         out = normalize_frontmatter(qmd, cover_fields={"subtitle": "My Subtitle"})
-        assert 'subtitle: "My Subtitle"' in out
-        assert 'subtitle: ""' not in out
+        assert "subtitle: 'My Subtitle'" in out
+        assert "subtitle: ''" not in out
 
     def test_apostrophe_in_title_escaped(self):
         """Apostrophes in YAML single-quoted scalars must be doubled."""
-        import yaml
+        import pytest
+        yaml = pytest.importorskip("yaml")
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: T\n---\nBody\n'
         out = normalize_frontmatter(qmd, cover_fields={"title": "User's Guide"})
@@ -1153,19 +1246,19 @@ class TestNormalizeFrontmatter:
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\ndate: "2011"\n---\nBody\n'
         out = normalize_frontmatter(qmd)
-        assert 'date: "2011-01-01"' in out
+        assert "date: '2011-01-01'" in out
 
     def test_preserves_full_date(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\ndate: "2019-06-15"\n---\nBody\n'
         out = normalize_frontmatter(qmd)
-        assert 'date: "2019-06-15"' in out
+        assert "date: '2019-06-15'" in out
 
     def test_adds_date_when_missing(self):
         from pdf2md.resolve import normalize_frontmatter
         qmd = '---\ntitle: "T"\nsubtitle: "S"\n---\nBody\n'
         out = normalize_frontmatter(qmd, date="2020-10-01")
-        assert 'date: "2020-10-01"' in out
+        assert "date: '2020-10-01'" in out
 
     def test_keeps_model_date(self):
         from pdf2md.resolve import normalize_frontmatter
@@ -1523,9 +1616,9 @@ class TestNormalizeFrontmatterCoverFields:
         qmd = '---\ntitle: "Converter Guess"\nsubtitle: "Wrong"\ndate: "2020-01-01"\n---\nBody\n'
         cover = {"title": "Real Title", "subtitle": "Real Subtitle", "date": "", "version": "v2"}
         out = normalize_frontmatter(qmd, cover_fields=cover)
-        assert 'title: "Real Title"' in out
-        assert 'subtitle: "Real Subtitle"' in out
-        assert 'version: "v2"' in out
+        assert "title: 'Real Title'" in out
+        assert "subtitle: 'Real Subtitle'" in out
+        assert "version: 'v2'" in out
         # date from cover is empty so converter's date survives
         assert '2020-01-01' in out
 
@@ -1542,7 +1635,7 @@ class TestNormalizeFrontmatterCoverFields:
         cover = {"title": "", "subtitle": "", "date": "2023-06", "version": ""}
         out = normalize_frontmatter(qmd, cover_fields=cover)
         # year-month is coerced to a gate-valid YYYY-MM-DD
-        assert 'date: "2023-06-01"' in out
+        assert "date: '2023-06-01'" in out
 
     def test_no_cover_fields_unchanged_behavior(self):
         from pdf2md.resolve import normalize_frontmatter
@@ -1613,3 +1706,19 @@ class TestResolveHtmlImg:
         out, rep = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
         assert 'src="doc-media/img-a.png"' in out
         assert "FIG_1" not in out and rep["resolved"] == ["FIG_1"]
+
+    def test_prepends_figure_label_from_detection(self, tmp_path):
+        # converter dropped the 'Figure N' label; detection kept it -> restore it
+        from pdf2md.resolve import resolve_fig_tokens
+        figs = [{"fig_id": "FIG_1", "file": "img-aaa.png",
+                 "caption": "Figure 1. MODIS tile layout: 23 tiles over EEA-39."}]
+        body = "![MODIS tile layout: 23 tiles over EEA-39.](FIG_1)\n"
+        out, _ = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
+        assert "![Figure 1. MODIS tile layout: 23 tiles over EEA-39.](doc-media/img-aaa.png)" in out
+
+    def test_keeps_existing_figure_label(self, tmp_path):
+        from pdf2md.resolve import resolve_fig_tokens
+        figs = [{"fig_id": "FIG_2", "file": "img-bbb.png", "caption": "Figure 2. Flowchart."}]
+        body = "![Figure 2. Flowchart.](FIG_2)\n"
+        out, _ = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
+        assert out.count("Figure 2.") == 1          # no double label

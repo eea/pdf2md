@@ -6,7 +6,7 @@ The production entry, distinct from the legacy single-pass `cli.py`.
     python3 tools/pdf2md/pdf2md.py FILE.pdf
     python3 tools/pdf2md/pdf2md.py inbox/                 # batch: every *.pdf in inbox/
     python3 tools/pdf2md/pdf2md.py FILE.pdf
-    python3 tools/pdf2md/pdf2md.py inbox/ --out output --model google/gemini-2.5-pro
+    python3 tools/pdf2md/pdf2md.py inbox/ --out output    # batch to a chosen dir
 
 Environment:
     OPENROUTER_API_KEY   (required)
@@ -18,7 +18,7 @@ import os
 import sys
 from pathlib import Path
 
-from .app import DEFAULT_MODEL, Events, convert_batch, convert_one
+from .app import CONFIG_DIR, CONFIG_FILE, DEFAULT_MODEL, Events, convert_batch, convert_one
 from .cost import eur_to_usd, fmt_eur
 from .cover import DEFAULT_COVER_MODEL
 from . import __version__
@@ -73,9 +73,7 @@ def _build_json_report(result, timing, model, cover_model):
 
 # ── Key & config helpers ───────────────────────────────────────────────────────
 
-CONFIG_DIR = Path.home() / ".pdf2md"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-KEY_FILE = CONFIG_DIR / "key"
+KEY_FILE = CONFIG_DIR / "key"  # CONFIG_DIR/CONFIG_FILE are the canonical defs in app
 
 
 def resolve_key() -> str:
@@ -98,6 +96,23 @@ def resolve_key() -> str:
     return ""
 
 
+def describe_key_sources() -> str:
+    """Explain where we looked for a key and what we found, for the no-key error."""
+    parts = []
+    env = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not env:
+        parts.append("OPENROUTER_API_KEY is not exported in this shell")
+    elif not env.startswith("sk-or-"):
+        parts.append(f"OPENROUTER_API_KEY is set but doesn't look like an OpenRouter "
+                     f"key (starts with {env[:6]!r}, expected 'sk-or-')")
+    kf = os.environ.get("OPENROUTER_API_KEY_FILE", "")
+    if kf and not Path(kf).exists():
+        parts.append(f"OPENROUTER_API_KEY_FILE points to a missing file ({kf})")
+    if not KEY_FILE.exists():
+        parts.append(f"no saved key at {KEY_FILE}")
+    return "; ".join(parts) or "key sources look fine"
+
+
 def resolve_model(args_model=None):
     """Resolve model: CLI arg -> env var -> config file -> default."""
     if args_model:
@@ -117,8 +132,26 @@ def resolve_model(args_model=None):
     return DEFAULT_MODEL
 
 
+def resolve_aux_model(args_val=None, cfg_key=""):
+    """Resolve an auxiliary model (figure / repair): CLI arg -> config file key -> None.
+    None lets the pipeline fall back to its own default (main model for figures, the
+    postfix default for repair)."""
+    if args_val:
+        return args_val
+    if cfg_key and CONFIG_FILE.exists():
+        try:
+            import json as _json
+            cfg = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            m = cfg.get(cfg_key, "").strip()
+            if m:
+                return m
+        except Exception:
+            pass
+    return None
+
+
 def run_setup() -> int:
-    """Interactive setup: API key + default model, saved to ~/.pdf2md/."""
+    """Interactive setup: API key (+ optional Quarto path), saved to ~/.pdf2md/."""
     import json
     print("pdf2md — one-time setup\n")
     print("Paste your OpenRouter API key (or press Enter to skip):")
@@ -134,24 +167,10 @@ def run_setup() -> int:
     else:
         print("  (skipped — set OPENROUTER_API_KEY env var to use pdf2md)\n")
 
-    models = [
-        ("google/gemini-2.5-pro",   "Best quality, slower (~EUR 0.15-0.60/doc)"),
-        ("google/gemini-2.5-flash", "Fast, cheap (~EUR 0.02-0.10/doc)"),
-        ("google/gemini-3.5-flash", "Newest flash model"),
-    ]
-    print("Pick a default model:")
-    for i, (m, desc) in enumerate(models, 1):
-        print(f"  {i}. {m}  -- {desc}")
-    print(f"  {len(models)+1}. {DEFAULT_MODEL} (default)")
-    choice = input(f"[1-{len(models)+1}, Enter=default]> ").strip()
-    try:
-        idx = int(choice) - 1
-        model = models[idx][0] if 0 <= idx < len(models) else DEFAULT_MODEL
-    except (ValueError, IndexError):
-        model = DEFAULT_MODEL
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = {"model": model}
-    
+    cfg = {}
+
+
     # Quarto auto-detection (for --render)
     import shutil as _shutil
     quarto = _shutil.which("quarto")
@@ -169,10 +188,9 @@ def run_setup() -> int:
         cfg["quarto_path"] = quarto
     
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"  Default model set to: {model}")
+    print(f"  Model: {DEFAULT_MODEL} (override with --model or OPENROUTER_MODEL env var)")
     if quarto:
         print(f"  Quarto path: {quarto}")
-    print(f"  (override with --model or OPENROUTER_MODEL env var)")
     return 0
 
 
@@ -188,9 +206,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=Path("output"),
                    help="output root directory (default: output/)")
     p.add_argument("--model", default=None,
-                   help=f"OpenRouter model for detect+convert (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
+                   help=f"OpenRouter model (default: env OPENROUTER_MODEL or {DEFAULT_MODEL})")
     p.add_argument("--cover-model", default=DEFAULT_COVER_MODEL,
                    help=f"model for cover-metadata extraction (default: {DEFAULT_COVER_MODEL})")
+    p.add_argument("--figure-model", default=None,
+                   help="model for Phase-1 figure detection (default: same as --model)")
+    p.add_argument("--repair-model", default=None,
+                   help="model for repair / table-crop calls (default: google/gemini-2.5-flash)")
     p.add_argument("--template", type=str, default=None, metavar="TEMPLATE",
                    help="path or URL to a .qmd template file; its YAML frontmatter is injected into the conversion prompt (with --format qmd or gfm)")
     p.add_argument("--render", action="store_true", help="render .qmd to PDF via Quarto/Typst")
@@ -380,19 +402,31 @@ def main() -> int:
 
     api_key = resolve_key()
     if not api_key:
-        log.warning("No API key configured — starting interactive setup.")
+        log.warning("No usable API key found: %s.", describe_key_sources())
+        log.warning("Starting interactive setup — or export OPENROUTER_API_KEY and re-run.")
         run_setup()
         api_key = resolve_key()
         if not api_key:
-            log.error("No API key provided. Set OPENROUTER_API_KEY or run 'pdf2md --setup'.")
+            log.error("No API key provided (%s). Set OPENROUTER_API_KEY or run "
+                      "'pdf2md --setup'.", describe_key_sources())
             return 1
     model = resolve_model(args.model)
+
+    # pre-flight: reject a bad/expired key here with a friendly message, instead of
+    # letting every page's detection call fail mid-run with a raw HTTP 401
+    from .llm_client import validate_key
+    ok, why = validate_key(api_key)
+    if not ok:
+        log.error("%s", why)
+        return 1
 
     batch = args.path.is_dir()
     events, rich_active = _setup_ui_and_logging(args, batch)
 
     common = dict(
         api_key=api_key, model=model, cover_model=args.cover_model,
+        figure_model=resolve_aux_model(args.figure_model, "figure_model"),
+        repair_model=resolve_aux_model(args.repair_model, "repair_model"),
         do_render=args.render, do_verify=not args.no_verify, force=args.force,
         format=args.format, strip_headers=(not args.keep_headers),
         postfix_passes=args.postfix,

@@ -51,12 +51,25 @@ DOCUMENT BODY:
 - Transcribe EVERY line of body text — do not omit any sentence, list item, or
   note. When in doubt, include it.
 - Produce clean Markdown/GitHub-flavored Markdown.
-- Headings: use #, ##, ### following the document's heading hierarchy. Do NOT keep
-  manual section numbers (e.g. "6.1") in the heading text — Markdown numbers sections.
+- Headings: use #, ##, ### following the document's heading hierarchy. Include
+  EVERY heading of the document — especially top-level chapter headings, which
+  often sit alone on a page or in decorative layout; skipping one orphans its
+  whole chapter. Do NOT keep manual section numbers (e.g. "6.1") in the heading text — Markdown numbers sections.
 - Tables: see the dedicated TABLES section below. Tables are TEXT, not figures —
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
-  names and codes, footnotes, and superscripts/subscripts where present.
+  names and codes, and superscripts/subscripts where present.
+- Footnotes: a superscript footnote mark — a small raised digit that has a
+  matching note at the BOTTOM of the page — becomes [^n] at that exact spot, and
+  the page-bottom note becomes a matching definition line [^n]: placed after the
+  paragraph. Example:
+    "…the nomenclature³ was applied." with page-bottom note "3 See Annex 1."
+    →  "…the nomenclature[^3] was applied." plus the line "[^3]: See Annex 1."
+  Never drop the mark and never inline the footnote text into the sentence.
+  This is for BODY text. Inside a table cell, a footnote mark stays a superscript
+  (<sup>n</sup>) — do NOT write [^n] in a cell, it renders literally there.
+  Exponents (x², km²) and author affiliation marks are not footnotes — keep them
+  as superscripts everywhere.
 - Mathematical formulas and equations: transcribe as LaTeX math, NOT as HTML
   entities (NEVER write &sqrt; — it is not a valid entity) and NOT as plain
   sub/superscript text. Use $...$ for a formula INLINE in a sentence and $$...$$

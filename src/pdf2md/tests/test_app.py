@@ -36,7 +36,7 @@ def _stub_phases(monkeypatch, *, verify_status="ok", phase2_raises=False, render
             (out_dir / f"{stem}.pdf").write_bytes(b"%PDF-1.4\n")
         return render_ok, "render log"
 
-    def fake_verify(out_dir, stem):
+    def fake_verify(out_dir, stem, meta=None):
         return [
             CheckResult("figure_placement", "ok", "2/2"),
             CheckResult("text_coverage", verify_status, "coverage", metric=97.3),
@@ -54,7 +54,7 @@ class TestConvertOne:
     def test_happy_path(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch)
         pdf = _make_pdf(tmp_path / "doc.pdf")
-        r = app.convert_one(pdf, tmp_path / "out", api_key="k")
+        r = app.convert_one(pdf, tmp_path / "out", api_key="k", do_render=True)
         assert r.status == "ok"
         assert r.figures == 2
         assert r.qmd.name == "doc.qmd"
@@ -63,7 +63,8 @@ class TestConvertOne:
         assert r.cover["title"] == "T"
         # cost accumulated across phases (cover 0.01 + detect 0.20 + convert 1.00)
         assert abs(r.cost_usd - 1.21) < 1e-9
-        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00}
+        assert r.phase_cost == {"cover": 0.01, "detect": 0.20, "convert": 1.00,
+                                "rescue": 0.0, "repair": 0.0}
 
     def test_verify_warn_sets_warn(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch, verify_status="warn")
@@ -80,7 +81,7 @@ class TestConvertOne:
     def test_render_failure_is_warn(self, tmp_path, monkeypatch):
         _stub_phases(monkeypatch, render_ok=False)
         pdf = _make_pdf(tmp_path / "doc.pdf")
-        r = app.convert_one(pdf, tmp_path / "out", api_key="k")
+        r = app.convert_one(pdf, tmp_path / "out", api_key="k", do_render=True)
         assert r.status == "warn" and "render failed" in r.error
 
     def test_no_render_no_verify_honored(self, tmp_path, monkeypatch):
@@ -200,6 +201,74 @@ class TestBudget:
         assert by["a"] in ("ok", "warn")
         assert by["b"] == "skip"
         assert "batch budget" in next(r.error for r in results if r.stem == "b")
+
+
+class TestLargeDocWarning:
+    def _est(self, text_chars, pages):
+        return {"expected_usd": 1.0, "low_usd": 0.5, "high_usd": 2.0, "pages": pages,
+                "candidate_pages": 0, "text_chars": text_chars,
+                "breakdown": {"cover": 0.0, "detect": 0.0, "convert": 1.0}, "calibrated": True}
+
+    def test_warns_when_text_exceeds_context_budget(self, tmp_path, monkeypatch, caplog):
+        import logging
+        _stub_phases(monkeypatch)
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        # 4M chars ≈ 1M tokens of text > 0.7 * 1M window → warn
+        with caplog.at_level(logging.WARNING):
+            app.convert_one(pdf, tmp_path / "out", api_key="k",
+                            estimate=self._est(text_chars=4_000_000, pages=1400))
+        assert any("very large" in r.message and "context window" in r.message
+                   for r in caplog.records)
+
+    def test_no_warning_for_normal_doc(self, tmp_path, monkeypatch, caplog):
+        import logging
+        _stub_phases(monkeypatch)
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        with caplog.at_level(logging.WARNING):
+            app.convert_one(pdf, tmp_path / "out", api_key="k",
+                            estimate=self._est(text_chars=120_000, pages=40))
+        assert not any("very large" in r.message for r in caplog.records)
+
+
+class TestValidateKey:
+    def _mock(self, monkeypatch, *, code=None):
+        import urllib.error, urllib.request
+        from pdf2md import llm_client
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"data": {"label": "ok"}}'
+
+        def _open(req, timeout=10):
+            if code:
+                raise urllib.error.HTTPError(req.full_url, code, "err", {}, None)
+            return _Resp()
+        monkeypatch.setattr(urllib.request, "urlopen", _open)
+        return llm_client
+
+    def test_valid_key_ok(self, monkeypatch):
+        lc = self._mock(monkeypatch)
+        ok, _ = lc.validate_key("sk-or-good")
+        assert ok
+
+    def test_401_rejected_with_friendly_message(self, monkeypatch):
+        lc = self._mock(monkeypatch, code=401)
+        ok, msg = lc.validate_key("sk-or-bad")
+        assert not ok and "rejected" in msg.lower() and "setup" in msg.lower()
+
+    def test_402_reports_credits(self, monkeypatch):
+        lc = self._mock(monkeypatch, code=402)
+        ok, msg = lc.validate_key("sk-or-broke")
+        assert not ok and "credit" in msg.lower()
+
+    def test_network_error_does_not_block(self, monkeypatch):
+        import urllib.request
+        from pdf2md import llm_client
+        def _boom(req, timeout=10): raise OSError("no network")
+        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+        ok, _ = llm_client.validate_key("sk-or-x")
+        assert ok            # flaky network must not block a valid run
 
 
 class TestScaffolding:

@@ -49,12 +49,19 @@ def _fit_name(name: str, width: int = _NAME_W) -> str:
     return name[:head] + "…" + name[len(name) - (keep - head):]
 
 
+def _issue_text(iss) -> str:
+    """The terse, problem-focused line for a verify issue — what a reader needs to
+    act on ("23 sentences missing"), falling back to the verbose check summary for
+    any check that didn't set one."""
+    return iss.get("problem") or iss["summary"]
+
+
 def _attention_reason(r) -> str:
     """Plain-text reason for a warn/fail/skip row: the first verify issue (with a
     +N for the rest), else the error, else a bare status."""
     if r.verify_issues:
         more = f"  (+{len(r.verify_issues) - 1} more)" if len(r.verify_issues) > 1 else ""
-        return r.verify_issues[0]["summary"] + more
+        return _issue_text(r.verify_issues[0]) + more
     if r.error:
         return r.error
     if r.verify_status and r.verify_status != "ok":
@@ -220,6 +227,17 @@ class RichUI(Events):
         self._set_phase("Removing headers/footers…")
         self._refresh()
 
+    def model_notes(self, notes):
+        """Print a small box above the live area with the pre-flight model warnings."""
+        if not notes:
+            return
+        icon = {"error": "[red]✗[/]", "warn": "[yellow]⚠[/]", "info": "[cyan]ℹ[/]"}
+        body = "\n".join(f"{icon.get(n['level'], '·')} {n['msg']}" for n in notes)
+        worst = ("red" if any(n["level"] == "error" for n in notes)
+                 else "yellow" if any(n["level"] == "warn" for n in notes) else "cyan")
+        self.con.print(Panel(Text.from_markup(body), title="model check",
+                             title_align="left", border_style=worst, padding=(0, 1)))
+
     def chrome_done(self, report):
         self._setup.append(f"[green]✔[/] headers [dim]({report.get('images_removed', 0)})[/]")
         self._set_phase("Reading cover page…")
@@ -362,7 +380,7 @@ class RichUI(Events):
         # assessable without opening verify_report.md
         for iss in r.verify_issues or []:
             t = Text.from_markup(f"      {_ICON.get(iss['status'], '[yellow]⚠[/]')} ")
-            t.append(_clip(iss["summary"], 74), style="dim")
+            t.append(_clip(_issue_text(iss), 74), style="dim")
             self.con.print(t)
 
     def _tally(self):
@@ -411,12 +429,20 @@ class RichUI(Events):
             r = results[0]
             t.add_row("document", r.stem)
             if r.text_cov is not None:
-                t.add_row("text", f"[dim]{r.text_cov}% coverage[/]")
+                # in-place (strict) headline, with the effective figure when the recovery
+                # appendix closed some gaps, and the before→after delta when fixes ran
+                cell = f"[dim]{r.text_cov}% in-place[/]"
+                if r.text_cov_effective is not None and r.text_cov_effective > r.text_cov:
+                    cell += (f"   [green]{r.text_cov_effective}% incl. recovered"
+                             f" (+{r.postfix_recovered})[/]")
+                if r.text_cov_before is not None and r.text_cov_before != r.text_cov:
+                    cell += f"   [grey58](was {r.text_cov_before}%)[/]"
+                t.add_row("text", cell)
             if r.verify_status:
                 t.add_row("verify", f"[{_VCOLOR.get(r.verify_status, 'yellow')}]{r.verify_status}[/]")
             for iss in r.verify_issues or []:    # the why, so warn/fail is assessable here
                 cell = Text.from_markup(f"{_ICON.get(iss['status'], '[yellow]⚠[/]')} ")
-                cell.append(_clip(iss["summary"], 64), style="dim")
+                cell.append(_clip(_issue_text(iss), 64), style="dim")
                 t.add_row("", cell)
             if r.postfixes_applied:
                 for postfix in r.postfixes_applied:
@@ -431,7 +457,14 @@ class RichUI(Events):
         t.add_row("figures", f"[green]{sum(r.figures for r in results)} placed[/]")
         t.add_row("tables", f"[green]{n_tbl}[/]"
                   + (f"   [dim]{cov}% word coverage[/]" if cov is not None else ""))
-        t.add_row("cost", f"[b]{fmt_eur(self._cost)}[/]")
+        # "repair" (main pipeline) and "postfix" (improve-only) are the same phase
+        repair = sum((r.phase_cost or {}).get("repair", 0.0)
+                     + (r.phase_cost or {}).get("postfix", 0.0) for r in results)
+        cost_cell = f"[b]{fmt_eur(self._cost)}[/]"
+        if repair:
+            cost_cell += (f"   [dim]conversion {fmt_eur(self._cost - repair)}"
+                          f" + repair {fmt_eur(repair)}[/]")
+        t.add_row("cost", cost_cell)
 
         attention = [r for r in results if r.status in ("warn", "fail", "skip")]
         if batch and attention:

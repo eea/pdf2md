@@ -49,7 +49,13 @@ def _try_source_titles(ctx) -> tuple:
 
 def _qmd_headings(qmd_text: str) -> list:
     body = _FRONTMATTER_RE.sub("", qmd_text, count=1)
-    return [normalize(m.group(2)) for m in _HEADING_RE.finditer(body) if normalize(m.group(2))]
+    out = []
+    for m in _HEADING_RE.finditer(body):
+        # drop Quarto anchor attrs ("Scope {#sec-1-2}") — they'd pollute matching
+        t = normalize(re.sub(r"\{[^}]*\}", " ", m.group(2)))
+        if t:
+            out.append(t)
+    return out
 
 
 def _fuzzy(text: str) -> str:
@@ -101,18 +107,29 @@ class HeadingHierarchyCheck:
 
         findings = []
 
-        # ── map each source heading to its position in the .qmd (first fuzzy
-        #    match, tolerant of section-number and punctuation differences) ──
+        # ── map each source heading to its position in the .qmd, tolerant of
+        #    section-number and punctuation differences. Each .qmd heading is claimed
+        #    AT MOST ONCE: ATBDs repeat a title across sections ("4.2 Retrieval
+        #    algorithm", "5.2 …"), and _fuzzy strips the section number, so plain
+        #    first-match sent every copy to the FIRST .qmd occurrence — reading as huge
+        #    false reordering (measured: 24 "reordered" on one doc, all artefact).
+        #    Matching the first UNUSED occurrence gives the Kth source copy the Kth
+        #    .qmd copy, in order; excess source copies (more than the .qmd has) are
+        #    missing. Consuming positions also avoids the cascade that a monotonic
+        #    pointer would cause (it inflates the missing count instead). ──
         qmd_keys = [_fuzzy(t) for t in qmd_titles]
         matched_positions = []
         missing = []
+        used = set()
         for title in toc_titles:
             key = _fuzzy(title)
-            pos = next((i for i, q in enumerate(qmd_keys) if _similar(key, q)), None)
+            pos = next((i for i, q in enumerate(qmd_keys)
+                        if i not in used and _similar(key, q)), None)
             if pos is None:
                 missing.append(title)
             else:
                 matched_positions.append(pos)
+                used.add(pos)
         for title in missing[:_MAX_LISTED]:
             findings.append(Finding(f"source heading missing from the .qmd: “{title}”",
                                     "warn", "headings"))
@@ -126,17 +143,30 @@ class HeadingHierarchyCheck:
                 f"{reordered} surviving heading(s) appear out of their source order",
                 "warn", "headings"))
 
-        # ── count mismatch ──
-        if abs(len(qmd_titles) - len(toc_titles)) > max(1, int(len(toc_titles) * _COUNT_TOLERANCE)):
+        # ── count mismatch: only a DEFICIT matters. The .qmd having MORE headings than
+        #    the bookmark outline is normal — the converter adds finer sub-headings the
+        #    outline omits (measured: 53 vs 41 on an ATBD, all legitimate). That is
+        #    structure gained, not lost; warn only on a real shortfall vs the outline. ──
+        deficit = len(toc_titles) - len(qmd_titles)
+        if deficit > max(1, int(len(toc_titles) * _COUNT_TOLERANCE)):
             findings.append(Finding(
-                f"source outline has {len(toc_titles)} heading(s) but the .qmd has "
+                f"source outline has {len(toc_titles)} heading(s) but the .qmd has only "
                 f"{len(qmd_titles)}", "warn", "headings"))
 
         status = "warn" if findings else "ok"
         summary = (f"{len(qmd_titles)} heading(s); {len(missing)} missing, "
                    f"{reordered} reordered vs the source outline")
+        # terse line leads with the reliable, actionable signal (missing count);
+        # "reordered" is noisy so it's the fallback only when nothing is missing
+        if missing:
+            problem = f"{len(missing)} heading{'s' if len(missing) != 1 else ''} missing"
+        elif reordered:
+            problem = f"{reordered} heading(s) out of order"
+        else:
+            problem = "heading count differs from source"
         return CheckResult(
             self.name, status, summary,
+            problem=problem if findings else None,
             metric=f"{len(qmd_titles)} headings, {reordered} reordered",
             findings=findings,
         )

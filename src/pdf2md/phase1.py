@@ -172,6 +172,11 @@ def run_phase1(
         timeout=timeout,
         workers=detect_workers,
     )
+    # split off excluded-table regions before the figure pipeline: they must not
+    # block oversized-table cropping or be materialized — they only ride along to
+    # the sidecar for the table-repair postfix
+    excluded_tables = [r for r in regions if r.rtype == "table"]
+    regions = [r for r in regions if r.rtype != "table"]
 
     # ── Step 2b: oversized tables (local), crop as figures ─────────────────────
     # the convert LLM silently drops huge tables (thousands of cells blow its
@@ -192,10 +197,26 @@ def run_phase1(
     figures = materialize_figures(
         working_pdf, regions, media_dir, dpi=figure_dpi, refine=refine
     )
-    others = [r for r in regions if r.rtype != "figure"]
+    others = [r for r in regions if r.rtype != "figure"] + excluded_tables
 
-    inject_placeholders(working_pdf, figures, placeholders_pdf)
-    write_sidecar(sidecar, figures, others, cover=cover_block)
+    # table placeholders: box substantial table regions like figures, so the
+    # whole-doc pass emits markers and Pass 2 fills them from focused crops
+    from .tableslots import build_table_slots
+    try:
+        table_slots, tbl_boxes = build_table_slots(working_pdf, figures, excluded_tables)
+    except Exception as e:                  # noqa: BLE001 — never abort Phase 1
+        log.warning("table-slot scan failed (%s) — tables stay inline", e)
+        table_slots, tbl_boxes = [], []
+
+    inject_placeholders(working_pdf, figures + tbl_boxes, placeholders_pdf)
+    size_mb = placeholders_pdf.stat().st_size / 1e6
+    if size_mb > 20:
+        log.warning(
+            "placeholders.pdf is still %.0f MB after figure redaction (~%.0f MB as "
+            "base64) — the conversion upload may be rejected. Large undetected "
+            "rasters (full-page maps, backgrounds) are the usual cause.",
+            size_mb, size_mb * 1.37)
+    write_sidecar(sidecar, figures, others, cover=cover_block, table_slots=table_slots)
 
     summary = {
         "chrome_images_removed": chrome_report["images_removed"],

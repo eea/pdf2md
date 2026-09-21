@@ -116,6 +116,75 @@ class TestFigurePlacementCheck:
         msgs = " ".join(f.message for f in r.findings)
         assert "FIG_2" in msgs and "FIG_9" in msgs
 
+    def test_sets_terse_problem_on_unresolved_token(self, tmp_path):
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        figs = [{"fig_id": "FIG_1", "file": "img-a.png", "page": 0, "bbox": [0, 0, 1, 1]}]
+        qmd = "![cap](FIG_9)\n"                       # unresolved token → fail
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, figs))
+        assert r.status == "fail" and r.problem == "1 figure token(s) unresolved"
+
+    def test_no_detections_falls_back_to_media_dir(self, tmp_path):
+        # detections.json gone (cleaned-up / improve-only rerun): crops on disk
+        # are the inventory — no "unknown crop" spam, no misleading "0/0" summary
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        (tmp_path / "img-a.png").write_bytes(b"x")
+        qmd = "![cap](dir-media/img-a.png)\n"
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, []))
+        assert r.status == "ok"
+        assert "no detection inventory" in r.summary and "1 image reference" in r.summary
+
+    def test_no_detections_missing_file_still_warns(self, tmp_path):
+        from pdf2md.verify.checks.figure_placement import FigurePlacementCheck
+        qmd = "![cap](dir-media/img-gone.png)\n"
+        r = FigurePlacementCheck().run(self._ctx(tmp_path, qmd, []))
+        assert r.status == "warn"
+        assert any("img-gone.png" in f.message for f in r.findings)
+
+
+# ── footnote_placement mark counting ─────────────────────────────────────────────
+
+class TestFootnoteMarkCounting:
+    def test_unit_superscripts_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("6,002,168 km² (covering the EEA-38 + UK)") == 0
+        assert _line_footnote_marks("Sealed: 0 m² and 90,000km² grouped") == 0
+        assert _line_footnote_marks("a volume of 3 m³ was measured") == 0
+
+    def test_real_footnote_mark_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("the nomenclature³ was applied") == 1
+        assert _line_footnote_marks("see the guidance¹ and annex") == 1
+
+    def test_exponent_on_symbol_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _line_footnote_marks
+        assert _line_footnote_marks("with a R² higher than 0.9") == 0
+        assert _line_footnote_marks("(σ⁰) of wet snow in comparison") == 0
+
+    def test_math_caret_not_counted(self):
+        from pdf2md.verify.checks.footnote_placement import _CARET_REF
+        assert not _CARET_REF.findall("(floor(B/2^7) %% 2 == 0)")
+        assert _CARET_REF.findall("as noted^1 in the manual")
+
+
+# ── math_presence line classification ────────────────────────────────────────────
+
+class TestMathLineClassification:
+    def test_real_equation_counts(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        assert _line_is_math("σ = √(∑ w² σ²)")
+        assert _line_is_math("x = ∫ f(t) dt + ε")
+        assert _line_is_math("$$\\sigma = 1$$")
+
+    def test_error_bar_prose_not_math(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        # accuracy prose with ± glyphs — reads as math on a raw symbol count
+        assert not _line_is_math("89.9% (± 1.90%) in Italy-Malta, 89.9% (± 1.50%) in Portugal")
+
+    def test_table_row_with_set_notation_not_math(self):
+        from pdf2md.verify.checks.math_presence import _line_is_math
+        assert not _line_is_math("| Broadleaved trees | Water ∪ Biotic ∪ Abiotic | NO |")
+        assert not _line_is_math("<td>Water ∪ Biotic ∪ Abiotic</td>")
+
 
 # ── structural_counts (qmd table counter) ────────────────────────────────────────
 
@@ -174,7 +243,7 @@ class TestTableCoverage:
         from pdf2md.verify.checks import table_coverage as tc
         present = [f"word{i}" for i in range(40)]
         absent = [f"absent{i}" for i in range(40)]      # a whole big table missing
-        monkeypatch.setattr(tc, "_source_grids", lambda p: [present, absent])
+        monkeypatch.setattr(tc, "_source_grids", lambda p: [(0, present), (4, absent)])
         r = tc.TableCoverageCheck().run(self._ctx(tmp_path, self._qmd_with_words(present)))
         assert r.status == "warn"          # weighted ~50% < 85%
         assert r.metric < 85
@@ -190,7 +259,7 @@ class TestTableCoverage:
         from pdf2md.verify.checks import table_coverage as tc
         present = [f"word{i}" for i in range(40)]
         fragment = ["x", "y", "z"]                       # a find_tables sliver (3 tokens)
-        monkeypatch.setattr(tc, "_source_grids", lambda p: [present, fragment])
+        monkeypatch.setattr(tc, "_source_grids", lambda p: [(0, present), (1, fragment)])
         r = tc.TableCoverageCheck().run(self._ctx(tmp_path, self._qmd_with_words(present)))
         assert r.status == "ok"            # weighted ~93% ≥ 85%; sliver can't trip it
         assert r.findings == []            # fragment filtered out of diagnostics (< _MIN_TOKENS)
@@ -284,6 +353,68 @@ def test_write_report(tmp_path):
     assert data["overall"] == "warn" and len(data["checks"]) == 2
 
 
+def test_report_folds_before_after_repair_delta(tmp_path):
+    # the single verify report must carry the before→after coverage inline
+    # (no separate postfix_report.md) and print the FINAL numbers
+    results = [
+        CheckResult("text_coverage", "warn", "…", metric=99.2,
+                    detail={"missing_count": 5, "total": 354}),
+        CheckResult("table_coverage", "ok", "…", metric=95.9, detail={"n_tables": 8}),
+    ]
+    meta = {"stem": "d", "postfixes": ["missing_text: 8 items recovered from 6 pages"],
+            "text_cov_before": 98.6, "table_cov_before": 95.1}
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    assert "text 98.6% → 99.2%" in text and "tables 95.1% → 95.9%" in text
+    assert "already include automatic repairs" in text
+    assert "postfix_report.md" not in text          # no pointer to a second file
+    assert not (tmp_path / "postfix_report.md").exists()
+
+
+def test_write_report_header_costs(tmp_path):
+    results = [CheckResult("a", "ok", "fine")]
+    meta = {"stem": "doc", "pages": 131, "model": "m", "date": "23 Jul 2026",
+            "cost_convert": 4.59, "cost_repair": 0.22}
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    header = text.splitlines()[2]
+    assert "conversion" in header and "repair" in header
+    assert "131 pages" in header
+    # repair bit is dropped when nothing was repaired
+    meta.pop("cost_repair")
+    text = write_report(results, tmp_path, meta=meta).read_text()
+    assert "conversion" in text.splitlines()[2] and "repair" not in text.splitlines()[2]
+
+
+def test_write_report_format(tmp_path):
+    results = [
+        CheckResult("text_coverage", "warn", "96.5% of source text found", metric=0.965,
+                    detail={"effective": 0.992, "recovered": 10, "missing_count": 16,
+                            "reworded_count": 4, "total": 500, "present": 480,
+                            "clusters": [{"pages": (84, 86), "count": 9,
+                                          "samples": ["Some missing sentence here."],
+                                          "qmd_heading": "Annex 2"}],
+                            "scattered": 7}),
+        CheckResult("table_coverage", "ok", "tables fine", metric=0.98,
+                    detail={"n_tables": 12, "thin": []}),
+        CheckResult("figure_placement", "ok", "80/86 figures placed"),
+    ]
+    meta = {"stem": "doc", "pages": 131, "model": "google/gemini-2.5-flash",
+            "date": "23 Jul 2026", "postfixes": ["tables: re-emitted 2 missing table(s)"]}
+    p = write_report(results, tmp_path, meta=meta)
+    text = p.read_text()
+    # machine-readable line replay depends on
+    assert "<!-- verify: overall=warn" in text and "text_coverage=0.965" in text
+    # no em/en dashes anywhere in generated output
+    assert "—" not in text and "–" not in text
+    # exactly one horizontal separator
+    assert text.count("\n---\n") == 1
+    # verdict icon, issue section, passed table
+    assert "\U0001F7E1" in text and "Annex 2" in text and "figure_placement" not in text
+    # replay can parse it back
+    from pdf2md.replay import _parse_verify_report
+    parsed = _parse_verify_report(p)
+    assert parsed["status"] == "warn" and parsed["metrics"]["text_coverage"] == 0.965
+
+
 # ── HTML-table awareness (complex tables emitted as raw HTML) ─────────────────
 
 class TestHtmlTableAwareness:
@@ -358,3 +489,169 @@ class TestWideTableLegibilityCheck:
         assert r.status == "warn"
         assert "6pt" in r.summary and "5pt" in r.summary
         assert r.findings and r.findings[0].severity == "warn"
+
+# ── table_coverage: union matching (converter re-segments tables) ───────────────
+
+from pdf2md.verify.checks.table_coverage import (  # noqa: E402
+    _best_match, _tokens_of, _union_match,
+)
+
+
+def test_union_match_recovers_a_split_table():
+    # the converter split one source table across two .qmd tables; a single best-match
+    # sees only half, the union sees all of it
+    src = ["alpha beta gamma", "delta epsilon zeta"]
+    q1, q2 = ["alpha beta gamma"], ["delta epsilon zeta"]
+    _m, single = _best_match(src, [q1, q2])
+    matched, content, used = _union_match(_tokens_of(src), [_tokens_of(q1), _tokens_of(q2)])
+    assert single == 0.5
+    assert content == 1.0 and used == 2
+    assert matched == _tokens_of(src)
+
+
+def test_union_match_ignores_non_contributing_tables():
+    # unrelated .qmd tables must not be pulled into the union (keeps it bounded,
+    # so "spans a few tables" never degrades into "appears anywhere")
+    src = _tokens_of(["a b c d e f g h i j k l m n o p q r s t"])
+    qsets = [_tokens_of(["a b c d e f g h i j"])] + [_tokens_of(["zz"]) for _ in range(5)]
+    _matched, content, used = _union_match(src, qsets)
+    assert used == 1 and content == 0.5
+
+
+def test_union_match_empty_source_is_covered():
+    matched, content, used = _union_match(set(), [_tokens_of(["x y"])])
+    assert content == 1.0 and used == 0 and matched == set()
+
+
+class TestLayoutArtifact:
+    """_is_layout_artifact: drop whole-page prose that find_tables misreads as a table
+    (<=2 populated rows) and printed TOCs, but keep real multi-row full-page tables."""
+
+    class _Page:
+        def __init__(self, text): self._t = text
+        def get_text(self): return self._t
+
+    def test_sidebar_prose_is_rejected(self):
+        # whole page in ~1 populated row (flowing text + grey side column) → artifact
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        prose = ("Users should use the VPP parameter layers together with their "
+                 "corresponding quality assurance layers for most applications.")
+        rows = [[prose, "5.0 Issue 2.0 Copernicus Land Monitoring Service EEA"]]
+        page = self._Page(prose + " 5.0 Issue 2.0 Copernicus Land Monitoring Service EEA")
+        assert _is_layout_artifact(page, rows) is True
+
+    def test_real_full_page_table_is_kept(self):
+        # fills the page BUT has many populated rows → real table, keep it
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        rows = [["Band", "Resolution", "Unit"], ["PPI", "500 m", "index"],
+                ["QFLAG", "500 m", "bitmask"], ["SOSD", "500 m", "day"],
+                ["EOSD", "500 m", "day"], ["MAXV", "500 m", "index"]]
+        page = self._Page("Band Resolution Unit PPI 500 m index QFLAG bitmask SOSD "
+                          "day EOSD MAXV")
+        assert _is_layout_artifact(page, rows) is False
+
+    def test_toc_is_rejected(self):
+        from pdf2md.verify.checks.table_coverage import _is_layout_artifact
+        rows = [["1 Introduction ........... 4"], ["2 Product overview ....... 8"],
+                ["3 Algorithm ............. 12"], ["4 File naming ........... 25"]]
+        page = self._Page("contents 1 Introduction 4 2 Product overview 8 3 Algorithm 12")
+        assert _is_layout_artifact(page, rows) is True
+
+
+class TestProseCallout:
+    def test_prose_callout_detected(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        # one populated column of paragraph text (other column empty) -> prose box
+        rows = [["Although longer time series are generally preferred in phenology "
+                 "estimation because they improve smoothing stability and reduce edge "
+                 "effects, a shorter window can still work well.", ""],
+                ["Nevertheless regions with irregular seasonality or persistent cloud "
+                 "contamination may remain more sensitive to the input window length.", ""]]
+        assert _is_prose_callout(rows) is True
+
+    def test_two_column_glossary_kept(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        rows = [["SOSD", "start of season date, the day the season begins for the pixel"],
+                ["EOSD", "end of season date, the day the season ends for the pixel"],
+                ["MAXD", "date of maximum value within the growing season for the pixel"]]
+        assert _is_prose_callout(rows) is False   # 2 populated columns -> real table
+
+    def test_short_value_table_kept(self):
+        from pdf2md.verify.checks.table_coverage import _is_prose_callout
+        rows = [["Band", "Res"], ["PPI", "500m"], ["QA", "500m"]]
+        assert _is_prose_callout(rows) is False
+
+    def test_formula_region_excluded(self):
+        from pdf2md.verify.checks.table_coverage import _is_formula
+        # a numbered equation find_tables misreads as a 1-row 2-col "table"
+        assert _is_formula([["NDSI= (P_green - P_SWIR1)/(P_green + P_SWIR1).", "(Eq. 2)"]]) is True
+        # operator-dense single line without a label still recognised
+        assert _is_formula([["BSI = ((a+b)-(c+d))/((a+b)+(c+d))"]]) is True
+        # a real 2-column data table is NOT a formula
+        assert _is_formula([["Band", "Resolution"], ["PPI", "500m"], ["QA", "500m"]]) is False
+        # a revision/change-log table is NOT excluded anymore (kept + counted)
+        assert _is_formula([["Ed.", "Rev.", "Date", "Purpose"],
+                            ["1", "0", "28/01/2020", "Creation"]]) is False
+
+
+class TestHeadingOccurrenceMatch:
+    def test_repeated_titles_not_false_reordered(self, tmp_path):
+        # a doc that repeats a section title (ATBD pattern) must not read as reordered
+        import fitz
+        from pdf2md.verify.checks.heading_hierarchy import HeadingHierarchyCheck
+        from pdf2md.verify import VerifyContext
+        doc = fitz.open()
+        for _ in range(8):
+            doc.new_page()
+        doc.set_toc([[1, "Section A", 1], [2, "Retrieval algorithm", 1],
+                     [1, "Section B", 3], [2, "Retrieval algorithm", 3],
+                     [1, "Section C", 5], [2, "Retrieval algorithm", 5]])
+        src = tmp_path / "d.source.pdf"; doc.save(str(src)); doc.close()
+        qmd = ("# Section A\n\n## Retrieval algorithm\n\ntext\n\n"
+               "# Section B\n\n## Retrieval algorithm\n\ntext\n\n"
+               "# Section C\n\n## Retrieval algorithm\n\ntext\n")
+        ctx = VerifyContext(run_dir=tmp_path, original_pdf=src, working_pdf=src,
+                            qmd_path=tmp_path / "d.qmd", qmd_text=qmd,
+                            detections={}, media_dir=tmp_path)
+        r = HeadingHierarchyCheck().run(ctx)
+        assert "0 reordered" in r.summary or "reordered" not in r.summary, r.summary
+
+
+def test_uri_in_qmd_normalizes_doubled_doi():
+    from pdf2md.verify.checks.link_preservation import _uri_in_qmd
+    # fitz's single-slash doubled-DOI annotation matches a collapsed body
+    ann = "https://doi.org/https:/doi.org/10.1016/j.rse.2020.111685"
+    body = "see <https://doi.org/10.1016/j.rse.2020.111685>.".lower()
+    assert _uri_in_qmd(ann, body) is True
+    # a genuinely-absent link still reports missing
+    assert _uri_in_qmd("https://example.org/gone", body) is False
+
+
+def test_is_cover_or_toc_catches_midsentence_and_plaindigit_affiliations():
+    from pdf2md.verify.checks.text_coverage import _is_cover_or_toc
+    # actual MRVPP page-2 cover sentences that leaked into "missing text"
+    s1 = ("Copernicus Land Monitoring Service (CLMS) Project Officer: Luca Battistella "
+          "European Environment Agency (EEA) Kongens Nytorv 6 - 1050 Copenhagen K.")
+    s2 = ("Hongxiao Jin1, Zhanzhang Cai1, Lars Eklundh1, Else Swinnen2, Walter Horsten2, "
+          "Tim Ng2 1) ULUND, 2) VITO Disclaimer:")
+    assert _is_cover_or_toc(s1) is True      # mid-sentence "Project Officer:"
+    assert _is_cover_or_toc(s2) is True      # "1) ULUND, 2) VITO" + "Disclaimer:"
+    # body prose must NOT be filtered
+    assert _is_cover_or_toc(
+        "The project officer roles are defined in section 2, and the model runs daily.") is False
+    assert _is_cover_or_toc(
+        "We fit a spline to the PPI time series to reduce noise across seasons.") is False
+
+
+def test_link_preservation_skips_editor_links_and_matches_doi_core():
+    from pdf2md.verify.checks.link_preservation import _EDITOR_LINK_RE, _uri_in_qmd
+    # #1 draw.io / diagrams.net editor links are excluded (figure-editor, not citations)
+    assert _EDITOR_LINK_RE.search("https://app.diagrams.net/?page-id=x#Gabc")
+    assert _EDITOR_LINK_RE.search("https://www.draw.io/?page-id=x#Gabc")
+    assert not _EDITOR_LINK_RE.search("https://land.copernicus.eu/products/x")
+    # #2 proxy-host DOI matches on the bare core present in the body
+    ann = "https://doi-org.insu.bib.cnrs.fr/10.1016/0034-4257(89)90101-6"
+    body = "see https://doi.org/10.1016/0034-4257(89)90101-6 for details".lower()
+    assert _uri_in_qmd(ann, body) is True
+    # a genuinely-absent URL still reports missing
+    assert _uri_in_qmd("https://example.org/gone", body) is False

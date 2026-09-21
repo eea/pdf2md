@@ -49,14 +49,44 @@ image reference EXACTLY in this form, on its own line:
 DOCUMENT BODY:
 
 - Transcribe EVERY line of body text — do not omit any sentence, list item, or
-  note. When in doubt, include it.
+  note. When in doubt, include it. This includes the LAST row of a table, even
+  when its cells are long or it sits alone at a page boundary — never truncate a
+  table early.
 - Produce clean Quarto/GitHub-flavored Markdown.
-- Headings: use #, ##, ### following the document's heading hierarchy. Do NOT keep
-  manual section numbers (e.g. "6.1") in the heading text — Quarto numbers sections.
+- Headings: use #, ##, ### following the document's heading hierarchy. Include
+  EVERY heading of the document — especially top-level chapter headings, which
+  often sit alone on a page or in decorative layout; skipping one orphans its
+  whole chapter.
+- KEEP the section number at the START of each heading exactly as printed — write
+  `## 4.2.6 Output data`, not `## Output data`. The number makes each heading UNIQUE,
+  which is essential: without it, repeated sub-section titles ("Output data",
+  "Assumptions", …) become identical and are easy to accidentally drop. A later
+  automated step removes the number for rendering (Quarto adds its own), so you do NOT
+  need to — just copy the number the document shows.
+- REPEATED STRUCTURE: many documents repeat the same sub-section skeleton across
+  several parent sections — e.g. several products or algorithms each with its own
+  "Assumptions", "Input data", "Output data", "Methodology", "Limitations". Because you
+  keep the section numbers (above), each of these is unique (4.2.6 vs 8.2.6). You MUST
+  emit the heading for EVERY occurrence, in EVERY parent section. Repetition is
+  EXPECTED and REQUIRED — never skip a heading because an earlier section had the same
+  title, and never merge a section's text into the previous one to avoid repeating its
+  heading. This matters most deep into a long document, where it is tempting to drop a
+  heading you have written many times before — do not.
 - Tables: see the dedicated TABLES section below. Tables are TEXT, not figures —
   never reference a table as FIG_n, even when it is colored, shaded, or grid-like.
 - Preserve lists (bullet/numbered), bold/italic, inline code/monospace for file
-  names and codes, footnotes, and superscripts/subscripts where present.
+  names and codes, and superscripts/subscripts where present.
+- Footnotes: a superscript footnote mark — a small raised digit that has a
+  matching note at the BOTTOM of the page — becomes [^n] at that exact spot, and
+  the page-bottom note becomes a matching definition line [^n]: placed after the
+  paragraph. Example:
+    "…the nomenclature³ was applied." with page-bottom note "3 See Annex 1."
+    →  "…the nomenclature[^3] was applied." plus the line "[^3]: See Annex 1."
+  Never drop the mark and never inline the footnote text into the sentence.
+  This is for BODY text. Inside a table cell, a footnote mark stays a superscript
+  (<sup>n</sup>) — do NOT write [^n] in a cell, it renders literally there.
+  Exponents (x², km²) and author affiliation marks are not footnotes — keep them
+  as superscripts everywhere.
 - Mathematical formulas and equations: transcribe as LaTeX math, NOT as HTML
   entities (NEVER write &sqrt; — it is not a valid entity) and NOT as plain
   sub/superscript text. Use $...$ for a formula INLINE in a sentence and $$...$$
@@ -68,6 +98,12 @@ DOCUMENT BODY:
   This applies ONLY to genuine mathematical expressions. Ordinary units and labels
   in prose (e.g. km², CO₂, "Level 2", "Strahler 2-9") stay as normal text or
   <sup>/<sub> — do NOT wrap those in math.
+  A NUMBERED or LABELLED equation MUST still be wrapped in $$…$$. Never emit a formula
+  as bare text carrying only a Quarto label — e.g. `NDSI= (Pgreen-PSWIR1)/(Pgreen+PSWIR1). {#eq:eq2}`
+  is WRONG (renders as literal text, subscripts lost, the label dangles). Write it as
+  `$$\text{NDSI} = (\rho_{green} - \rho_{SWIR1})/(\rho_{green} + \rho_{SWIR1})$$ {#eq-2}`.
+  Any standalone line that is a formula (has `=` with fractions, ρ/σ/µ, or sub/superscripts)
+  goes in $$…$$.
 - Preserve links as Markdown links.
 - Do NOT transcribe running headers/footers or page numbers.
 
@@ -81,12 +117,33 @@ If the document contains a printed TABLE OF CONTENTS (a page listing section tit
 with page numbers), do NOT transcribe it either — the rendering template builds its
 own TOC automatically from the headings you produce. Transcribing the printed TOC
 would produce a duplicate and garbled page-number references.
+Skip ONLY the contents listing itself — the lines that pair a section title with a
+page number. If any OTHER content shares that page — a table (or a row of one
+continued from the previous page), a heading, or a paragraph — you MUST still
+transcribe it. Never discard a whole page just because it also holds the TOC.
 
-Everything else — including the document-history table, introduction, and all body
-sections — is normal content and MUST be transcribed.
+Everything else — including the document-history / revision table, approval and
+distribution tables, introduction, and all body sections — is normal content and
+MUST be transcribed. Only the cover page and the printed TOC listing are dropped.
 
 TABLES (read carefully — classify each table first):
 Tables are TEXT, never figures. Never reference a table as FIG_n.
+
+CONTINUED AND ADJACENT TABLES (applies to BOTH pipe and HTML tables — decide this
+FIRST, before transcribing):
+- A table can continue onto the next page. You recognise a continuation because it
+  RESUMES the same columns with NO header row of its own (the header appeared on the
+  previous page). Treat it as ONE table: emit the header and its separator line
+  ONCE, then append the continuation rows. NEVER repeat the header row, and NEVER
+  emit a second separator (|---|) partway down — a separator in the middle of a
+  table breaks the rendering and splits it in two.
+- Two tables that sit next to each other are SEPARATE when the second has its OWN
+  header row OR a DIFFERENT number of columns. Put a blank line between them and
+  give each its own header + separator; never let one table's rows flow into the
+  next. (Document-control / front-matter pages often stack several small tables of
+  different widths back-to-back — keep each as its own table.)
+- Decide merge-vs-separate by HEADER PRESENCE and COLUMN COUNT, not by whether the
+  values happen to look similar.
 
 Decide whether the table is SIMPLE or COMPLEX before transcribing it.
 

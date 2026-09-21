@@ -5,7 +5,9 @@ token-bag level, per table, reporting per-table coverage. Catches dropped tables
 rows, or cells.
 """
 
+import math
 import re
+from collections import Counter
 
 from .. import CheckResult, Finding, register
 from ..textutil import normalize, top_level_html_tables
@@ -19,6 +21,8 @@ except ImportError:
 _GLOBAL_MIN = 0.85   # WARN if token-weighted coverage across all tables drops below this
 _CELL_HIT = 0.7      # a table is "thin" below this fraction of its words matched
 _MIN_TOKENS = 12     # ignore find_tables slivers as diagnostics (a 3-word piece isn't a table)
+_UNION_MAX = 4       # a source table may span at most this many .qmd tables
+_UNION_MIN_GAIN = 0.05   # ...and each must add >=5% of its tokens to join the union
 
 
 # Oversized tables (>= these) are cropped as figures, not transcribed, so they must NOT
@@ -34,34 +38,149 @@ def _is_oversized(rows: list) -> bool:
     return ncols >= _OVERSIZE_COLS or len(rows) * ncols >= _OVERSIZE_CELLS
 
 
+_TOC_LEADER_RE = re.compile(r"[.…]\s*\d{1,4}\s*$")   # "… 25" dotted-leader page ref
+
+
+def _is_toc(rows: list) -> bool:
+    """A Table of Contents region. We deliberately do NOT transcribe the printed TOC
+    (Quarto rebuilds it from headings), so it must not count as a missing source table.
+    Signature: most non-empty lines end in a page number, usually via a dotted leader."""
+    lines = [(" ".join(c.split()) if c else "") for row in rows for c in row]
+    lines = [ln for ln in lines if ln.strip()]
+    if len(lines) < 4:
+        return False
+    hits = sum(1 for ln in lines if _TOC_LEADER_RE.search(ln))
+    return hits / len(lines) >= 0.6
+
+
+def _is_prose_callout(rows: list) -> bool:
+    """A bordered prose paragraph (a note/callout box) that find_tables split into a
+    1-column "table" — one populated column of PROSE, not tabular values. It's body
+    text, scored by text_coverage, so it must not count as a table (and the postfix
+    un-tables it). A real 2-column glossary is spared: it has >=2 populated columns."""
+    import statistics
+    ncols = max((len(row) for row in rows), default=0)
+    populated_rows = sum(1 for row in rows if any(c and normalize(c) for c in row))
+    if ncols == 0 or populated_rows == 0:
+        return False
+    populated_cols = sum(
+        1 for c in range(ncols)
+        if sum(1 for row in rows if c < len(row) and row[c] and normalize(row[c]))
+        >= max(1, populated_rows) / 2)
+    cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
+    if not cells:
+        return False
+    median_words = statistics.median(len(c.split()) for c in cells)
+    return populated_cols <= 1 and median_words >= 12
+
+
+_EQ_LABEL_RE = re.compile(r"\(\s*eq(?:uation)?\.?\s*\d+\s*\)", re.I)
+
+
+def _is_formula(rows: list) -> bool:
+    """A find_tables region that is really a numbered equation, not a data table. The
+    converter renders these as $$…$$ math (scored by the equations check), so counting
+    them as tables understates coverage (measured: 4 spectral-index formulas on the ice
+    ATBD scored 26–51% while the equations were 100% present). Signature: a cell is an
+    equation label '(Eq. N)', or the region is a single line dominated by math — an '='
+    plus several fraction/relational operators — rather than tabular values."""
+    text = " ".join((c or "") for row in rows for c in row).strip()
+    if not text:
+        return False
+    if _EQ_LABEL_RE.search(text):
+        return True
+    populated_rows = sum(1 for row in rows if any((c or "").strip() for c in row))
+    if populated_rows <= 1 and "=" in text:
+        ops = sum(text.count(ch) for ch in "=/+()")
+        return ops >= 4          # operator-dense; a 2-value data row is not
+    return False
+
+
+def _is_layout_artifact(page, rows: list) -> bool:
+    """True when a find_tables region is not a data table we score against.
+
+    Four disjoint cases, none a data table we score against:
+
+    1. Page-layout false-positive — a sidebar or multi-column page layout that
+       find_tables misreads as a 2-col "table" spanning the whole page (measured: a
+       PUM with a full-height grey side-column scored every page as a phantom table,
+       dragging table coverage 98% -> 16%). Signature: the region's tokens are
+       essentially the whole page AND it has <=2 POPULATED rows — flowing text, not a
+       grid. The populated-row test is what spares a real full-page data table, which
+       fills the page too but has many rows (measured: phantoms 1-2 rows, real tables
+       7-28).
+    2. A printed Table of Contents (see _is_toc) — dropped from the output on purpose.
+    3. A prose callout box (see _is_prose_callout) — body text, not a table.
+    4. A numbered equation (see _is_formula) — rendered as $$…$$ math, not a table.
+
+    NOTE: revision/change-log tables are NOT excluded — they are kept in the output and
+    counted like any other table (policy: convert as much as possible).
+    """
+    if _is_toc(rows) or _is_prose_callout(rows) or _is_formula(rows):
+        return True
+    cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
+    if not cells:
+        return False
+    ctok = {t for c in cells for t in c.split()}
+    ptok = set(normalize(page.get_text()).split())
+    if not ctok or not ptok:
+        return False
+    fills_page = (len(ctok & ptok) / len(ctok) > 0.5
+                  and len(ctok) / len(ptok) > 0.6)
+    populated_rows = sum(1 for row in rows if any(c and normalize(c) for c in row))
+    return fills_page and populated_rows <= 2
+
+
 def _source_grids(pdf_path) -> list:
-    """Extract table grids, excluding running-header tables."""
-    from collections import Counter
+    """Extract table grids, excluding running header/footer chrome and page-layout
+    false-positives.
+
+    Chrome is stripped before conversion, so it must not be scored here — otherwise the
+    page footer, which find_tables reports as a table on EVERY page, reads as missing
+    content we removed on purpose (measured: 29 of 43 "tables" in one ATBD were footers,
+    dragging table coverage from ~97% to 87.8%). The fingerprint heuristic below cannot
+    catch them, because the page number makes every footer unique. `_is_layout_artifact`
+    additionally drops whole-page prose blocks a sidebar layout makes look like a table.
+    """
+    from ..textutil import _rect_center_in
+
+    try:
+        from ...marginchrome import detect_running_chrome
+        chrome = detect_running_chrome(pdf_path)
+    except Exception:                       # noqa: BLE001 — exclusion is best-effort
+        chrome = {}
 
     grids_raw = []
     doc = fitz.open(str(pdf_path))
     total_pages = doc.page_count
     try:
         for pno in range(total_pages):
+            boxes = chrome.get(pno, [])
             try:
-                for tab in doc[pno].find_tables().tables:
+                page = doc[pno]
+                for tab in page.find_tables().tables:
+                    if boxes and _rect_center_in(tab.bbox, boxes):
+                        continue
                     rows = tab.extract()
                     if _is_oversized(rows):
+                        continue
+                    if _is_layout_artifact(page, rows):
                         continue
                     cells = [normalize(c) for row in rows for c in row if c and normalize(c)]
                     if cells:
                         fp = " ".join(cells[:2])
-                        grids_raw.append((fp, cells))
+                        grids_raw.append((fp, pno, cells))
             except Exception:
                 continue
     finally:
         doc.close()
 
-    fp_counts = Counter(fp for fp, _ in grids_raw)
+    fp_counts = Counter(fp for fp, _pno, _ in grids_raw)
     threshold = max(3, total_pages * 0.5)
     running = {fp for fp, c in fp_counts.items() if c >= threshold}
 
-    return [cells for fp, cells in grids_raw if fp not in running]
+    # (page, cells) pairs, so findings can point at the source page
+    return [(pno, cells) for fp, pno, cells in grids_raw if fp not in running]
 def _html_table_grids(qmd_text: str) -> list:
     """One token-bag per top-level HTML table, nested-table text included. Coverage is
     token-overlap, so per-cell granularity isn't needed, and collapsing nested tables
@@ -123,6 +242,66 @@ def _best_match(src_cells, qmd_grids):
     return best, best_score
 
 
+def _token_weights(qmd_tok_sets: list) -> dict:
+    """IDF-style token weights. A token occurring in many .qmd tables proves nothing —
+    bare numbers ('475') and units ('small', '%') recur everywhere, so a table that never
+    converted can still collect them from unrelated tables and score as covered
+    (measured: 13 pages of missing tables still scored 97.5%). Rare tokens are the real
+    evidence a specific table survived.
+    """
+    df = Counter()
+    for s in qmd_tok_sets:
+        for t in s:
+            df[t] += 1
+    n = max(1, len(qmd_tok_sets))
+    # A token absent from every .qmd table is maximally rare, so it must carry the
+    # HIGHEST weight — it is the strongest evidence a table did not convert. Returning
+    # it as the default matters: weighting it 1.0 while present tokens scored 2-4
+    # inflated coverage instead of exposing gaps.
+    return {t: math.log(1 + n / (1 + c)) for t, c in df.items()}, math.log(1 + n)
+
+
+def _w(tok, weights, default):
+    return default if weights is None else weights.get(tok, default)
+
+
+def _weigh(toks, weights, default):
+    return sum(_w(t, weights, default) for t in toks)
+
+
+def _union_match(src_toks: set, qmd_tok_sets: list, weights: dict = None,
+                 wdefault: float = 1.0) -> tuple:
+    """Score a source table against the best-matching SET of .qmd tables.
+
+    The converter legitimately re-segments tables — splitting one source table across
+    several .qmd tables and merging others — so scoring against a single best match
+    counts present content as missing (measured: 91% single-match vs 98% actual on a
+    131-page manual). Greedily add whichever .qmd table contributes the most as-yet
+    unmatched tokens, while it contributes meaningfully. Bounded by _UNION_MAX and
+    _UNION_MIN_GAIN so this stays "spans a few tables", not "appears anywhere".
+    Returns (matched_tokens, coverage, n_tables_used).
+    """
+    if not src_toks:
+        return set(), 1.0, 0
+    total_w = _weigh(src_toks, weights, wdefault) or 1.0
+    remaining, matched, used = set(src_toks), set(), 0
+    for _ in range(_UNION_MAX):
+        best_toks, best_gain = None, 0.0
+        for q in qmd_tok_sets:
+            gain = _weigh(remaining & q, weights, wdefault)
+            if gain > best_gain:
+                best_toks, best_gain = q, gain
+        if best_toks is None or best_gain / total_w < _UNION_MIN_GAIN:
+            break
+        hit = remaining & best_toks
+        matched |= hit
+        remaining -= hit
+        used += 1
+        if not remaining:
+            break
+    return matched, _weigh(matched, weights, wdefault) / total_w, used
+
+
 @register
 class TableCoverageCheck:
     name = "table_coverage"
@@ -131,52 +310,72 @@ class TableCoverageCheck:
         return _FITZ_AVAILABLE and ctx.original_pdf and ctx.original_pdf.exists()
 
     def run(self, ctx) -> CheckResult:
-        src_grids = _source_grids(ctx.original_pdf)
+        src_grids = _source_grids(ctx.reference_pdf)
         if not src_grids:
             return CheckResult(self.name, "ok", "no source tables detected")
         qmd_grids = _qmd_grids(ctx.qmd_text)
 
-        # status is driven by token-WEIGHTED coverage, so find_tables fragmenting a
-        # table into low-scoring slivers can't trip a warn when content survived: a big
-        # table losing half its cells tanks the weighted number, a 5-word sliver can't.
-        per_table = []           # (i, score, src_cells, match, n_src_tokens)
-        total_toks = matched_toks = 0
-        for i, src in enumerate(src_grids, 1):
-            match, score = _best_match(src, qmd_grids)
-            ntoks = len(_tokens_of(src))
+        # Two numbers, because the converter re-segments tables:
+        #   content — tokens found across the few .qmd tables the source table spans.
+        #             This is cell FIDELITY and drives the status.
+        #   aligned — tokens found in a SINGLE best-matching .qmd table. A structure
+        #             signal: much lower than content means heavy split/merge.
+        # Token-WEIGHTED, so a find_tables sliver can't trip a warn while a big table
+        # losing half its cells does.
+        qmd_tok_sets = [_tokens_of(g) for g in qmd_grids]
+        weights, wdefault = _token_weights(qmd_tok_sets)
+        per_table = []           # (i, page, content, src_cells, matched_tokens, n_src_tokens)
+        total_toks = content_toks = aligned_toks = 0
+        for i, (pno, src) in enumerate(src_grids, 1):
+            stoks = _tokens_of(src)
+            ntoks = len(stoks)
+            matched, content, _used = _union_match(stoks, qmd_tok_sets, weights, wdefault)
+            wt = _weigh(stoks, weights, wdefault) or 1.0
+            aligned = max((_weigh(stoks & q, weights, wdefault) / wt for q in qmd_tok_sets),
+                          default=0.0) if ntoks else 1.0
             total_toks += ntoks
-            matched_toks += score * ntoks
-            per_table.append((i, score, src, match, ntoks))
+            content_toks += content * ntoks
+            aligned_toks += aligned * ntoks
+            per_table.append((i, pno, content, src, matched, ntoks))
 
-        weighted = (matched_toks / total_toks) if total_toks else 1.0
-        simple_avg = sum(t[1] for t in per_table) / len(per_table)
+        weighted = (content_toks / total_toks) if total_toks else 1.0
+        aligned_w = (aligned_toks / total_toks) if total_toks else 1.0
+        simple_avg = sum(t[2] for t in per_table) / len(per_table)
         status = "warn" if weighted < _GLOBAL_MIN else "ok"
 
         # diagnostics for substantial-but-thin tables only (slivers filtered). Severity
         # tracks the overall verdict: FYI when coverage is fine, the warn detail when not.
         sev = "warn" if status == "warn" else "info"
         findings = []
-        for i, score, src, match, ntoks in per_table:
-            if ntoks < _MIN_TOKENS or score >= _CELL_HIT:
+        thin = []
+        for i, pno, content, src, matched, ntoks in per_table:
+            if ntoks < _MIN_TOKENS or content >= _CELL_HIT:
                 continue
-            match_toks = _tokens_of(match or [])
+            thin.append({"table": i, "page": pno + 1, "pct": round(100 * content)})
             missing = []
             for c in dict.fromkeys(src):
                 ct = c.split()
-                if ct and sum(t in match_toks for t in ct) / len(ct) < 0.5:
+                if ct and sum(t in matched for t in ct) / len(ct) < 0.5:
                     missing.append(c[:80])
             findings.append(Finding(
-                f"table {i}: {round(100 * score)}% of words matched"
-                + (f"; e.g. missing {missing[:3]}" if missing else " (likely a mis-aligned match)"),
-                sev, f"table {i}"))
+                f"table {i}: {round(100 * content)}% of words matched"
+                + (f"; e.g. missing {missing[:3]}" if missing else ""),
+                sev, f"table {i}, p{pno + 1}"))
 
         wpct = round(100 * weighted, 1)
+        apct = round(100 * aligned_w, 1)
         avg = round(100 * simple_avg, 1)
+        n_thin = len(thin)
         return CheckResult(
             self.name, status,
-            f"{len(src_grids)} source table(s); weighted word coverage {wpct}% "
-            f"(simple avg {avg}%)"
+            f"{len(src_grids)} source table(s); word coverage {wpct}% "
+            f"(simple avg {avg}%; {apct}% single-table aligned)"
             + (f"; {len(findings)} substantial table(s) below {int(_CELL_HIT*100)}%"
                if findings else ""),
+            problem=(f"table coverage {wpct}%"
+                     + (f", {n_thin} table(s) thin" if n_thin else "")
+                     if status == "warn" else None),
             metric=wpct, findings=findings,
+            detail={"content": wpct, "aligned": apct, "thin": thin,
+                    "n_tables": len(src_grids)},
         )

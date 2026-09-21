@@ -17,13 +17,14 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# ── Seed per-unit costs (USD), from the 2026-06 calibration runs ────────────────
-# PUM:  detect 0.0294/2 candidate-pages ≈ 0.0147;  convert 0.194/9 pages ≈ 0.0216
-# QA:   detect 0 (no candidates);                  convert 0.180/4 pages ≈ 0.0450
-# convert/page varies a lot with table density, so seed toward the higher end.
-SEED_COVER_USD = 0.005                  # a flash cover call when it fires
-SEED_DETECT_USD_PER_CANDIDATE = 0.015
-SEED_CONVERT_USD_PER_PAGE = 0.035
+# ── Seed per-unit costs (USD) ───────────────────────────────────────────────────
+# Calibrated 2026-07 against google/gemini-2.5-flash with implicit prompt caching,
+# from 13 real conversions: detect ≈ $0.0011/candidate-page, convert ≈ $0.0013/page.
+# (The earlier seeds were ~15-25x too high — a pre-caching / costlier-model era.)
+# convert/page varies with table density, so the seed sits a little above the mean.
+SEED_COVER_USD = 0.001                  # a flash cover call when it fires
+SEED_DETECT_USD_PER_CANDIDATE = 0.0012
+SEED_CONVERT_USD_PER_PAGE = 0.002
 
 # band multipliers on the convert term (the uncertain one); detect is left tight
 _CONVERT_LOW = 0.5
@@ -39,7 +40,12 @@ def _read_json(path: Path):
 
 def load_calibration(out_root: Path) -> dict:
     """Aggregate real per-unit costs from sidecars under out_root/*/, falling back to
-    seed constants for any unit with no history."""
+    seed constants for any unit with no history.
+
+    Reads page/candidate counts from result.json's `est` block (which survives the
+    end-of-run cleanup); phase1.json is used only if it happens to still be around.
+    Only docs that actually spent are counted — a failed/skipped run (0 cost) would
+    otherwise drag the per-unit average to zero."""
     detect_cost = detect_pages = 0.0
     convert_cost = convert_pages = 0.0
     n_docs = 0
@@ -47,20 +53,25 @@ def load_calibration(out_root: Path) -> dict:
         for d in out_root.iterdir():
             if not d.is_dir() or d.name.startswith("_"):
                 continue
-            p1 = _read_json(d / "phase1.json")
             res = _read_json(d / "result.json")
-            if not p1 or not res:
+            if not res:
                 continue
-            n_docs += 1
             pc = res.get("phase_cost") or {}
-            cand = p1.get("pages_candidate") or 0
-            pages = p1.get("pages_total") or 0
-            if cand:
-                detect_cost += pc.get("detect", 0.0)
+            p1 = _read_json(d / "phase1.json") or {}
+            est = res.get("est") or {}
+            cand = p1.get("pages_candidate") or est.get("candidate_pages") or 0
+            pages = p1.get("pages_total") or est.get("pages") or 0
+            counted = False
+            if cand and pc.get("detect"):       # skip zero-spend (failed/skipped) runs
+                detect_cost += pc["detect"]
                 detect_pages += cand
-            if pages:
-                convert_cost += pc.get("convert", 0.0)
+                counted = True
+            if pages and pc.get("convert"):
+                convert_cost += pc["convert"]
                 convert_pages += pages
+                counted = True
+            if counted:
+                n_docs += 1
     return {
         "cover_usd": SEED_COVER_USD,
         "detect_usd_per_candidate": (detect_cost / detect_pages) if detect_pages
