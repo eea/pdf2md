@@ -518,6 +518,12 @@ class _TableAnalyzer(HTMLParser):
     Only the outermost table is measured (nested tables flagged, not counted). colspan
     is honored for the column count; for width estimation colspan>1 cells are skipped
     (they'd smear across columns) and single-span text lengths accumulate per column.
+
+    rowspan is tracked too: a cell spanning N rows occupies its columns in the N-1 rows
+    below, which start with fewer cells. Ignoring that shifts every later row leftwards
+    and files its text under the wrong column — a legend table whose first row carries
+    rowspan="19" cells measured its last column from the header alone, sized it too
+    narrow, and its widest word then printed past the table's right edge.
     """
 
     def __init__(self):
@@ -529,6 +535,8 @@ class _TableAnalyzer(HTMLParser):
         self.col_cursor = 0
         self.max_cols = 0
         self.row_span_sum = 0
+        self.cur_rowspan = 1
+        self.pending = {}          # col index -> rows still covered by a rowspan above
         self.col_len = {}          # col index -> max single-span cell text length
         self.col_tok = {}          # col index -> longest unbreakable token (word) length
         self._buf = []
@@ -542,7 +550,7 @@ class _TableAnalyzer(HTMLParser):
         if self.depth != 1:
             return
         if tag == "tr":
-            self.row_span_sum = 0
+            self.row_span_sum = sum(1 for n in self.pending.values() if n > 0)
             self.col_cursor = 0
         elif tag in ("td", "th"):
             d = dict(attrs)
@@ -550,6 +558,12 @@ class _TableAnalyzer(HTMLParser):
                 self.cur_span = max(1, int(d.get("colspan", "1")))
             except ValueError:
                 self.cur_span = 1
+            try:
+                self.cur_rowspan = max(1, int(d.get("rowspan", "1")))
+            except ValueError:
+                self.cur_rowspan = 1
+            while self.pending.get(self.col_cursor, 0) > 0:   # covered from above
+                self.col_cursor += 1
             self.in_cell = True
             self._buf = []
 
@@ -570,11 +584,15 @@ class _TableAnalyzer(HTMLParser):
                 self.col_len[c] = max(self.col_len.get(c, 0), len(text))
                 longest = max((len(w) for w in text.split()), default=0)
                 self.col_tok[c] = max(self.col_tok.get(c, 0), longest)
+            for c in range(self.col_cursor, self.col_cursor + self.cur_span):
+                self.pending[c] = self.cur_rowspan
             self.col_cursor += self.cur_span
             self.row_span_sum += self.cur_span
             self.in_cell = False
         elif tag == "tr":
             self.max_cols = max(self.max_cols, self.row_span_sum)
+            for c, n in list(self.pending.items()):           # this row is done
+                self.pending[c] = max(0, n - 1)
 
 
 def _analyze_html_table(inner: str):

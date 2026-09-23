@@ -1529,6 +1529,45 @@ class TestDropEmptyTableRows:
         twice, n2 = drop_empty_table_rows(once)
         assert n1 == 1 and n2 == 0 and once == twice
 
+    def test_shrinks_rowspans_that_covered_the_dropped_row(self):
+        """Dropping the filler row without shrinking the spans it accounted for
+        pushes the next row into a fully-covered slot: Pandoc then discards that
+        row's cells and still emits the bare comma (PA21 p11, class 8.3)."""
+        from pdf2md.resolve import drop_empty_table_rows
+        src = ('<table>\n'
+               '<tr><td rowspan="14">8. Water</td><td rowspan="5">8.2 Lakes</td>'
+               '<td colspan="2">8.2.1</td><td rowspan="8">RIVERS</td></tr>\n'
+               '<tr><td colspan="2" rowspan="2">8.2.4 wrapped title</td></tr>\n'
+               '<tr></tr>\n'
+               '<tr><td rowspan="3">8.3 Transitional</td>'
+               '<td colspan="2">8.3.1 Lagoons</td><td rowspan="3">MARINE</td></tr>\n'
+               '</table>')
+        out, n = drop_empty_table_rows(src)
+        assert n == 1
+        # spans reaching over the dropped row lose exactly one row …
+        assert '<td rowspan="4">8.2 Lakes</td>' in out
+        assert '<td colspan="2" rowspan="1">8.2.4 wrapped title</td>' in out
+        assert '<td rowspan="7">RIVERS</td>' in out
+        assert '<td rowspan="13">8. Water</td>' in out
+        # … and the row that follows keeps every cell
+        assert "8.3 Transitional" in out and "8.3.1 Lagoons" in out and "MARINE" in out
+
+    def test_leaves_spans_that_end_before_the_dropped_row(self):
+        from pdf2md.resolve import drop_empty_table_rows
+        src = ('<table><tr><td rowspan="2">a</td><td>b</td></tr>'
+               '<tr><td>c</td></tr><tr></tr><tr><td>d</td><td>e</td></tr></table>')
+        out, n = drop_empty_table_rows(src)
+        assert n == 1 and '<td rowspan="2">a</td>' in out   # span ended at row 2
+
+    def test_span_shrink_is_idempotent(self):
+        from pdf2md.resolve import drop_empty_table_rows
+        src = ('<table><tr><td rowspan="3">a</td><td>b</td></tr>'
+               '<tr></tr><tr><td>c</td></tr></table>')
+        once, n1 = drop_empty_table_rows(src)
+        twice, n2 = drop_empty_table_rows(once)
+        assert n1 == 1 and n2 == 0 and once == twice
+        assert '<td rowspan="2">a</td>' in once
+
 
 # ── Cover-page logic ──────────────────────────────────────────────────────────
 

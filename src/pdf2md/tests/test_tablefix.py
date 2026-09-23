@@ -14,6 +14,30 @@ from pdf2md.tablefix.transforms import (  # noqa: E402
 
 # ── Grid normalization: html_table_consistency ────────────────────────────────
 
+def test_analyzer_tracks_rowspan_for_column_widths():
+    """A cell spanning many rows occupies its columns below; ignoring that files every
+    later row's text under the wrong column and starves the real one (PA21 Table 2:
+    the MAES column was sized from its header alone and 'WOODLAND' printed past the
+    table's right edge)."""
+    from pdf2md.tablefix.transforms import _analyze_html_table, _colgroup_for
+    tbl = ('<table>'
+           '<tr><td rowspan="3">L1</td><td>1.1 first level two label</td>'
+           '<td rowspan="3">MAES</td></tr>'
+           '<tr><td>1.2 second level two label</td></tr>'
+           '<tr><td>1.3 third level two label</td></tr>'
+           '<tr><td>L1b</td><td>2.1 label</td><td>WOODLAND AND FOREST</td></tr>'
+           '</table>')
+    info = _analyze_html_table(tbl)
+    assert info["ncols"] == 3
+    # long words must be measured against the column they really occupy
+    assert info["col_tok"][2] == len("WOODLAND")
+    assert info["col_len"][2] == len("WOODLAND AND FOREST")
+    assert info["col_tok"][0] == len("L1b")
+    colgroup = _colgroup_for(3, info["col_len"], info["col_tok"])
+    widths = [float(part.split("%")[0]) for part in colgroup.split("width: ")[1:]]
+    assert widths[2] > widths[0]        # MAES column wider than the narrow level-1 one
+
+
 class TestHtmlTableConsistency:
     def test_header_wider_than_data_flagged(self):
         # Table-10 v1 pattern: header colspan 25, data rows 16

@@ -470,12 +470,55 @@ _EMPTY_TR_RE = re.compile(
 )
 
 
+# Cells whose rowspan reaches over a dropped row must shrink with it. Dropping the
+# row alone leaves every such span one row too long, so the NEXT row lands in a
+# fully-covered position: Pandoc silently discards all of its cells (data loss) and
+# still emits the bare comma the drop was meant to prevent.
+_TABLE_RE = re.compile(r"<table\b.*?</table\s*>", re.DOTALL | re.IGNORECASE)
+_TR_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr\s*>", re.DOTALL | re.IGNORECASE)
+_CELL_OPEN_RE = re.compile(r"<t[dh]\b([^>]*)>", re.IGNORECASE)
+_ROWSPAN_ATTR_RE = re.compile(r'rowspan\s*=\s*["\']?(\d+)', re.IGNORECASE)
+
+
+def _shrink_spans_over_empty_rows(qmd_text: str) -> str:
+    """Decrement every rowspan that covers a cell-less row, per table."""
+    def _fix(table_m):
+        html = table_m.group(0)
+        rows = list(_TR_RE.finditer(html))
+        empty_rows, spans = [], []
+        for ri, row in enumerate(rows):
+            opens = list(_CELL_OPEN_RE.finditer(row.group(1)))
+            if not opens:
+                empty_rows.append(ri)
+                continue
+            for cell in opens:
+                rs = _ROWSPAN_ATTR_RE.search(cell.group(1))
+                if not rs:
+                    continue
+                base = row.start(1) + cell.start(1)
+                spans.append({"row": ri, "n": int(rs.group(1)),
+                              "at": (base + rs.start(1), base + rs.end(1))})
+        if not empty_rows or not spans:
+            return html
+        for er in empty_rows:
+            for sp in spans:
+                if sp["row"] < er <= sp["row"] + sp["n"] - 1:
+                    sp["n"] -= 1
+        for sp in sorted(spans, key=lambda s: s["at"], reverse=True):
+            start, end = sp["at"]
+            html = html[:start] + str(max(1, sp["n"])) + html[end:]
+        return html
+
+    return _TABLE_RE.sub(_fix, qmd_text)
+
+
 def drop_empty_table_rows(qmd_text: str) -> tuple:
-    """Remove cell-less ``<tr>`` rows (whitespace/comments only) from HTML tables.
+    """Remove cell-less ``<tr>`` rows (whitespace/comments only) from HTML tables,
+    shrinking the rowspans that reached over them so the grid stays consistent.
 
     Returns (clean_text, count). Idempotent.
     """
-    out, n = _EMPTY_TR_RE.subn("", qmd_text)
+    out, n = _EMPTY_TR_RE.subn("", _shrink_spans_over_empty_rows(qmd_text))
     return out, n
 
 
