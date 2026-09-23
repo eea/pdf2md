@@ -467,20 +467,7 @@ def convert_one(
         result.timing["phase25"] = round(_time.perf_counter() - t_phase25, 3)
         result.tables = _count_tables(result.qmd)
 
-        # Phase 3 — render. A render failure is a warn; the .qmd is still produced.
         render_failed = False
-        t_render = _time.perf_counter()
-        if do_render and format == "qmd":
-            events.render_start()
-            ok, render_log = _render(out_dir, stem)
-            events.render_done(ok)
-            result.timing["render"] = round(_time.perf_counter() - t_render, 3)
-            if ok:
-                result.pdf_out = out_dir / f"{stem}.pdf"
-            else:
-                render_failed = True
-                result.error = "render failed (see render log)"
-                log.warning("Render failed for %s:\n%s", pdf.name, render_log[-1500:])
 
         # Phase 4 — verify
         results = []
@@ -531,6 +518,25 @@ def convert_one(
                 if ca.get("table") is not None:
                     result.table_cov = ca["table"]
             result.timing["postfix"] = round(_time.perf_counter() - t_postfix, 3)
+
+        # Phase 5 — render, last so the PDF matches the repaired .qmd. Verify has to
+        # run before postfix (each repair is gated on the check that found the problem)
+        # and postfix re-verifies its own output, so rendering earlier only produced a
+        # PDF missing every fix the run reported. A render failure is a warn; the .qmd
+        # is still produced.
+        t_render = _time.perf_counter()
+        if do_render and format == "qmd":
+            events.render_start()
+            ok, render_log = _render(out_dir, stem)
+            events.render_done(ok)
+            result.timing["render"] = round(_time.perf_counter() - t_render, 3)
+            if ok:
+                result.pdf_out = out_dir / f"{stem}.pdf"
+            else:
+                render_failed = True
+                result.error = "render failed (see render log)"
+                log.warning("Render failed for %s:\n%s", pdf.name, render_log[-1500:])
+
         result.timing["total"] = round(_time.perf_counter() - t0, 3)
         # final status = worst of render (warn) and verify (ok/warn/fail)
         sev = {"ok": 0, "warn": 1, "fail": 2}
