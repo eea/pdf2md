@@ -11,7 +11,7 @@ before the PDF->qmd conversion.
 Outputs (in out_dir):
     <stem>.working.pdf            chrome-stripped copy, kept for traceability
     <stem>.placeholders.pdf       working.pdf with each figure replaced by a [FIG_n] box
-    <stem>-media/img-<md5>.png    cropped illustration rasters
+    <stem>-media/img-<md5>.<ext>  figure rasters (verbatim stream where possible)
     detections.json               FIG_n -> file/page/bbox plus gate+chrome summary
 """
 

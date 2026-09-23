@@ -164,6 +164,8 @@ def adopt_unstamped_figures(body: str, figures: list, source_pdf: Path,
         return 0
     import hashlib
 
+    from .regions import extract_region
+
     page_of_known = {f["fig_id"]: f.get("page") for f in figures
                      if f.get("fig_id") and f.get("page") is not None}
     doc = fitz.open(str(source_pdf))
@@ -232,11 +234,12 @@ def adopt_unstamped_figures(body: str, figures: list, source_pdf: Path,
                 candidates.append(r)
             candidates.sort(key=lambda r: (round(r.y0), r.x0))
             for fid, rect in zip(fids, candidates):
-                mat = fitz.Matrix(_ADOPT_DPI / 72, _ADOPT_DPI / 72)
-                png = page.get_pixmap(matrix=mat, clip=rect).tobytes("png")
-                name = f"img-{hashlib.md5(png).hexdigest()}.png"
+                # same rule as the figure pipeline: copy the stored stream when the
+                # rect IS one image, else render (vector swatches always render)
+                data, ext, _how = extract_region(doc, page, tuple(rect), _ADOPT_DPI)
+                name = f"img-{hashlib.md5(data).hexdigest()}.{ext}"
                 media_dir.mkdir(parents=True, exist_ok=True)
-                (media_dir / name).write_bytes(png)
+                (media_dir / name).write_bytes(data)
                 figures.append({"fig_id": fid, "file": name, "page": pno,
                                 "bbox": list(rect), "rtype": "figure",
                                 "origin": "adopted-from-model"})

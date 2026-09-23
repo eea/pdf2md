@@ -1722,3 +1722,86 @@ class TestResolveHtmlImg:
         body = "![Figure 2. Flowchart.](FIG_2)\n"
         out, _ = resolve_fig_tokens(body, figs, tmp_path / "d.qmd", "doc-media")
         assert out.count("Figure 2.") == 1          # no double label
+
+
+# ── Figure materialization: verbatim streams + resolution-aware rendering ──────
+
+class TestMaterializeFigures:
+    """The extraction rule: copy the stored stream when the region IS one image,
+    otherwise render at the resolution the content actually has."""
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "pdf2md_edgecases.pdf"
+
+    def _doc(self):
+        fitz = pytest.importorskip("fitz")
+        return fitz, fitz.open(str(self.FIXTURE))
+
+    def _image_region(self, fitz, page):
+        """The refined bbox of the first image placement on a page."""
+        from pdf2md.regions import refine_bbox
+        info = page.get_image_info(xrefs=True)[0]
+        return info, refine_bbox(page, tuple(fitz.Rect(info["bbox"])))
+
+    def test_lone_image_is_copied_byte_for_byte(self):
+        from pdf2md.regions import extract_region
+        fitz, doc = self._doc()
+        try:
+            page = doc[8]                     # single full-width image, nothing on top
+            info, bbox = self._image_region(fitz, page)
+            data, ext, how = extract_region(doc, page, bbox)
+            assert how == "verbatim stream"
+            assert data == doc.extract_image(info["xref"])["image"]
+            assert ext == doc.extract_image(info["xref"])["ext"]
+        finally:
+            doc.close()
+
+    def test_render_never_exceeds_source_resolution(self):
+        from pdf2md.regions import _region_ink, _render_dpi
+        fitz, doc = self._doc()
+        try:
+            page = doc[6]                     # raster region that fails passthrough
+            info, bbox = self._image_region(fitz, page)
+            ink = _region_ink(page, bbox)
+            used = _render_dpi(page, bbox, ink, 300)
+            native = info["width"] / (fitz.Rect(info["bbox"]).width / 72)
+            assert used < 300 and used <= round(native) + 1
+        finally:
+            doc.close()
+
+    def test_text_over_image_keeps_full_dpi(self):
+        """The photo's 96 dpi must not decide how sharp the labels come out."""
+        from pdf2md.regions import _Ink, _render_dpi
+        fitz, doc = self._doc()
+        try:
+            page = doc[6]
+            _info, bbox = self._image_region(fitz, page)
+            assert _render_dpi(page, bbox, _Ink(1.0, True, False), 300) == 300
+            assert _render_dpi(page, bbox, _Ink(1.0, False, True), 300) == 300
+        finally:
+            doc.close()
+
+    def test_encoding_follows_content(self):
+        from pdf2md.regions import _Ink, _render
+        fitz, doc = self._doc()
+        try:
+            page = doc[6]
+            _info, bbox = self._image_region(fitz, page)
+            assert _render(page, bbox, 72, _Ink(0.95, True, False))[1] == "jpeg"
+            assert _render(page, bbox, 72, _Ink(0.0, False, True))[1] == "png"
+        finally:
+            doc.close()
+
+    def test_materialize_names_files_by_actual_format(self, tmp_path):
+        from pdf2md.regions import Region, materialize_figures
+        fitz, doc = self._doc()
+        try:
+            page = doc[8]
+            _info, bbox = self._image_region(fitz, page)
+        finally:
+            doc.close()
+        media = tmp_path / "media"
+        figs = materialize_figures(self.FIXTURE, [Region(page=8, bbox=bbox)], media)
+        assert figs[0].file.endswith(".png") and figs[0].fig_id == "FIG_1"
+        written = list(media.iterdir())
+        assert [p.name for p in written] == [figs[0].file]
+        assert hashlib.md5(written[0].read_bytes()).hexdigest() == figs[0].md5
