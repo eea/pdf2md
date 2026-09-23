@@ -199,6 +199,27 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     if n_tblblank:
         summary['postfixes_applied'].append(
             'tables: separated {} table(s) glued to a caption/heading'.format(n_tblblank))
+    # markdown safety: a list glued to the paragraph above renders as literal `*` text
+    cleaned, n_lstblank = _ensure_list_blanks(cleaned)
+    if n_lstblank:
+        summary['postfixes_applied'].append(
+            'lists: separated {} list(s) glued to a paragraph'.format(n_lstblank))
+    # the convert LLM skips background-color on big tables; sample it from the PDF
+    cleaned, n_tblcolor = _colorize_tables(cleaned, _body_pdf(out_dir, Path(qmd_path).stem))
+    if n_tblcolor:
+        summary['postfixes_applied'].append(
+            'tables: restored background colour on {} cell(s)'.format(n_tblcolor))
+    # markdown safety: consecutive image lines are one paragraph -> inline images
+    # with their captions discarded; restore blocks and the source's grid
+    try:
+        _det = json.loads((Path(out_dir) / 'detections.json').read_text(encoding='utf-8'))
+        _figs = _det.get('figures', [])
+    except Exception:                          # noqa: BLE001 — layout is best-effort
+        _figs = []
+    cleaned, n_imggrid = _group_image_rows(cleaned, _figs)
+    if n_imggrid:
+        summary['postfixes_applied'].append(
+            'figures: restored captions on {} image group(s)'.format(n_imggrid))
     # markdown safety: a |---| separator mid-table (glued/continued tables) breaks rendering
     cleaned, n_midsep = _fix_midtable_separators(cleaned)
     if n_midsep:
@@ -549,6 +570,292 @@ def _ensure_pipe_table_blanks(text):
         if is_header and out and out[-1].strip() and not re.match(r'^\s*\|', out[-1]):
             out.append('')
             n += 1
+        out.append(ln)
+    return '\n'.join(out), n
+
+
+# ── Table cell colours ────────────────────────────────────────────────────────
+# The convert LLM is told to put background-color on every <td> (see the prompt's
+# COLORS section) but silently skips it on big tables — styling 50+ cells roughly
+# doubles the output tokens. The colours are still in the PDF as vector fills, so
+# read them back instead of asking the model again.
+_TD_RE = re.compile(r'(<td\b[^>]*>)(.*?)(</td\s*>)', re.DOTALL | re.IGNORECASE)
+_TABLE_BLOCK_RE = re.compile(r'<table\b.*?</table\s*>', re.DOTALL | re.IGNORECASE)
+_STYLE_IN_TAG_RE = re.compile(r'style\s*=\s*(["\'])(.*?)\1', re.DOTALL | re.IGNORECASE)
+_CELL_FILL_MIN_W = 20.0    # ignore rules, borders and hairlines
+_CELL_FILL_MIN_H = 8.0
+_WHITE_LEVEL = 0.97        # near-white is "no fill" — leave the cell unstyled
+_PROBE_MIN_CHARS = 12      # a cell text long enough to locate a page with
+_PROBE_CELLS = 6           # how many such cells to probe per table
+
+
+def _cell_text_of(html_fragment):
+    """Plain text of a cell: tags stripped, entities decoded, whitespace collapsed."""
+    import html as _html
+    return ' '.join(_html.unescape(re.sub(r'<[^>]+>', ' ', html_fragment)).split())
+
+
+def _page_fills(page, fitz):
+    """Cell-sized filled rects on a page as (rect, '#RRGGBB'), skipping near-white."""
+    out = []
+    for drawing in page.get_drawings():
+        fill = drawing.get('fill')
+        if 'f' not in drawing['type'] or not fill:
+            continue
+        rect = fitz.Rect(drawing['rect'])
+        if rect.width < _CELL_FILL_MIN_W or rect.height < _CELL_FILL_MIN_H:
+            continue
+        if all(c >= _WHITE_LEVEL for c in fill[:3]):
+            continue
+        out.append((rect, '#%02X%02X%02X' % tuple(int(round(c * 255)) for c in fill[:3])))
+    return out
+
+
+def _fill_under(text, page, fills, fitz):
+    """The colour of the smallest filled rect containing this text on the page.
+
+    Smallest wins so a cell fill beats the row/table background painted behind it.
+    """
+    if not text:
+        return None
+    for probe in (text[:60], text[:30]):
+        try:
+            hits = page.search_for(probe)
+        except Exception:                      # noqa: BLE001 — odd glyphs, keep going
+            hits = None
+        for rect in hits or []:
+            mid = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+            covering = [f for f in fills if f[0].contains(mid)]
+            if covering:
+                return min(covering, key=lambda f: f[0].get_area())[1]
+    return None
+
+
+def _with_background(open_tag, color):
+    """Add background-color to a <td> tag, merging into an existing style attr."""
+    decl = 'background-color:%s' % color
+    m = _STYLE_IN_TAG_RE.search(open_tag)
+    if not m:
+        return open_tag[:-1].rstrip() + ' style="%s">' % decl
+    if 'background-color' in m.group(2).lower():
+        return open_tag                        # the model already coloured this cell
+    body = m.group(2).rstrip().rstrip(';')
+    return open_tag[:m.start(2)] + (body + '; ' + decl if body else decl) + open_tag[m.end(2):]
+
+
+def _colorize_tables(text, body_pdf):
+    """Restore table cell background colours by sampling the source PDF.
+
+    Deterministic: each cell's text is located on the page the table came from and
+    takes the colour of the fill beneath it. A cell that can't be located keeps
+    exactly what it has, so this can only add styling, never change content.
+    Returns (new_text, n_cells_coloured).
+
+    Nested tables inside a cell aren't handled — the <td> match is non-greedy and
+    would stop at the inner cell's close tag.
+    """
+    if not _TABLE_BLOCK_RE.search(text or ''):
+        return text, 0
+    try:
+        import fitz
+        doc = fitz.open(str(body_pdf))
+    except Exception as exc:                   # noqa: BLE001 — colours are best-effort
+        log.debug('table colours skipped (%s)', exc)
+        return text, 0
+
+    coloured = [0]
+    try:
+        page_fills = {}
+
+        def _fills_for(idx):
+            if idx not in page_fills:
+                page_fills[idx] = _page_fills(doc[idx], fitz)
+            return page_fills[idx]
+
+        def _colorize(table_m):
+            table = table_m.group(0)
+            cells = [_cell_text_of(m.group(2)) for m in _TD_RE.finditer(table)]
+            probes = [c for c in cells if len(c) >= _PROBE_MIN_CHARS][:_PROBE_CELLS]
+            if not probes:
+                return table
+            # the table's page is the one matching the most of its cell texts
+            best_n, best_i = 0, None
+            for i in range(doc.page_count):
+                n = sum(1 for p in probes if doc[i].search_for(p[:40]))
+                if n > best_n:
+                    best_n, best_i = n, i
+            if best_i is None:
+                return table
+            page, fills = doc[best_i], _fills_for(best_i)
+            if not fills:
+                return table
+
+            def _one(cell_m):
+                color = _fill_under(_cell_text_of(cell_m.group(2)), page, fills, fitz)
+                if not color:
+                    return cell_m.group(0)
+                tag = _with_background(cell_m.group(1), color)
+                if tag == cell_m.group(1):
+                    return cell_m.group(0)     # already coloured: nothing to report
+                coloured[0] += 1
+                return tag + cell_m.group(2) + cell_m.group(3)
+
+            return _TD_RE.sub(_one, table)
+
+        return _TABLE_BLOCK_RE.sub(_colorize, text), coloured[0]
+    finally:
+        doc.close()
+
+
+# An image line: `![caption](path)` with optional `{attrs}`, alone on its line.
+_IMG_LINE_RE = re.compile(r'^!\[(?P<cap>.*?)\]\((?P<path>[^)]+)\)(?P<attr>\{[^}]*\})?\s*$')
+
+
+# Typst sizes an image to its container, so an image with no width attribute fills
+# the text column whatever the source did. A photo the guide printed 210pt wide then
+# renders at 441pt — 2.1x too big and at half the resolution (92 dpi -> 44). Carry the
+# source's own width across for figures narrower than the column; wider ones already
+# fill it, and an absolute width there would overflow the margin.
+_TEXT_COLUMN_PT = 451.0    # A4 minus the template's 2.54cm side margins
+_WIDTH_SLACK_PT = 10.0     # don't bother for a figure already at column width
+
+
+def _with_width(line, det, match):
+    """Add {width=Npt} from the source placement, unless the line has attrs already."""
+    if match.group('attr') or not det:
+        return line
+    bbox = det.get('bbox')
+    if not bbox:
+        return line
+    width = bbox[2] - bbox[0]
+    if not 0 < width < _TEXT_COLUMN_PT - _WIDTH_SLACK_PT:
+        return line                        # full-width figure: let it fill the column
+    return '%s{width=%.0fpt}' % (line.rstrip(), width)
+
+
+def _source_ncol(files, by_file):
+    """How many of these figures shared a row in the source PDF.
+
+    Figures on the same page whose bboxes overlap vertically were printed side by
+    side; the widest such row is the grid's column count. Unknown files (no
+    detection entry) simply don't vote; 1 means the source stacked them.
+    """
+    rows = []
+    for name in files:
+        det = by_file.get(name)
+        bbox = det.get('bbox') if det else None
+        if not bbox:
+            continue
+        page, y0, y1 = det.get('page'), bbox[1], bbox[3]
+        for row in rows:
+            if row['page'] == page and not (y1 <= row['y0'] or y0 >= row['y1']):
+                row['n'] += 1
+                row['y0'], row['y1'] = min(row['y0'], y0), max(row['y1'], y1)
+                break
+        else:
+            rows.append({'page': page, 'y0': y0, 'y1': y1, 'n': 1})
+    return max((r['n'] for r in rows), default=1)
+
+
+def _group_image_rows(text, figures):
+    """Give each image in a run its own block, wrapped in a Quarto layout div.
+
+    Consecutive image lines are ONE paragraph, so Pandoc emits them as inline
+    `#box(image(..))` and discards the alt text — every caption in a photo grid is
+    lost (256 of 378 images in a 226-page guide). Blank lines alone would restore the
+    captions but stack the grid one image per row; the layout div keeps both. The
+    column count is measured from the source geometry, not guessed.
+    Returns (new_text, n_groups)."""
+    by_file = {f['file']: f for f in (figures or []) if f.get('file')}
+    lines = text.split('\n')
+    out, n, i = [], 0, 0
+    in_div = False                             # inside a ::: layout div already written
+    while i < len(lines):
+        if not _IMG_LINE_RE.match(lines[i]):
+            stripped = lines[i].lstrip()
+            if stripped.startswith('::: {layout'):
+                in_div = True
+            elif stripped.startswith(':::'):
+                in_div = False
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and _IMG_LINE_RE.match(lines[j]):
+            j += 1
+        run = lines[i:j]
+        i = j
+        names = [_IMG_LINE_RE.match(ln).group('path').rsplit('/', 1)[-1] for ln in run]
+        ncol = _source_ncol(names, by_file) if len(run) > 1 else 1
+        # a ::: div fence is itself a block boundary — no blank needed against it
+        before = bool(out and out[-1].strip() and not out[-1].lstrip().startswith(':::'))
+        after = bool(i < len(lines) and lines[i].strip()
+                     and not lines[i].lstrip().startswith(':::'))
+        if len(run) == 1 and not before and not after:
+            # inside a layout div the column already constrains the image
+            sized = run[0] if in_div else _with_width(
+                run[0], by_file.get(names[0]), _IMG_LINE_RE.match(run[0]))
+            out.append(sized)                 # already its own block; may still need a width
+            n += sized != run[0]
+            continue
+        spaced = []
+        for k, ln in enumerate(run):
+            if k:
+                spaced.append('')
+            spaced.append(ln)
+        if before:                            # an image glued to the text above it
+            out.append('')
+        if ncol > 1:
+            out.append('::: {layout-ncol=%d}' % ncol)
+            out.extend(spaced)
+            out.append(':::')
+        elif len(run) == 1:
+            # a single image fills the whole column unless told otherwise — restore
+            # the width the source printed it at (a stacked GROUP keeps the column
+            # width for now; same stretch, but it is its own decision)
+            out.append(_with_width(run[0], by_file.get(names[0]), _IMG_LINE_RE.match(run[0])))
+        else:
+            out.extend(spaced)                # source stacked them: blocks are enough
+        if after:                             # …or to the text below it
+            out.append('')
+        n += 1
+    return '\n'.join(out), n
+
+
+# A list item: bullet or ordinal, at most 3 spaces of indent, content after the marker.
+# `*emphasis*` mid-paragraph can't match — the marker must be followed by a space.
+_LIST_ITEM_RE = re.compile(r'^\s{0,3}(?:[*+-]|\d+[.)])\s+\S')
+
+
+def _ensure_list_blanks(text):
+    """A list must be preceded by a blank line or Markdown folds it into the paragraph
+    above: Pandoc escapes the markers and the bullets render as literal `*` inside a
+    running sentence (seen throughout the "This category includes:" sections). Same
+    rule, and same repair, as _ensure_pipe_table_blanks above.
+
+    Headings, HTML, tables and block quotes close the preceding block on their own, so
+    only a plain paragraph line needs the blank. Indented lines are list continuations
+    or code, and YAML front matter is skipped — its `- ` entries are not Markdown.
+    Returns (new_text, n_fixed)."""
+    lines = text.split('\n')
+    out, n, fence = [], 0, False
+    start = 0
+    if lines and lines[0].strip() == '---':          # YAML front matter: copy verbatim
+        for i in range(1, len(lines)):
+            if lines[i].strip() in ('---', '...'):
+                start = i + 1
+                break
+    out.extend(lines[:start])
+    for ln in lines[start:]:
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+        elif not fence and _LIST_ITEM_RE.match(ln) and out:
+            prev = out[-1]
+            if (prev.strip() and not _LIST_ITEM_RE.match(prev)
+                    and not prev.startswith(('    ', '\t'))
+                    and not prev.lstrip().startswith(('#', '<', '|', '>', ':::'))):
+                out.append('')
+                n += 1
         out.append(ln)
     return '\n'.join(out), n
 
@@ -1886,13 +2193,33 @@ def _llm_convert_gaps(api_key, gaps, model=_REPAIR_MODEL, char_budget=12000):
     return out, total_cost
 
 
-def _build_units(source_pdf):
+def _figure_boxes(out_dir):
+    """{page: [bbox, …]} for the detected figures.
+
+    Text drawn inside a figure — map class codes stamped over a satellite image,
+    axis labels, legend keys — belongs to the picture, not the prose. text_coverage
+    already excludes these regions when it decides what is missing; the repair pass
+    must use the same exclusion or it re-injects as a stray line exactly the text
+    verify was right to ignore.
+    """
+    try:
+        det = json.loads((Path(out_dir) / 'detections.json').read_text(encoding='utf-8'))
+    except Exception:                       # noqa: BLE001 — repair must never abort
+        return {}
+    boxes = defaultdict(list)
+    for fig in det.get('figures', []):
+        if fig.get('bbox') and fig.get('page') is not None:
+            boxes[fig['page']].append(tuple(fig['bbox']))
+    return dict(boxes)
+
+
+def _build_units(source_pdf, exclude_boxes_by_page=None):
     """Ordered source prose units: [(page, raw_sentence, norm_tokens)] in reading
-    order, with running headers/footers and TOC leaders dropped."""
+    order, with running headers/footers, TOC leaders and figure-internal text dropped."""
     from .verify.textutil import normalize, pdf_lines, split_sentences, tokens
     from .verify.checks.text_coverage import _join_wrapped, _TOC_LEADER_RE
 
-    lines = pdf_lines(source_pdf, exclude_boxes_by_page={})
+    lines = pdf_lines(source_pdf, exclude_boxes_by_page=exclude_boxes_by_page or {})
     total_pages = (max((p for p, _ in lines), default=-1) + 1) or 1
 
     # digit-insensitive chrome signature: "Page | 9" and "Page | 15" collapse to one
@@ -2024,7 +2351,7 @@ def _postfix_missing_text(qmd_path, out_dir, api_key, text_check, model=_REPAIR_
     qmd_sh = shingles(tokens(qmd_to_plain(qmd_text)))
 
     try:
-        units = _build_units(source_pdf)
+        units = _build_units(source_pdf, _figure_boxes(out_dir))
     except Exception as e:                  # noqa: BLE001 — repair must never abort
         log.warning('Missing-text repair: could not read source: %s', e)
         return 0, 0, 0.0

@@ -4,8 +4,11 @@ The converter intermittently drops a passage (LLM non-determinism). Postfix dete
 it and recovers the prose from the source PDF — these tests cover putting it back
 *in flow* rather than in an end-of-document appendix.
 """
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -142,6 +145,39 @@ def test_build_units_drops_numbered_running_footer(tmp_path):
     joined = " ".join(u[1] for u in units)
     assert "Page |" not in joined                          # numbered footer gone
     assert "processing chain" in joined                    # bodies kept
+
+
+def test_build_units_drops_figure_internal_text(tmp_path):
+    """Class codes stamped over a satellite image are part of the picture. Without the
+    exclusion the repair pass re-injects them as a stray line of digits (PA21: a line
+    reading "1110 1110 1110 2110 …" that appears nowhere in the source prose)."""
+    import fitz
+    from pdf2md.postfix import _build_units, _figure_boxes
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 100), "The delineation rules for urban fabric are described here.")
+    page.insert_text((200, 400), "1110")          # inside the figure
+    page.insert_text((260, 430), "2110")          # inside the figure
+    src = tmp_path / "d.pdf"
+    doc.save(str(src)); doc.close()
+    fig_box = {0: [(150.0, 350.0, 450.0, 500.0)]}
+
+    joined = " ".join(u[1] for u in _build_units(src))
+    assert "1110" in joined                       # today's behaviour: leaks in
+    joined = " ".join(u[1] for u in _build_units(src, fig_box))
+    assert "1110" not in joined and "2110" not in joined
+    assert "delineation rules" in joined          # body prose untouched
+
+
+def test_figure_boxes_reads_detections(tmp_path):
+    from pdf2md.postfix import _figure_boxes
+    (tmp_path / "detections.json").write_text(json.dumps({"figures": [
+        {"file": "a.png", "page": 3, "bbox": [1, 2, 3, 4]},
+        {"file": "b.png", "page": 3, "bbox": [5, 6, 7, 8]},
+        {"file": "c.png", "page": 9, "bbox": None},        # unmaterialised: skipped
+    ]}), encoding="utf-8")
+    assert _figure_boxes(tmp_path) == {3: [(1, 2, 3, 4), (5, 6, 7, 8)]}
+    assert _figure_boxes(tmp_path / "nope") == {}          # missing file is not fatal
 
 
 def test_locate_after_unique_anchor():
@@ -765,6 +801,192 @@ def test_ensure_pipe_table_blanks():
     # idempotent
     out2, n2 = _ensure_pipe_table_blanks(out)
     assert n2 == 0
+
+
+def test_ensure_list_blanks():
+    from pdf2md.postfix import _ensure_list_blanks
+    # a list glued to the paragraph above is folded into it by Pandoc and renders as
+    # literal `*` text (PA21 "This category includes:")
+    qmd = ("**This category includes:**\nVery dense Urban:\n"
+           "*   Built-up areas\n*   Buildings and roads\n\n"
+           "## Heading\n*   heading closes the block, no blank needed\n\n"
+           "Spaced already:\n\n*   untouched\n")
+    out, n = _ensure_list_blanks(qmd)
+    assert n == 1                                      # only the glued list
+    assert "Very dense Urban:\n\n*   Built-up areas" in out
+    assert "## Heading\n*   heading closes" in out    # heading untouched
+    assert out.count("*   untouched") == 1
+    out2, n2 = _ensure_list_blanks(out)
+    assert n2 == 0 and out2 == out                     # idempotent
+
+
+def test_ensure_list_blanks_skips_front_matter_and_fences():
+    from pdf2md.postfix import _ensure_list_blanks
+    # YAML `- ` entries are not Markdown lists; a fenced block is verbatim
+    qmd = ("---\nformat:\n  - pdf\n  - html\n---\n"
+           "Intro line:\n```\ncode:\n- not a list\n```\n")
+    out, n = _ensure_list_blanks(qmd)
+    assert n == 0 and out == qmd
+
+
+def test_ensure_list_blanks_leaves_list_continuations(tmp_path):
+    from pdf2md.postfix import _ensure_list_blanks
+    # an indented continuation line inside a list must not split the list
+    qmd = ("*   Industrial, commercial, public units\n"
+           "    $\\rightarrow$ class 1.1.2\n"
+           "*   Allotment gardens\n")
+    out, n = _ensure_list_blanks(qmd)
+    assert n == 0 and out == qmd
+
+
+def _colour_pdf(tmp_path):
+    """A one-page PDF with two filled cells and their text, like a nomenclature table."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.draw_rect(fitz.Rect(50, 50, 250, 90), color=None, fill=(1, 1, 0))      # #FFFF00
+    page.draw_rect(fitz.Rect(50, 90, 250, 130), color=None, fill=(0, 0.5, 0))   # #008000
+    page.insert_text((60, 75), "Managed grassland")
+    page.insert_text((60, 115), "Natural woodland")
+    out = tmp_path / "t.pdf"
+    doc.save(str(out)); doc.close()
+    return out
+
+
+def test_colorize_tables_samples_cell_colours(tmp_path):
+    from pdf2md.postfix import _colorize_tables
+    pdf = _colour_pdf(tmp_path)
+    qmd = ("<table><tr><td>Managed grassland</td></tr>"
+           "<tr><td>Natural woodland</td></tr></table>")
+    out, n = _colorize_tables(qmd, pdf)
+    assert n == 2
+    assert '<td style="background-color:#FFFF00">Managed grassland</td>' in out
+    assert '<td style="background-color:#008000">Natural woodland</td>' in out
+    # idempotent: a second pass reports nothing and changes nothing
+    again, n2 = _colorize_tables(out, pdf)
+    assert n2 == 0 and again == out
+
+
+def test_colorize_tables_merges_and_respects_existing_style(tmp_path):
+    from pdf2md.postfix import _colorize_tables
+    pdf = _colour_pdf(tmp_path)
+    qmd = ('<table><tr><td style="text-align:center">Managed grassland</td></tr>'
+           '<tr><td style="background-color:#123456">Natural woodland</td></tr></table>')
+    out, n = _colorize_tables(qmd, pdf)
+    assert n == 1                                        # only the uncoloured one
+    assert 'style="text-align:center; background-color:#FFFF00"' in out
+    assert 'background-color:#123456' in out             # model's own colour kept
+
+def test_colorize_tables_leaves_unmatched_cells_alone(tmp_path):
+    from pdf2md.postfix import _colorize_tables
+    pdf = _colour_pdf(tmp_path)
+    qmd = "<table><tr><td>Managed grassland</td><td>Not in the PDF at all</td></tr></table>"
+    out, n = _colorize_tables(qmd, pdf)
+    assert n == 1 and "<td>Not in the PDF at all</td>" in out
+
+
+def test_colorize_tables_noop_without_tables_or_pdf(tmp_path):
+    from pdf2md.postfix import _colorize_tables
+    assert _colorize_tables("no tables here", tmp_path / "missing.pdf") == ("no tables here", 0)
+    assert _colorize_tables("<table><tr><td>x</td></tr></table>",
+                            tmp_path / "missing.pdf") == ("<table><tr><td>x</td></tr></table>", 0)
+
+
+def test_group_image_rows_builds_grid_from_source_geometry():
+    from pdf2md.postfix import _group_image_rows
+    # four photos, two per row in the source -> layout-ncol=2, captions preserved
+    figs = [{"file": "a.jpeg", "page": 18, "bbox": [100, 100, 300, 300]},
+            {"file": "b.jpeg", "page": 18, "bbox": [400, 110, 600, 310]},
+            {"file": "c.jpeg", "page": 18, "bbox": [100, 400, 300, 600]},
+            {"file": "d.jpeg", "page": 18, "bbox": [400, 410, 600, 610]}]
+    qmd = ("Text above.\n"
+           "![Cap A](media/a.jpeg)\n![Cap B](media/b.jpeg)\n"
+           "![Cap C](media/c.jpeg)\n![Cap D](media/d.jpeg)\n")
+    out, n = _group_image_rows(qmd, figs)
+    assert n == 1
+    assert "::: {layout-ncol=2}" in out and out.rstrip().endswith(":::")
+    # each image is its own block now, so Pandoc keeps the alt text as a caption
+    assert "![Cap A](media/a.jpeg)\n\n![Cap B](media/b.jpeg)" in out
+
+
+def test_lone_image_keeps_its_source_width():
+    """With no width attribute Typst stretches the image to the text column: a photo
+    printed 210pt wide rendered at 441pt, 2.1x too big and at 44 dpi instead of 92."""
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "a.jpeg", "page": 68, "bbox": [196.0, 342.5, 405.8, 502.0]}]  # 210pt
+    out, n = _group_image_rows("Text.\n![Vineyard](m/a.jpeg)\nMore text.\n", figs)
+    assert n == 1 and "![Vineyard](m/a.jpeg){width=210pt}" in out
+    again, n2 = _group_image_rows(out, figs)          # attrs present -> left alone
+    assert n2 == 0 and again == out
+
+
+def test_full_width_image_gets_no_explicit_width():
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "b.jpeg", "page": 1, "bbox": [60.0, 100.0, 560.0, 400.0]}]    # 500pt
+    out, _ = _group_image_rows("Text.\n![Wide](m/b.jpeg)\nMore.\n", figs)
+    assert "![Wide](m/b.jpeg)" in out and "width=" not in out
+
+
+def test_grid_images_are_not_given_widths():
+    """Inside a layout div the column already constrains the image, and a width would
+    fight Quarto's own proportioning."""
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "a.jpeg", "page": 1, "bbox": [50, 100, 250, 300]},
+            {"file": "b.jpeg", "page": 1, "bbox": [300, 100, 500, 300]}]
+    out, _ = _group_image_rows("![A](m/a.jpeg)\n![B](m/b.jpeg)\n", figs)
+    assert "layout-ncol=2" in out and "width=" not in out
+
+
+def test_image_with_existing_attrs_is_left_alone():
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "a.jpeg", "page": 1, "bbox": [0, 0, 100, 100]}]
+    out, _ = _group_image_rows('Text.\n![A](m/a.jpeg){width=80%}\nMore.\n', figs)
+    assert "{width=80%}" in out and "pt}" not in out
+
+
+def test_group_image_rows_stacks_when_source_stacked():
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "a.jpeg", "page": 3, "bbox": [100, 100, 300, 200]},
+            {"file": "b.jpeg", "page": 3, "bbox": [100, 300, 300, 400]}]
+    qmd = "![Cap A](m/a.jpeg)\n![Cap B](m/b.jpeg)\n"
+    out, n = _group_image_rows(qmd, figs)
+    assert n == 1 and "layout-ncol" not in out        # one per row in the source
+    assert "![Cap A](m/a.jpeg)\n\n![Cap B](m/b.jpeg)" in out
+
+
+def test_group_image_rows_unglues_a_lone_image_from_surrounding_text():
+    from pdf2md.postfix import _group_image_rows
+    # an image glued to the line below is inline too -> caption dropped
+    qmd = "![Schematic view of a lagoon.](m/a.jpeg)\nLagoon\nSand bank\n"
+    out, n = _group_image_rows(qmd, [])
+    assert n == 1
+    assert "![Schematic view of a lagoon.](m/a.jpeg)\n\nLagoon" in out
+    again, n2 = _group_image_rows(out, [])
+    assert n2 == 0 and again == out
+
+
+def test_group_image_rows_sizes_lone_images_and_is_idempotent():
+    """A lone image already in its own block still needs its source width — without it
+    Typst stretches it to the full column (see test_lone_image_keeps_its_source_width).
+    Everything else about the block is left as it is."""
+    from pdf2md.postfix import _group_image_rows
+    figs = [{"file": "a.jpeg", "page": 1, "bbox": [0, 0, 10, 10]},
+            {"file": "b.jpeg", "page": 1, "bbox": [20, 0, 30, 10]}]
+    lone = "Para.\n\n![Only one](m/a.jpeg)\n\nMore text.\n"
+    out, n = _group_image_rows(lone, figs)
+    assert n == 1 and out == lone.replace("(m/a.jpeg)", "(m/a.jpeg){width=10pt}")
+    settled, n_again = _group_image_rows(out, figs)
+    assert n_again == 0 and settled == out
+    grid, _ = _group_image_rows("![A](m/a.jpeg)\n![B](m/b.jpeg)\n", figs)
+    again, n2 = _group_image_rows(grid, figs)
+    assert n2 == 0 and again == grid
+
+
+def test_group_image_rows_without_detections_defaults_to_stacking():
+    from pdf2md.postfix import _group_image_rows
+    qmd = "![A](m/a.jpeg)\n![B](m/b.jpeg)\n"
+    out, n = _group_image_rows(qmd, [])
+    assert n == 1 and "layout-ncol" not in out and "![A](m/a.jpeg)\n\n![B](m/b.jpeg)" in out
 
 
 def test_run_postfix_accepts_repair_model_kwarg(tmp_path):
