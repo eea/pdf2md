@@ -115,11 +115,30 @@ def test_grid_used_when_the_divider_is_a_printed_rule(tmp_path):
     assert "Alpha" in text and "Beta" in text
 
 
-def test_grid_declined_when_the_divider_is_only_a_colour(tmp_path):
+def test_grid_reads_a_colour_divided_table(tmp_path):
     """The failure that made PA21's nomenclature table a 7-column misread: the
-    Level 1/Level 2 boundary is a fill edge, so find_tables merges both columns
-    into one cell and every word survives in the wrong place."""
+    Level 1/Level 2 boundary is a fill edge, and lines_strict discards fill-only
+    paths, so both columns landed in one cell. Feeding those edges back via
+    add_lines separates them, so the table is read rather than sent to vision."""
     pdf, bbox = _table_pdf(tmp_path, ruled_divider=False)
-    _text, report, captured = _read(pdf, bbox)
-    assert report["from_grid"] == 0            # declined to vision
+    text, report, captured = _read(pdf, bbox)
+    assert report["from_grid"] == 1
+    assert "vision" not in captured
+    assert "| Alpha | Beta |" in text           # the columns are separated, not merged
+
+
+def test_grid_declined_when_text_escapes_the_cells(tmp_path):
+    """Coverage gate: text inside the region but outside every cell would be lost
+    by a rebuild, so the grid must decline regardless of how clean it looks."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open(); page = doc.new_page()
+    page.draw_rect(fitz.Rect(50, 50, 250, 110), color=(0, 0, 0), width=1)
+    page.draw_line(fitz.Point(150, 50), fitz.Point(150, 110), color=(0, 0, 0), width=1)
+    page.insert_text((60, 75), "Alpha")
+    page.insert_text((160, 75), "Beta")
+    page.insert_text((60, 135), "stray text below the grid")   # inside region, no cell
+    out = tmp_path / "escaped.pdf"
+    doc.save(str(out)); doc.close()
+    _text, report, captured = _read(out, (50, 50, 250, 150))
+    assert report["from_grid"] == 0
     assert captured.get("vision") is True

@@ -38,6 +38,7 @@ _GRID_MIN_COV = 0.999
 # rule always does. Measured over the corpus this is the difference between 75.1% of
 # slots accepted (unchecked, some misplaced) and 48.6% accepted and all sound.
 _FILL_SPAN_MIN = 0.8       # a divider runs (nearly) the full extent of the cell
+_FILL_EDGE_MIN_PT = 15.0   # ignore fills too small to be a column band
 _FILL_INSET_PT = 3.0       # ignore an edge this close to the cell border
 _MIN_DISTINCT = 8        # fewer distinctive values = sliver, leave it inline
 _VISION_MIN_CHARS = 60   # a vision region with less clip text is noise
@@ -162,8 +163,28 @@ def fill_table_slots(text, slots, working_pdf, api_key):
                 and fitz.Rect(d['rect']).width >= 15 and fitz.Rect(d['rect']).height >= 8]
         return fill_cache[page.number]
 
+    def _fill_edges(page, rect):
+        """Vertical x-positions implied by the cell fills inside this region."""
+        xs = set()
+        for fill in _page_fills(page):
+            if fill.width < _FILL_EDGE_MIN_PT or (fill & rect).is_empty:
+                continue
+            for x in (fill.x0, fill.x1):
+                if rect.x0 + _FILL_INSET_PT < x < rect.x1 - _FILL_INSET_PT:
+                    xs.add(round(x, 1))
+        return sorted(xs)
+
     def _wrongly_merged(page, cell, fills):
-        """True if a fill edge splits this cell into two parts that both hold text."""
+        """True if a fill edge splits this cell COLUMN-WISE into two parts that both
+        hold text — the signature of a column rule drawn as colour.
+
+        Only the vertical direction is testable this way: a cell's text wraps onto
+        several lines, so any horizontal line through it has text above and below
+        whether or not a row rule was missed. Rows come from the stroked rules, which
+        lines_strict reads correctly (verified: 27 and 34 rows on the two tables that
+        prompted this). A table dividing its ROWS by colour alone would slip through;
+        distinguishing that from a line wrap needs the fill colours either side of the
+        edge to differ, which is the upgrade if such a table ever turns up."""
         for fill in fills:
             if (fill & cell).is_empty:
                 continue
@@ -172,12 +193,6 @@ def fill_table_slots(text, slots, working_pdf, api_key):
                     if cell.x0 + _FILL_INSET_PT < x < cell.x1 - _FILL_INSET_PT and \
                             page.get_text(clip=fitz.Rect(cell.x0, cell.y0, x, cell.y1)).strip() and \
                             page.get_text(clip=fitz.Rect(x, cell.y0, cell.x1, cell.y1)).strip():
-                        return True
-            if fill.width >= _FILL_SPAN_MIN * cell.width:
-                for y in (fill.y0, fill.y1):
-                    if cell.y0 + _FILL_INSET_PT < y < cell.y1 - _FILL_INSET_PT and \
-                            page.get_text(clip=fitz.Rect(cell.x0, cell.y0, cell.x1, y)).strip() and \
-                            page.get_text(clip=fitz.Rect(cell.x0, y, cell.x1, cell.y1)).strip():
                         return True
         return False
 
@@ -192,10 +207,16 @@ def fill_table_slots(text, slots, working_pdf, api_key):
         region = set(_tok(page.get_text(clip=rect)))
         if not region:
             return None, 0.0
+        # lines_strict follows the printed rules and gets the ROWS right, but it
+        # discards fill-only paths by design (pymupdf/table.py: "If only looking at
+        # lines, we ignore fill-only paths"), so a table that divides its columns by
+        # colour comes back with two columns inside one cell. The default "lines"
+        # strategy reads those fill edges but splits every wrapped line into its own
+        # row. Take the rows from lines_strict and hand it the column edges the fills
+        # imply — add_lines exists for exactly this.
+        add = [((x, rect.y0), (x, rect.y1)) for x in _fill_edges(page, rect)]
         try:
-            # lines_strict follows the printed rules; the default strategy splits a
-            # wrapped line into its own row (57 rows for a 27-row table)
-            found = page.find_tables(strategy='lines_strict').tables
+            found = page.find_tables(strategy='lines_strict', add_lines=add).tables
         except Exception:                   # noqa: BLE001 — fall through to vision
             return None, 0.0
         for t in found:
