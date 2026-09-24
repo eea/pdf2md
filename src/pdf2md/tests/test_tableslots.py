@@ -1,5 +1,7 @@
 """Table-slot fill: markers filled from crops, markerless slots rescued by anchor."""
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -61,3 +63,63 @@ def test_invented_marker_is_dropped(tmp_path, monkeypatch):
     text = "A.\n\n<!--pdf2md-tblslot-TBL_9-->\n\nB.\n"
     out, rep = fill_table_slots(text, [_slot(1)], _fake_pdf(tmp_path), "k")
     assert "pdf2md-tblslot" not in out and rep["filled"] == 0
+
+
+def _table_pdf(tmp_path, ruled_divider: bool):
+    """A 2x2 table. The column split is a stroked rule or only a colour change."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open(); page = doc.new_page()
+    outer = fitz.Rect(50, 50, 250, 130)
+    page.draw_rect(outer, color=(0, 0, 0), width=1)
+    page.draw_line(fitz.Point(50, 90), fitz.Point(250, 90), color=(0, 0, 0), width=1)
+    if ruled_divider:
+        page.draw_line(fitz.Point(150, 50), fitz.Point(150, 130), color=(0, 0, 0), width=1)
+    else:                                   # the boundary exists only as a fill
+        page.draw_rect(fitz.Rect(50, 50, 150, 130), color=None, fill=(1, 0.85, 0.85))
+    page.insert_text((60, 75), "Alpha")
+    page.insert_text((160, 75), "Beta")
+    page.insert_text((60, 115), "Gamma")
+    page.insert_text((160, 115), "Delta")
+    out = tmp_path / ("ruled.pdf" if ruled_divider else "coloured.pdf")
+    doc.save(str(out)); doc.close()
+    return out, tuple(outer)
+
+
+def _read(pdf, bbox):
+    """Drive fill_table_slots' grid reader without touching the network."""
+    from pdf2md.tableslots import fill_table_slots
+    captured = {}
+    slot = {"slot": 1, "page": 0, "bbox": list(bbox), "rows": None, "ctx": [],
+            "dist": ["alpha"], "est_chars": 100}
+
+    def _no_vision(*a, **k):
+        captured["vision"] = True
+        return None, 0.0
+
+    import pdf2md.postfix as pf
+    real = pf._crop_table_md
+    pf._crop_table_md = _no_vision
+    try:
+        text, report = fill_table_slots("before\n\n<!--pdf2md-tblslot-TBL_1-->\n\nafter\n",
+                                        [slot], pdf, api_key=None)
+    finally:
+        pf._crop_table_md = real
+    return text, report, captured
+
+
+def test_grid_used_when_the_divider_is_a_printed_rule(tmp_path):
+    pdf, bbox = _table_pdf(tmp_path, ruled_divider=True)
+    text, report, captured = _read(pdf, bbox)
+    assert report["from_grid"] == 1            # deterministic path, no vision call
+    assert "vision" not in captured
+    assert "Alpha" in text and "Beta" in text
+
+
+def test_grid_declined_when_the_divider_is_only_a_colour(tmp_path):
+    """The failure that made PA21's nomenclature table a 7-column misread: the
+    Level 1/Level 2 boundary is a fill edge, so find_tables merges both columns
+    into one cell and every word survives in the wrong place."""
+    pdf, bbox = _table_pdf(tmp_path, ruled_divider=False)
+    _text, report, captured = _read(pdf, bbox)
+    assert report["from_grid"] == 0            # declined to vision
+    assert captured.get("vision") is True
