@@ -149,8 +149,9 @@ def fill_table_slots(text, slots, working_pdf, api_key):
     unique anchor is counted `lost` (Pass 3/4 repair remains as the net below).
     """
     import fitz
-    from .postfix import (_anchor_by_context, _crop_table_md, _grid_to_markdown,
-                          _qmd_word_offsets, _safe_boundary, _tbl_md_tokens)
+    from .postfix import (_anchor_by_context, _crop_table_md, _grid_to_html,
+                          _grid_to_markdown, _qmd_word_offsets, _safe_boundary,
+                          _tbl_md_tokens)
     from .verify.textutil import tokens as _tok
 
     fill_cache = {}
@@ -237,8 +238,10 @@ def fill_table_slots(text, slots, working_pdf, api_key):
             if any(_wrongly_merged(page, cr, fills) for cr in rects):
                 log.debug('grid declined on page %d: a colour boundary divides a cell', pno + 1)
                 return None, cov
-            rows = [r for r in t.extract() if any(c for c in r)]
-            return (_grid_to_markdown(rows) if rows else None), cov
+            # HTML, not a pipe table: merged cells survive and the colour pass has
+            # a <td> to style
+            html = _grid_to_html(page, t)
+            return (('```{=html}\n' + html + '\n```') if html else None), cov
         return None, 0.0
 
     report = {"filled": 0, "rescued": 0, "fallbacks": 0, "lost": 0, "cost": 0.0,

@@ -45,10 +45,17 @@ def resolve_leftover_fig_tokens(qmd_text: str, figures: list,
         fig = by_num.get(num)
         if fig and fig.get('file'):
             resolved += 1
+            path = f'{media_dirname}/{fig["file"]}'
+            # A token already sitting in a link target — "![alt](FIG_3)" whose alt text
+            # spans several lines, so the image-shaped pattern never matched it — needs
+            # the PATH only. Emitting a whole image there nests one inside another's
+            # target and Typst fails on the url-encoded filename.
+            if _IN_LINK_TARGET_RE.search(qmd_text, 0, m.start()):
+                return path
             cap = fig.get('caption') or f'Figure {num}'
             # Escape brackets for markdown image syntax
             cap = cap.replace('[', '\\[').replace(']', '\\]')
-            return f'![{cap}]({media_dirname}/{fig["file"]})'
+            return f'![{cap}]({path})'
         return m.group(0)  # leave unknown tokens as-is
 
     new_text = _BARE_FIG_RE.sub(_repl, qmd_text)
@@ -69,6 +76,11 @@ def resolve_leftover_fig_tokens(qmd_text: str, figures: list,
 
 _CAP_LABEL_RE = re.compile(r'^\s*(?:fig(?:ure)?\.?|table)\s*\d+', re.I)
 _CAP_NUM_RE = re.compile(r'(?:fig(?:ure)?\.?|table)\s*(\d+)', re.I)
+
+
+# "](" immediately before the token: the token is the link target of an image whose
+# alt text the image-shaped pattern could not span (a multi-line caption).
+_IN_LINK_TARGET_RE = re.compile(r'\]\(\s*$')
 
 
 def _place_figures_by_caption(qmd_text, unreferenced, media_dirname):

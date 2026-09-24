@@ -1130,6 +1130,50 @@ def _fence_unfenced_code(text):
     return '\n'.join(lines), len(blocks)
 
 
+def _grid_to_html(page, table):
+    """Render a source grid as an HTML table, spans derived from the cell geometry.
+
+    Markdown pipe tables cannot express merged cells and carry no <td> for the colour
+    pass to style, so a grid-read table would lose both. Cell text is clipped to each
+    cell's own rectangle; a position covered by a span comes back as None from
+    find_tables and is simply skipped.
+    """
+    import fitz
+    rects = [fitz.Rect(c) for row in table.rows for c in row.cells if c]
+    if not rects:
+        return None
+    xs = sorted({round(v, 1) for r in rects for v in (r.x0, r.x1)})
+    ys = sorted({round(v, 1) for r in rects for v in (r.y0, r.y1)})
+
+    def _span(lo, hi, edges):
+        """How many grid intervals this side of the cell covers."""
+        near = lambda v: min(range(len(edges)), key=lambda i: abs(edges[i] - v))
+        return max(1, near(hi) - near(lo))
+
+    out = ['<table>']
+    for row in table.rows:
+        cells = []
+        for cell in row.cells:
+            if not cell:
+                continue                       # covered by a neighbour's span
+            r = fitz.Rect(cell)
+            text = ' '.join(page.get_text(clip=r).split())
+            text = (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+            attrs = ''
+            cs, rs = _span(r.x0, r.x1, xs), _span(r.y0, r.y1, ys)
+            if cs > 1:
+                attrs += ' colspan="%d"' % cs
+            if rs > 1:
+                attrs += ' rowspan="%d"' % rs
+            cells.append('    <td%s>%s</td>' % (attrs, text))
+        if cells:
+            out.append('  <tr>')
+            out.extend(cells)
+            out.append('  </tr>')
+    out.append('</table>')
+    return '\n'.join(out)
+
+
 def _grid_to_markdown(rows):
     """Render extracted source cells as a Markdown grid. Values are copied verbatim."""
     width = max(len(r) for r in rows)

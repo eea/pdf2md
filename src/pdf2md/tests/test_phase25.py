@@ -33,3 +33,25 @@ def test_append_fallback_when_no_caption_in_body():
     fig = {"fig_id": "FIG_9", "file": "img-z.png", "caption": "Figure 9. A plot."}
     out, n = _append_unplaced_figures(qmd, [fig], "doc-media")
     assert n == 1 and out.rstrip().endswith("![Figure 9. A plot.](doc-media/img-z.png)")
+
+
+def test_bare_token_in_a_link_target_resolves_to_the_path_only():
+    """A multi-line alt text stops the image-shaped pattern matching, so the token
+    reaches the bare-token pass still inside "](...)". Substituting a whole image
+    there nests one image inside another's target and Typst fails on the url-encoded
+    filename (PA21: "La Albufera" figure)."""
+    from pdf2md.phase25 import resolve_leftover_fig_tokens as _resolve_bare_fig_tokens
+    figs = [{"fig_id": "FIG_1", "file": "img-abc.jpeg", "caption": "Schematic view."}]
+    body = ("![Coastal lagoon\nSand bank\n"
+            "Schematic view of La Albufera coastal lagoon (Valencia, Spain).](FIG_1)\n")
+    out, n = _resolve_bare_fig_tokens(body, figs, "media", "doc")
+    assert n == 1
+    assert "](media/img-abc.jpeg)" in out
+    assert "](![" not in out                      # no nesting
+
+
+def test_bare_token_on_its_own_still_becomes_an_image():
+    from pdf2md.phase25 import resolve_leftover_fig_tokens as _resolve_bare_fig_tokens
+    figs = [{"fig_id": "FIG_2", "file": "img-b.jpeg", "caption": "A plot."}]
+    out, n = _resolve_bare_fig_tokens("Text before.\n\nFIG_2\n\nAfter.\n", figs, "media", "doc")
+    assert n == 1 and "![A plot.](media/img-b.jpeg)" in out
