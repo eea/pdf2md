@@ -974,6 +974,82 @@ def test_colorize_tables_merges_and_respects_existing_style(tmp_path):
     assert 'style="text-align:center; background-color:#FFFF00"' in out
     assert 'background-color:#123456' in out             # model's own colour kept
 
+def test_table_font_size_is_sampled_from_the_source(tmp_path):
+    """The theme pins table text at 9pt; the source typeset this table at 8pt. The
+    emitted size is that sampled size scaled to match the source's optical width —
+    the theme's face runs wider, so equal point sizes do not occupy equal space."""
+    fitz = pytest.importorskip("fitz")
+    from pdf2md.postfix import _table_font_size
+    doc = fitz.open(); page = doc.new_page()
+    page.insert_text((60, 75), "a cell set in eight point", fontsize=8)
+    page.insert_text((60, 95), "another eight point cell", fontsize=8)
+    page.insert_text((60, 115), "one twelve", fontsize=12)
+    pdf = tmp_path / "sizes.pdf"
+    doc.save(str(pdf)); doc.close()
+    page = fitz.open(str(pdf))[0]
+    rects = [fitz.Rect(50, 60, 300, 125)]
+    from pdf2md.postfix import _TABLE_FONT_SCALE
+    # the dominant size, scaled to match the source's optical width (see the constant)
+    assert _table_font_size(page, rects) == round(8.0 * _TABLE_FONT_SCALE, 1)
+    assert _table_font_size(page, [fitz.Rect(400, 400, 500, 450)]) is None
+
+
+def test_font_size_attribute_becomes_a_scoped_typst_rule():
+    """Quarto's Typst writer drops CSS font-size and the theme pins cells at 9pt, so
+    the size has to arrive as a `show table.cell` rule, restored afterwards."""
+    from pdf2md.postfix import _apply_table_font_size
+    qmd = '```{=html}\n<table style="font-size:8pt">\n  <tr><td>x</td></tr>\n</table>\n```'
+    out, n = _apply_table_font_size(qmd)
+    assert n == 1
+    assert "#show table.cell: set text(size: 8pt)" in out
+    assert "#show table.cell: set text(size: 9pt)" in out   # theme size restored
+    assert "<table>" in out and "font-size" not in out      # attribute consumed
+    assert _apply_table_font_size(out)[1] == 0              # idempotent
+
+
+def test_table_without_a_sampled_size_is_untouched():
+    from pdf2md.postfix import _apply_table_font_size
+    qmd = '```{=html}\n<table>\n  <tr><td>x</td></tr>\n</table>\n```'
+    assert _apply_table_font_size(qmd) == (qmd, 0)
+
+
+def test_grid_cells_carry_the_source_text_colour(tmp_path):
+    """A cell on a dark fill is set in white in the source. Once a cell's background
+    comes from the source the theme's text colour is no longer a safe default (it was
+    chosen against white), so a filled cell pins the source's exact ink; an unfilled
+    cell emits none and keeps the theme's."""
+    fitz = pytest.importorskip("fitz")
+    from pdf2md.postfix import _cell_text_colour
+    doc = fitz.open(); page = doc.new_page()
+    page.draw_rect(fitz.Rect(50, 50, 250, 90), color=None, fill=(0.75, 0, 0))
+    page.insert_text((60, 75), "White on dark red", color=(1, 1, 1))
+    page.insert_text((60, 130), "Black on white")
+    pdf = tmp_path / "ink.pdf"
+    doc.save(str(pdf)); doc.close()
+    page = fitz.open(str(pdf))[0]
+    assert _cell_text_colour(page, fitz.Rect(50, 50, 250, 90)) == "#FFFFFF"
+    assert _cell_text_colour(page, fitz.Rect(50, 110, 250, 145)) == "#000000"
+    assert _cell_text_colour(page, fitz.Rect(400, 400, 500, 450)) is None  # empty cell
+
+
+def test_colorize_tables_declines_when_the_text_is_ambiguous(tmp_path):
+    """page.search_for is CASE-INSENSITIVE: the white "URBAN" cell in the last column
+    matched "1. Urban" in the first and was painted that column's red. More than one
+    hit means the cell cannot be located, so no colour is applied."""
+    fitz = pytest.importorskip("fitz")
+    from pdf2md.postfix import _colorize_tables
+    doc = fitz.open(); page = doc.new_page()
+    page.draw_rect(fitz.Rect(50, 50, 200, 90), color=None, fill=(1, 0.25, 0.25))
+    page.insert_text((60, 75), "1. Urban")          # coloured cell, first column
+    page.insert_text((300, 75), "URBAN")            # white cell, last column
+    pdf = tmp_path / "amb.pdf"
+    doc.save(str(pdf)); doc.close()
+    qmd = "<table><tr><td>1. Urban</td><td>URBAN</td></tr></table>"
+    out, _n = _colorize_tables(qmd, pdf)
+    assert "<td>URBAN</td>" in out               # stays white, not the neighbour's red
+    assert "#FF4040" not in out.split("URBAN")[0].split("<td>1. Urban")[-1]
+
+
 def test_colorize_tables_leaves_unmatched_cells_alone(tmp_path):
     from pdf2md.postfix import _colorize_tables
     pdf = _colour_pdf(tmp_path)

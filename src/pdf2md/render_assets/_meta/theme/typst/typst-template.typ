@@ -130,6 +130,17 @@
     )
   }
 
+  // ---- section labels --------------------------------------------------------
+  // "Definition:", "Appearance:" and friends are a bold line introducing the prose,
+  // list or figure grid below them. Left to itself Typst will happily break the page
+  // straight after one, stranding the label at the foot of a page above content it
+  // introduces. `sticky` keeps a block with whatever follows it.
+  // Only a paragraph that is ENTIRELY bold counts as a label; ordinary prose keeps
+  // Typst's normal pagination.
+  show par: it => {
+    if it.body.func() == strong { block(sticky: true, it) } else { it }
+  }
+
   // ---- figure captions ------------------------------------------------------
   // `it.body` renders just the caption text from the qmd; `it` (the default)
   // would add Typst's auto "Figure N:" supplement on top, which the docx-imported
@@ -180,8 +191,15 @@
   show table.cell.where(y: 0): set align(center + horizon)
   // Columns are sized to fit each column's longest word (see the table-fix phase),
   // so disable hyphenation in cells: words wrap whole instead of breaking mid-word
-  // (no "Conif-/erous"), and they still fit because the column floors guarantee it.
+  // (no "Conif-/erous"). The floor is enforced in POINTS, not as a share of the table
+  // (see _colgroup_for), because a relative weight let a long word exceed its column
+  // and spill over the border ("MARINE INLETS AND TRANSITIONAL WATERS", PA21).
   show table.cell: set text(size: 9pt, hyphenate: false)
+  // Ragged-right in cells, as the sources set them. A column holds three or four
+  // words, so justification has almost no slack to distribute and dumps it into a
+  // couple of gaps: measured 2.40pt mean word-gap with a 1.26pt spread (up to 5.6pt)
+  // against the source's 1.52pt / 0.18pt. Body prose keeps its justification.
+  show table.cell: set par(justify: false)
 
   // Nested tables are used for in-cell LAYOUT (e.g. two-column bullet lists),
   // not data — they should carry no border. Every table strips the stroke of

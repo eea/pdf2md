@@ -634,11 +634,17 @@ def _fill_under(text, page, fills, fitz):
             hits = page.search_for(probe)
         except Exception:                      # noqa: BLE001 — odd glyphs, keep going
             hits = None
-        for rect in hits or []:
-            mid = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
-            covering = [f for f in fills if f[0].contains(mid)]
-            if covering:
-                return min(covering, key=lambda f: f[0].get_area())[1]
+        # search_for is CASE-INSENSITIVE, so a short cell text matches its neighbours:
+        # "URBAN" in the MAES column hit "1. Urban" two columns away and the cell was
+        # painted that column's red. With more than one hit there is no way to tell
+        # which is this cell, so decline rather than guess.
+        if len(hits or []) != 1:
+            continue
+        rect = hits[0]
+        mid = fitz.Point((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+        covering = [f for f in fills if f[0].contains(mid)]
+        if covering:
+            return min(covering, key=lambda f: f[0].get_area())[1]
     return None
 
 
@@ -1256,6 +1262,59 @@ def _fence_unfenced_code(text):
     return '\n'.join(lines), len(blocks)
 
 
+# Once a cell's background comes from the source, the theme's text colour is no
+# longer a safe default — it was chosen against white. So a cell that carries a fill
+# carries the source's exact text colour with it; a cell left white keeps the theme's.
+
+
+def _cell_text_colour(page, rect):
+    """Dominant text colour in a cell, or None when the cell holds no text."""
+    from collections import Counter
+    weight = Counter()
+    for block in page.get_text('dict', clip=rect).get('blocks', []):
+        for line in block.get('lines', []):
+            for span in line['spans']:
+                if span['text'].strip():
+                    weight[span['color']] += len(span['text'].strip())
+    if not weight:
+        return None
+    colour = weight.most_common(1)[0][0]
+    return '#%02X%02X%02X' % ((colour >> 16) & 255, (colour >> 8) & 255, colour & 255)
+
+
+# The theme's face is wider than the ones these sources are typeset in, so matching
+# the point size still reads looser than the original: "6.2.1 Beaches and dunes" is
+# 78.2pt wide in the source's Calibri at 8pt and 87.1pt in Lato at the same size.
+# Scaling the sampled size by that ratio matches the ORIGINAL'S OPTICAL WIDTH rather
+# than its nominal size (8.0 x 0.9 = 7.2pt renders 78.4pt wide). Set to 1.0 to keep
+# the source's literal point size instead.
+_TABLE_FONT_SCALE = 0.9
+_TABLE_FONT_MIN_PT = 5.0     # below this a table stops being readable at all
+
+
+def _table_font_size(page, rects):
+    """Dominant font size across a table's cells, or None.
+
+    The theme sets table text at a fixed 9pt; the source knows what this table was
+    actually typeset at (8pt for the PA21 nomenclature table), and honouring that is
+    what keeps a long table as compact as the original.
+    """
+    from collections import Counter
+    weight = Counter()
+    for rect in rects:
+        for block in page.get_text('dict', clip=rect).get('blocks', []):
+            for line in block.get('lines', []):
+                for span in line['spans']:
+                    if span['text'].strip():
+                        weight[round(span['size'], 1)] += len(span['text'].strip())
+    if not weight:
+        return None
+    sampled = weight.most_common(1)[0][0] * _TABLE_FONT_SCALE
+    # Typst takes fractional sizes, and rounding to half points overshot the target
+    # width by 2pt on the reference table — keep one decimal.
+    return max(_TABLE_FONT_MIN_PT, round(sampled, 1))
+
+
 def _grid_to_html(page, table):
     """Render a source grid as an HTML table, spans derived from the cell geometry.
 
@@ -1268,6 +1327,10 @@ def _grid_to_html(page, table):
     rects = [fitz.Rect(c) for row in table.rows for c in row.cells if c]
     if not rects:
         return None
+    # Colour comes from the cell's own rectangle, never from searching for its text:
+    # search_for is case-insensitive, so "URBAN" in the MAES column matched "1. Urban"
+    # in column 1 and the cell inherited that column's red.
+    fills = _page_fills(page, fitz)
     xs = sorted({round(v, 1) for r in rects for v in (r.x0, r.x1)})
     ys = sorted({round(v, 1) for r in rects for v in (r.y0, r.y1)})
 
@@ -1276,7 +1339,8 @@ def _grid_to_html(page, table):
         near = lambda v: min(range(len(edges)), key=lambda i: abs(edges[i] - v))
         return max(1, near(hi) - near(lo))
 
-    out = ['<table>']
+    size = _table_font_size(page, rects)
+    out = ['<table style="font-size:%gpt">' % size if size else '<table>']
     for row in table.rows:
         cells = []
         for cell in row.cells:
@@ -1285,7 +1349,16 @@ def _grid_to_html(page, table):
             r = fitz.Rect(cell)
             text = ' '.join(page.get_text(clip=r).split())
             text = (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
-            attrs = ''
+            style = []
+            mid = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+            covering = [f for f in fills if f[0].contains(mid)]
+            if covering:
+                style.append('background-color:%s' % min(
+                    covering, key=lambda f: f[0].get_area())[1])
+                ink = _cell_text_colour(page, r)   # pin the ink to match the fill
+                if ink:
+                    style.append('color:%s' % ink)
+            attrs = ' style="%s"' % ';'.join(style) if style else ''
             cs, rs = _span(r.x0, r.x1, xs), _span(r.y0, r.y1, ys)
             if cs > 1:
                 attrs += ' colspan="%d"' % cs
