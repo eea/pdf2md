@@ -382,12 +382,17 @@ def build_tbl_caption(caption_text: str) -> str:
     caption_text = _CAPTION_ATTR_RE.sub("", caption_text).strip()
     if not caption_text:
         return ""
+    # #set applies to the end of the ENCLOSING SCOPE, and a Quarto div does not open
+    # one — a bare "#set text(fill: …)" here therefore recolours every page after the
+    # first table caption. Scope it to the caption by passing the text as content.
+    escaped = caption_text
+    for ch in ('\\', '#', '[', ']', '*', '_', '$', '@', '<', '>', '`'):
+        escaped = escaped.replace(ch, '\\' + ch)
     return (
         "::: {.tbl-caption}\n"
         "```{=typst}\n"
-        f'#set text(size: 9pt, fill: rgb("{_TBL_CAPTION_FILL}"))\n'
+        f'#text(size: 9pt, fill: rgb("{_TBL_CAPTION_FILL}"))[{escaped}]\n'
         "```\n"
-        f"{caption_text}\n"
         ":::"
     )
 

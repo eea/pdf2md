@@ -1445,7 +1445,9 @@ class TestLiftHtmlTableCaptions:
         assert "#tbl-" not in out                     # no crossref id → no auto-numbering
         assert "<caption>" not in out                 # caption element removed from html
         assert "Table 4: CZ classes" in out           # source caption kept verbatim
-        assert "#set text" in out                     # embedded raw-typst styling
+        # styling is scoped to the caption: a bare "#set text" would recolour
+        # every page that follows it
+        assert "#text(size: 9pt, fill:" in out and "#set text" not in out
         assert out.rstrip().endswith("```")           # ends with the html table block
 
     def test_idempotent(self):

@@ -52,17 +52,25 @@ _STAR_WRAP_RE = re.compile(r"^(\*{1,2})(.*?)(\*{1,2})$")
 def build_tbl_caption(caption_text: str) -> str:
     """Return a `.tbl-caption` div for `caption_text`, or "" if no visible text.
 
-    Output must stay byte-identical to build_tbl_caption in
-    tools/pdf_to_qmd/src/pdf_to_qmd/resolve.py."""
+    Delegates to resolve.build_tbl_caption so the two cannot drift: this copy kept
+    emitting a bare "#set text(fill: ...)" long after the other was scoped, and every
+    page after a table caption came out blue."""
+    try:                        # keep the two copies from drifting apart again
+        from ...resolve import build_tbl_caption as _shared
+        return _shared(caption_text)
+    except ImportError:         # running standalone, outside the package
+        pass
     caption_text = _CAPTION_ATTR_RE.sub("", caption_text).strip()
     if not caption_text:
         return ""
+    escaped = caption_text
+    for ch in ('\\', '#', '[', ']', '*', '_', '$', '@', '<', '>', '`'):
+        escaped = escaped.replace(ch, '\\' + ch)
     return (
         "::: {.tbl-caption}\n"
         "```{=typst}\n"
-        f'#set text(size: 9pt, fill: rgb("{_TBL_CAPTION_FILL}"))\n'
+        f'#text(size: 9pt, fill: rgb("{_TBL_CAPTION_FILL}"))[{escaped}]\n'
         "```\n"
-        f"{caption_text}\n"
         ":::"
     )
 

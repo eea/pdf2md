@@ -199,6 +199,18 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
     if n_tblblank:
         summary['postfixes_applied'].append(
             'tables: separated {} table(s) glued to a caption/heading'.format(n_tblblank))
+    # the source's bold section labels ("Definition:", "Appearance:") come through as
+    # plain text, or as headings Quarto then numbers
+    cleaned, n_labels = _restore_bold_labels(
+        cleaned, _body_pdf(out_dir, Path(qmd_path).stem))
+    if n_labels:
+        summary['postfixes_applied'].append(
+            'headings: restored bold on {} source label(s)'.format(n_labels))
+    # markdown safety: a heading glued to the paragraph above renders as literal `###`
+    cleaned, n_hdrblank = _ensure_heading_blanks(cleaned)
+    if n_hdrblank:
+        summary['postfixes_applied'].append(
+            'headings: separated {} heading(s) glued to a paragraph'.format(n_hdrblank))
     # markdown safety: a list glued to the paragraph above renders as literal `*` text
     cleaned, n_lstblank = _ensure_list_blanks(cleaned)
     if n_lstblank:
@@ -837,6 +849,99 @@ def _colorize_tables(text, body_pdf):
         return _TABLE_BLOCK_RE.sub(_colorize, text), coloured[0]
     finally:
         doc.close()
+
+
+# A short label on its own line ("Definition:", "Appearance:", "This category
+# includes:") introduces the prose, list or figure grid beneath it. The source sets
+# these in bold; the converter usually emits them as plain text, so they read as
+# stray sentences — and where it emits them as a heading instead, Quarto numbers them
+# ("5.1 This category includes:"). Restore the source's own emphasis in both cases.
+_LABEL_LINE_RE = re.compile(r'^(?P<hashes>#{1,6}\s+)?(?P<text>[A-Z][^*#`|<>]{2,58}:)$')
+
+
+def _source_bold_lines(body_pdf):
+    """Normalised texts the source PDF sets entirely in bold."""
+    try:
+        import fitz
+        doc = fitz.open(str(body_pdf))
+    except Exception as exc:                    # noqa: BLE001 — emphasis is cosmetic
+        log.debug('bold-label scan skipped (%s)', exc)
+        return set()
+    bold = set()
+    try:
+        for page in doc:
+            for block in page.get_text('dict').get('blocks', []):
+                for line in block.get('lines', []):
+                    spans = [sp for sp in line['spans'] if sp['text'].strip()]
+                    if spans and all('bold' in sp['font'].lower() for sp in spans):
+                        text = ' '.join(''.join(sp['text'] for sp in spans).split())
+                        if text:
+                            bold.add(text.lower())
+    finally:
+        doc.close()
+    return bold
+
+
+def _restore_bold_labels(text, body_pdf):
+    """Bold the standalone labels the source prints in bold. Returns (text, n)."""
+    bold = _source_bold_lines(body_pdf)
+    if not bold:
+        return text, 0
+    lines = text.split('\n')
+    out, n, fence = [], 0, False
+    for ln in lines:
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+            out.append(ln)
+            continue
+        m = None if fence else _LABEL_LINE_RE.match(ln.strip())
+        if m and ' '.join(m.group('text').split()).lower() in bold:
+            out.append('**%s**' % m.group('text'))   # never a heading: Quarto numbers those
+            n += 1
+        else:
+            out.append(ln)
+    return '\n'.join(out), n
+
+
+# An ATX heading needs a blank line above it (Pandoc's blank_before_header, on by
+# default). Without one the hashes are escaped and the heading renders as literal
+# "### Urban fabric" inside the paragraph above — 116 of them in a 226-page guide.
+# No blank line is needed after: the heading ends at the newline.
+_HEADING_LINE_RE = re.compile(r'^#{1,6}\s+\S')
+# A fenced div needs the blank line just as a heading does: without one Pandoc leaves
+# "::: {.tbl-caption} Table 3: List :::" as literal text in the paragraph, and the
+# raw-Typst styling inside it escapes into the rest of the document.
+_DIV_OPEN_RE = re.compile(r'^:::+\s*\{')
+
+
+def _ensure_heading_blanks(text):
+    """Insert the blank line an ATX heading or an opening ::: div needs above it.
+
+    Returns (text, n_fixed). Only the OPENING fence needs it — a bare ``:::`` closing
+    a div sits inside the block and is fine where it is.
+
+    Same rule and same repair as _ensure_list_blanks; front matter and fenced blocks
+    are skipped, and a raw-typst directive like "#set text(...)" cannot match because
+    the pattern requires whitespace after the hashes.
+    """
+    lines = text.split('\n')
+    out, n, fence = [], 0, False
+    start = 0
+    if lines and lines[0].strip() == '---':          # YAML front matter: copy verbatim
+        for i in range(1, len(lines)):
+            if lines[i].strip() in ('---', '...'):
+                start = i + 1
+                break
+    out.extend(lines[:start])
+    for ln in lines[start:]:
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+        elif (not fence and out and out[-1].strip()
+                and (_HEADING_LINE_RE.match(ln) or _DIV_OPEN_RE.match(ln.lstrip()))):
+            out.append('')
+            n += 1
+        out.append(ln)
+    return '\n'.join(out), n
 
 
 # An image line: `![caption](path)` with optional `{attrs}`, alone on its line.

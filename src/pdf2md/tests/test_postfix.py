@@ -803,6 +803,101 @@ def test_ensure_pipe_table_blanks():
     assert n2 == 0
 
 
+def _label_pdf(tmp_path):
+    """A page with a bold label, a bold-ish heading and a plain line ending in ':'."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open(); page = doc.new_page()
+    page.insert_text((60, 80), "Appearance:", fontname="hebo")      # bold
+    page.insert_text((60, 110), "Urban fabric appears in blue.")     # plain body
+    page.insert_text((60, 140), "Note the following:")               # plain, ends in ':'
+    out = tmp_path / "labels.pdf"
+    doc.save(str(out)); doc.close()
+    return out
+
+
+def test_restores_bold_on_labels_the_source_prints_bold(tmp_path):
+    """The source sets "Appearance:" in bold; the converter emits it as plain text, so
+    it reads as a stray sentence above the figures it introduces."""
+    from pdf2md.postfix import _restore_bold_labels
+    pdf = _label_pdf(tmp_path)
+    qmd = "Appearance:\n\n* Urban fabric appears in blue.\n"
+    out, n = _restore_bold_labels(qmd, pdf)
+    assert n == 1 and out.startswith("**Appearance:**")
+    assert _restore_bold_labels(out, pdf)[1] == 0            # idempotent
+
+
+def test_label_that_is_not_bold_in_the_source_is_left_alone(tmp_path):
+    """A line ending in ':' is not automatically a label — the source decides."""
+    from pdf2md.postfix import _restore_bold_labels
+    pdf = _label_pdf(tmp_path)
+    out, n = _restore_bold_labels("Note the following:\n\n* item\n", pdf)
+    assert n == 0 and out.startswith("Note the following:")
+
+
+def test_label_emitted_as_a_heading_becomes_bold_not_a_section(tmp_path):
+    """As a heading Quarto numbers it ("5.1 This category includes:"), so a label is
+    always emitted bold, never as a heading."""
+    from pdf2md.postfix import _restore_bold_labels
+    pdf = _label_pdf(tmp_path)
+    out, n = _restore_bold_labels("### Appearance:\n\nBody.\n", pdf)
+    assert n == 1 and "**Appearance:**" in out and "###" not in out
+
+
+def test_labels_inside_fences_are_untouched(tmp_path):
+    from pdf2md.postfix import _restore_bold_labels
+    pdf = _label_pdf(tmp_path)
+    qmd = "```{=typst}\nAppearance:\n```\n"
+    out, n = _restore_bold_labels(qmd, pdf)
+    assert n == 0 and out == qmd
+
+
+def test_no_source_pdf_is_not_fatal(tmp_path):
+    from pdf2md.postfix import _restore_bold_labels
+    qmd = "Appearance:\n"
+    assert _restore_bold_labels(qmd, tmp_path / "missing.pdf") == (qmd, 0)
+
+
+def test_ensure_heading_blanks():
+    """Pandoc's blank_before_header is on by default: a heading glued to the line
+    above is escaped and renders as literal "### Urban fabric" inside that paragraph
+    (116 of them in the PA21 guide)."""
+    from pdf2md.postfix import _ensure_heading_blanks
+    qmd = ("This category includes:\n### Urban fabric\nBody text.\n"
+           "### Transport infrastructure\nMore body.\n\n"
+           "Already spaced:\n\n## Fine heading\n")
+    out, n = _ensure_heading_blanks(qmd)
+    assert n == 2                                   # the already-spaced one is untouched
+    assert "This category includes:\n\n### Urban fabric" in out
+    assert "Body text.\n\n### Transport infrastructure" in out
+    assert out.count("## Fine heading") == 1        # already spaced, untouched
+    assert _ensure_heading_blanks(out)[1] == 0      # idempotent
+
+
+def test_ensure_blanks_before_an_opening_div():
+    """Without the blank line Pandoc leaves "::: {.tbl-caption} Table 3: List :::" as
+    literal text in the paragraph above, and the styling inside it escapes into the
+    rest of the document. A bare closing ::: sits inside the block and is left alone."""
+    from pdf2md.postfix import _ensure_heading_blanks
+    qmd = ("In order to clarify certain mapping delineations.\n"
+           "::: {.tbl-caption}\nTable 3: List of allowed comments\n:::\n")
+    out, n = _ensure_heading_blanks(qmd)
+    assert n == 1
+    assert "delineations.\n\n::: {.tbl-caption}" in out
+    assert "comments\n:::" in out                  # closing fence untouched
+    assert _ensure_heading_blanks(out)[1] == 0
+
+
+def test_ensure_heading_blanks_leaves_typst_directives_and_fences():
+    """"#set text(...)" is not a heading — the pattern needs whitespace after the
+    hashes — and fenced blocks are verbatim."""
+    from pdf2md.postfix import _ensure_heading_blanks
+    qmd = ("---\ntitle: x\n---\n"
+           "Caption:\n```{=typst}\n#set text(size: 9pt)\n#text(fill: red)[hi]\n```\n"
+           "Intro:\n```\n# not a heading in a fence\n```\n")
+    out, n = _ensure_heading_blanks(qmd)
+    assert n == 0 and out == qmd
+
+
 def test_ensure_list_blanks():
     from pdf2md.postfix import _ensure_list_blanks
     # a list glued to the paragraph above is folded into it by Pandoc and renders as

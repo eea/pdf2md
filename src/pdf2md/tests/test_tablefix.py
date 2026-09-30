@@ -298,7 +298,9 @@ class TestPipeCaptionsToDivs:
         assert lines[0] == "::: {.tbl-caption}"        # div now leads, above the table
         assert "Table 2: Caption" in out
         assert ": Table 2: Caption" not in out          # the pipe-caption line is gone
-        assert "#set text" in out                       # embedded raw-typst styling
+        # styling is scoped to the caption: a bare "#set text" would recolour
+        # every page that follows it
+        assert "#text(size: 9pt, fill:" in out and "#set text" not in out
         # the table still follows the div
         assert any(ln.startswith("| A") for ln in lines)
 
@@ -508,7 +510,8 @@ class TestPromoteBareCaptions:
         assert n == 1
         assert out.index(self.DIV0) < out.index("| A | B |")
         assert out.count("Table 1: foo") == 1
-        assert "#set text(size: 9pt" in out
+        # scoped to the caption: a bare "#set text" recolours every following page
+        assert "#text(size: 9pt, fill:" in out and "#set text" not in out
 
     def test_table_caption_above_table_image(self):
         qmd = 'Table 2: classes\n\n![](media/Table2.png){width="3.59in"}\n'
