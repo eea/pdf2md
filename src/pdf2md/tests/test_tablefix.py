@@ -14,6 +14,23 @@ from pdf2md.tablefix.transforms import (  # noqa: E402
 
 # ── Grid normalization: html_table_consistency ────────────────────────────────
 
+def test_column_is_wide_enough_for_its_longest_word():
+    """The weight is a RELATIVE share, so with several columns a long word can be
+    allotted less width than it needs and spill over the cell border ("MARINE INLETS
+    AND TRANSITIONAL WATERS" in the PA21 nomenclature table). The floor is enforced in
+    points, not as a share."""
+    from pdf2md.tablefix.transforms import (_colgroup_for, _CELL_CHAR_PT,
+                                            _CELL_PAD_CHARS, _TEXT_WIDTH_PT)
+    # four wordy columns plus one holding a single 12-character word
+    col_tok = {0: 14, 1: 14, 2: 14, 3: 14, 4: 12}
+    col_len = {0: 90, 1: 90, 2: 90, 3: 90, 4: 37}
+    cg = _colgroup_for(5, col_len, col_tok)
+    widths = [float(part.split("%")[0]) for part in cg.split("width: ")[1:]]
+    assert len(widths) == 5 and abs(sum(widths) - 100.0) < 0.5
+    needed_pt = (col_tok[4] + _CELL_PAD_CHARS) * _CELL_CHAR_PT
+    assert widths[4] * _TEXT_WIDTH_PT / 100.0 >= needed_pt - 0.5   # fits its longest word
+
+
 def test_analyzer_tracks_rowspan_for_column_widths():
     """A cell spanning many rows occupies its columns below; ignoring that files every
     later row's text under the wrong column and starves the real one (PA21 Table 2:
@@ -136,7 +153,7 @@ def _wide_html(ncols, wlen):
 
 class TestRedistributeStackedCaptions:
     def _div(self, cap):
-        return ("::: {.tbl-caption}\n```{=typst}\n#set text(size: 9pt, fill: rgb(\"#3E6893\"))\n```\n"
+        return ("::: {.tbl-caption}\n```{=typst}\n#text(size: 9pt, fill: rgb(\"#3E6893\"))["
                 f"{cap}\n:::")
 
     def test_two_stacked_divs_over_two_tables_redistributed(self):

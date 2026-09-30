@@ -39,6 +39,13 @@ _GRID_MIN_COV = 0.999
 # slots accepted (unchecked, some misplaced) and 48.6% accepted and all sound.
 _FILL_SPAN_MIN = 0.8       # a divider runs (nearly) the full extent of the cell
 _FILL_EDGE_MIN_PT = 15.0   # ignore fills too small to be a column band
+# This document draws its rules as thin filled rectangles, and ERASES a rule where a
+# cell is merged vertically by painting that segment in the cell's own background
+# colour instead of black. find_tables treats any thin rect as a "simulated line", so
+# an erased rule still splits the merged cell ("6.2 Beaches, dunes, river banks" came
+# out as two cells). A rule is dark; a thin rect in some other colour is background.
+_RULE_THIN_PT = 2.0        # a rect this thin is a rule, not a shape
+_RULE_MAX_LEVEL = 0.5      # ...and a real rule is dark
 _FILL_INSET_PT = 3.0       # ignore an edge this close to the cell border
 _MIN_DISTINCT = 8        # fewer distinctive values = sliver, leave it inline
 _VISION_MIN_CHARS = 60   # a vision region with less clip text is noise
@@ -164,6 +171,19 @@ def fill_table_slots(text, slots, working_pdf, api_key):
                 and fitz.Rect(d['rect']).width >= 15 and fitz.Rect(d['rect']).height >= 8]
         return fill_cache[page.number]
 
+    def _rule_paths(page):
+        """Drawings with the "erased" rules removed, so merged cells stay merged."""
+        keep = []
+        for drawing in page.get_drawings():
+            r = fitz.Rect(drawing['rect'])
+            thin = r.height <= _RULE_THIN_PT or r.width <= _RULE_THIN_PT
+            fill = drawing.get('fill')
+            if thin and 'f' in drawing['type'] and (
+                    fill is None or max(fill[:3]) > _RULE_MAX_LEVEL):
+                continue                    # a rule painted in the cell's own colour
+            keep.append(drawing)
+        return keep
+
     def _fill_edges(page, rect):
         """Vertical x-positions implied by the cell fills inside this region."""
         xs = set()
@@ -217,7 +237,8 @@ def fill_table_slots(text, slots, working_pdf, api_key):
         # imply — add_lines exists for exactly this.
         add = [((x, rect.y0), (x, rect.y1)) for x in _fill_edges(page, rect)]
         try:
-            found = page.find_tables(strategy='lines_strict', add_lines=add).tables
+            found = page.find_tables(strategy='lines_strict', add_lines=add,
+                                     paths=_rule_paths(page)).tables
         except Exception:                   # noqa: BLE001 — fall through to vision
             return None, 0.0
         for t in found:

@@ -13,6 +13,13 @@ A3_FONT_PT = 8       # font size on A3-landscape tables
 A3_XL_FONT_PT = 6    # very wide tables: A3-landscape + smaller font
 A3_XXL_FONT_PT = 5   # extreme width: A3-landscape + smallest legible font (the floor)
 _CELL_PAD_CHARS = 3  # per-column char allowance for cell inset (left+right padding)
+# Absolute floor for a column: wide enough for its longest word. The weight below is
+# only a RELATIVE share, so with several columns a long word can still be allotted
+# less than it needs and spill over the cell border ("MARINE INLETS AND TRANSITIONAL
+# WATERS" in the PA21 nomenclature table). Points, not shares, are what actually fit.
+_TEXT_WIDTH_PT = 451.0   # A4 minus the template's 2.54cm side margins
+_CELL_CHAR_PT = 5.2      # ~width of an upper-case glyph at the 9pt cell size
+_FLOOR_MAX_PCT = 40.0    # one pathological word must not starve every other column
 
 _HTML_FENCE_RE = re.compile(r"```\{=html\}\n(?P<inner>.*?)\n```", re.DOTALL)
 
@@ -624,6 +631,23 @@ def _colgroup_for(ncols: int, col_len: dict, col_tok: dict) -> str:
     s = sum(weights) or 1.0
     pct = [max(3.0, w * 100.0 / s) for w in weights]
     s = sum(pct)
+    pct = [p * 100.0 / s for p in pct]
+
+    # raise any column below its longest word's width, paying for it out of the
+    # columns that have room to spare
+    floors = [min(_FLOOR_MAX_PCT,
+                  (max(1, col_tok.get(c, 0)) + _CELL_PAD_CHARS) * _CELL_CHAR_PT
+                  * 100.0 / _TEXT_WIDTH_PT)
+              for c in range(ncols)]
+    if sum(floors) >= 100.0:
+        pct = floors                                  # can't satisfy all; share out
+    else:
+        deficit = sum(max(0.0, f - p) for f, p in zip(floors, pct))
+        surplus = sum(max(0.0, p - f) for f, p in zip(floors, pct))
+        if deficit > 0 and surplus > 0:
+            pct = [f if p < f else p - (p - f) * deficit / surplus
+                   for f, p in zip(floors, pct)]
+    s = sum(pct) or 1.0
     pct = [p * 100.0 / s for p in pct]
     cols = "".join(f'<col style="width: {p:.1f}%">\n' for p in pct)
     return f"<colgroup>\n{cols}</colgroup>"

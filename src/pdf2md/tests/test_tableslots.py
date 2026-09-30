@@ -1,4 +1,5 @@
 """Table-slot fill: markers filled from crops, markerless slots rescued by anchor."""
+import re
 import sys
 
 import pytest
@@ -112,7 +113,7 @@ def test_grid_used_when_the_divider_is_a_printed_rule(tmp_path):
     text, report, captured = _read(pdf, bbox)
     assert report["from_grid"] == 1            # deterministic path, no vision call
     assert "vision" not in captured
-    assert "<td>Alpha</td>" in text and "<td>Beta</td>" in text
+    assert re.search(r"<td[^>]*>Alpha</td>", text) and re.search(r"<td[^>]*>Beta</td>", text)
 
 
 def test_grid_reads_a_colour_divided_table(tmp_path):
@@ -124,8 +125,9 @@ def test_grid_reads_a_colour_divided_table(tmp_path):
     text, report, captured = _read(pdf, bbox)
     assert report["from_grid"] == 1
     assert "vision" not in captured
-    # HTML so merged cells survive and the colour pass has a <td> to style
-    assert "<td>Alpha</td>" in text and "<td>Beta</td>" in text
+    # HTML so merged cells survive; the cell carries the fill sampled from its own
+    # rectangle, so match on content rather than on a bare tag
+    assert re.search(r"<td[^>]*>Alpha</td>", text) and re.search(r"<td[^>]*>Beta</td>", text)
 
 
 def test_grid_declined_when_text_escapes_the_cells(tmp_path):

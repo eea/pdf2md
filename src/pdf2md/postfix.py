@@ -206,6 +206,17 @@ def run_postfix(qmd_path, verify_results, out_dir, *, api_key=None, passes=1, me
             'lists: separated {} list(s) glued to a paragraph'.format(n_lstblank))
     # the convert LLM skips background-color on big tables; sample it from the PDF
     cleaned, n_tblcolor = _colorize_tables(cleaned, _body_pdf(out_dir, Path(qmd_path).stem))
+    cleaned, n_tblmerge = _merge_continued_tables(
+        cleaned, _body_pdf(out_dir, Path(qmd_path).stem))
+    if n_tblmerge:
+        from .tablefix.transforms import stamp_html_colgroups
+        cleaned, _ = stamp_html_colgroups(cleaned)   # re-measure the joined columns
+        summary['postfixes_applied'].append(
+            'tables: rejoined {} table(s) split across source pages'.format(n_tblmerge))
+    cleaned, n_tblfont = _apply_table_font_size(cleaned)
+    if n_tblfont:
+        summary['postfixes_applied'].append(
+            'tables: set {} table(s) at the source font size'.format(n_tblfont))
     if n_tblcolor:
         summary['postfixes_applied'].append(
             'tables: restored background colour on {} cell(s)'.format(n_tblcolor))
@@ -643,6 +654,129 @@ def _with_background(open_tag, color):
     return open_tag[:m.start(2)] + (body + '; ' + decl if body else decl) + open_tag[m.end(2):]
 
 
+# A long table is printed one grid per page, each repeating the header, so detection
+# makes one slot per page and the reader fills them independently — the document ends
+# up with N tables where the source has one. Rejoin them when the evidence is
+# unambiguous: identical headers, and nothing between the two but the fence boundary.
+_HTML_FENCE_TABLE_RE = re.compile(
+    # the opening tag carries attributes (the sampled font size), so match <table …>
+    r'```\{=html\}\n(?P<table><table\b[^>]*>.*?</table>)\n```', re.DOTALL | re.IGNORECASE)
+# A footnote definition often lands between the two halves — the converter emits it
+# wherever its reference fell, which is nondeterministic. It is not content that
+# separates a table from its continuation, so carry it past the join instead of
+# refusing to merge.
+_FOOTNOTE_DEF_RE = re.compile(r'^\[\^[^\]]+\]:')
+
+
+def _locate_table_page(doc, cells):
+    """Index of the page whose text matches most of this table's cells, or None."""
+    probes = [c for c in cells if len(c) >= _PROBE_MIN_CHARS][:_PROBE_CELLS]
+    if not probes:
+        return None
+    best_n, best_i = 0, None
+    for i in range(doc.page_count):
+        n = sum(1 for probe in probes if doc[i].search_for(probe[:40]))
+        if n > best_n:
+            best_n, best_i = n, i
+    return best_i
+
+
+def _header_cells(table):
+    row = re.search(r'<tr[^>]*>(.*?)</tr\s*>', table, re.DOTALL | re.IGNORECASE)
+    if not row:
+        return []
+    return [_cell_text_of(c).lower()
+            for c in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]\s*>', row.group(1),
+                                re.DOTALL | re.IGNORECASE)]
+
+
+# Quarto's Typst writer drops CSS font-size, and the theme pins table cells at 9pt,
+# so an ambient "#set text" cannot reach them either. A `show table.cell` rule can —
+# bracket the table with one and restore the theme's size afterwards. Runs after the
+# merge so a joined table is sized once, as a whole.
+_TABLE_FONT_ATTR_RE = re.compile(
+    r'```\{=html\}\n<table style="font-size:(?P<pt>[\d.]+)pt">(?P<rest>.*?</table>)\n```',
+    re.DOTALL | re.IGNORECASE)
+_THEME_CELL_PT = 9          # matches typst-template.typ's show table.cell rule
+
+
+def _apply_table_font_size(text):
+    """Turn the sampled font-size attribute into a scoped Typst rule. (text, n)."""
+    def _one(m):
+        return ('```{=typst}\n#show table.cell: set text(size: %spt)\n```\n\n'
+                '```{=html}\n<table>%s\n```\n\n'
+                '```{=typst}\n#show table.cell: set text(size: %dpt)\n```'
+                % (m.group('pt'), m.group('rest'), _THEME_CELL_PT))
+    return _TABLE_FONT_ATTR_RE.subn(_one, text)
+
+
+def _merge_continued_tables(text, body_pdf):
+    """Join consecutive HTML tables that are one source table split across pages.
+
+    Returns (new_text, n_merges). The second table's repeated header row is dropped.
+    Three conditions must all hold: identical header cells, nothing but whitespace
+    between the two blocks, and the second table printed on the page AFTER the first.
+    The page test is what separates a continuation from sibling tables that merely
+    share a header — this document has three such 2-row tables, two of them on the
+    same source page, which the first two tests alone would have fused.
+    """
+    blocks = list(_HTML_FENCE_TABLE_RE.finditer(text or ''))
+    if len(blocks) < 2:
+        return text, 0
+    try:
+        import fitz
+        doc = fitz.open(str(body_pdf))
+    except Exception as exc:                    # noqa: BLE001 — merging is best-effort
+        log.debug('table merge skipped (%s)', exc)
+        return text, 0
+    try:
+        pages = [_locate_table_page(doc, [_cell_text_of(m.group(2))
+                                          for m in _TD_RE.finditer(b.group('table'))])
+                 for b in blocks]
+    finally:
+        doc.close()
+    merges, out, last = 0, [], 0
+    i = 0
+    while i < len(blocks) - 1:
+        a, b = blocks[i], blocks[i + 1]
+        between = text[a.end():b.start()]
+        head_a, head_b = _header_cells(a.group('table')), _header_cells(b.group('table'))
+        pa, pb = pages[i], pages[i + 1]
+        carried = [ln for ln in between.split('\n') if ln.strip()]
+        if (not head_a or head_a != head_b or pa is None or pb is None or pb != pa + 1
+                or any(not _FOOTNOTE_DEF_RE.match(ln.strip()) for ln in carried)):
+            i += 1
+            continue
+        # drop the continuation's repeated header, splice its rows onto the first
+        rows_b = re.search(r'<table[^>]*>(.*)</table\s*>', b.group('table'),
+                           re.DOTALL | re.IGNORECASE).group(1)
+        # the continuation carries its own <colgroup>; spliced mid-table it makes the
+        # markup invalid and Pandoc drops the whole table without a word
+        rows_b = re.sub(r'<colgroup>.*?</colgroup>\s*', '', rows_b,
+                        flags=re.DOTALL | re.IGNORECASE)
+        rows_b = re.sub(r'<thead[^>]*>.*?</thead\s*>', '', rows_b,
+                        flags=re.DOTALL | re.IGNORECASE)
+        rows_b = re.sub(r'<tr[^>]*>.*?</tr\s*>', '', rows_b, count=1,
+                        flags=re.DOTALL | re.IGNORECASE)
+        joined = a.group('table').replace('</table>', rows_b.rstrip() + '\n</table>')
+        # the surviving colgroup was measured on the first half alone; the joined
+        # table has the other half's content in the same columns, so drop it and let
+        # the caller re-stamp against everything the table now holds
+        joined = re.sub(r'<colgroup>.*?</colgroup>\s*', '', joined,
+                        flags=re.DOTALL | re.IGNORECASE)
+        out.append(text[last:a.start()])
+        out.append('```{=html}\n' + joined + '\n```')
+        if carried:                             # re-emit below the joined table
+            out.append('\n\n' + '\n\n'.join(ln.strip() for ln in carried))
+        last = b.end()
+        merges += 1
+        i += 2                                  # the pair is consumed
+    if not merges:
+        return text, 0
+    out.append(text[last:])
+    return ''.join(out), merges
+
+
 def _colorize_tables(text, body_pdf):
     """Restore table cell background colours by sampling the source PDF.
 
@@ -675,15 +809,7 @@ def _colorize_tables(text, body_pdf):
         def _colorize(table_m):
             table = table_m.group(0)
             cells = [_cell_text_of(m.group(2)) for m in _TD_RE.finditer(table)]
-            probes = [c for c in cells if len(c) >= _PROBE_MIN_CHARS][:_PROBE_CELLS]
-            if not probes:
-                return table
-            # the table's page is the one matching the most of its cell texts
-            best_n, best_i = 0, None
-            for i in range(doc.page_count):
-                n = sum(1 for p in probes if doc[i].search_for(p[:40]))
-                if n > best_n:
-                    best_n, best_i = n, i
+            best_i = _locate_table_page(doc, cells)
             if best_i is None:
                 return table
             page, fills = doc[best_i], _fills_for(best_i)

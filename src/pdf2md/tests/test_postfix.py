@@ -853,6 +853,103 @@ def _colour_pdf(tmp_path):
     return out
 
 
+def _two_page_table_pdf(tmp_path, same_page=False):
+    """A table printed across two pages, each repeating its header — or, when
+    same_page is set, two sibling tables sharing a header on ONE page."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    def _draw(page, y, first):
+        page.insert_text((60, y), "Level 1")
+        page.insert_text((160, y), "Level 2")
+        page.insert_text((60, y + 20),
+                         "1. Urban fabric areas" if first else "4. Grassland areas")
+        page.insert_text((160, y + 20),
+                         "1.1 industrial units" if first else "4.1 managed grassland")
+    if same_page:
+        page = doc.new_page(); _draw(page, 100, True); _draw(page, 300, False)
+    else:
+        _draw(doc.new_page(), 100, True); _draw(doc.new_page(), 100, False)
+    out = tmp_path / ("same.pdf" if same_page else "split.pdf")
+    doc.save(str(out)); doc.close()
+    return out
+
+
+_COLS = '<colgroup>\\n<col style="width: 50%">\\n<col style="width: 50%">\\n</colgroup>\\n'
+_T1 = ("```{=html}\n<table>\n" + _COLS + "  <tr><td>Level 1</td><td>Level 2</td></tr>\n"
+       "  <tr><td>1. Urban fabric areas</td><td>1.1 industrial units</td></tr>\n</table>\n```")
+_T2 = ("```{=html}\n<table>\n" + _COLS + "  <tr><td>Level 1</td><td>Level 2</td></tr>\n"
+       "  <tr><td>4. Grassland areas</td><td>4.1 managed grassland</td></tr>\n</table>\n```")
+
+
+def test_merges_a_table_split_across_two_source_pages(tmp_path):
+    """One source table printed per page with a repeated header becomes one slot per
+    page, so the document ends up with two tables where the source has one."""
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path)
+    out, n = _merge_continued_tables(_T1 + "\n\n" + _T2 + "\n", pdf)
+    assert n == 1
+    assert out.count("<table>") == 1
+    assert "1. Urban fabric areas" in out and "4. Grassland areas" in out  # no rows lost
+    assert out.count("<td>Level 1</td>") == 1                # repeated header dropped
+    # neither <colgroup> survives: the first was measured on half the table and a
+    # second spliced mid-table makes the markup invalid (Pandoc then silently drops
+    # the whole table). run_postfix re-stamps one against the joined columns.
+    assert out.count("<colgroup>") == 0
+    assert _merge_continued_tables(out, pdf)[1] == 0         # idempotent
+
+
+def test_merges_tables_whose_tag_carries_attributes(tmp_path):
+    """The grid reader records the sampled font size on the opening tag; a merge
+    pattern that insisted on a bare "<table>" silently stopped matching and the split
+    table stayed split."""
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path)
+    a = _T1.replace("<table>", '<table style="font-size:8pt">')
+    b = _T2.replace("<table>", '<table style="font-size:8pt">')
+    out, n = _merge_continued_tables(a + "\n\n" + b + "\n", pdf)
+    assert n == 1 and out.count("<table") == 1
+    assert 'font-size:8pt' in out                     # the size survives the join
+
+
+def test_merges_across_a_footnote_definition(tmp_path):
+    """The converter drops a footnote definition wherever its reference fell, which
+    is nondeterministic — one run put it between the two halves of the nomenclature
+    table and blocked the merge. It is carried past the join, not treated as content
+    that separates the halves."""
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path)
+    note = "[^2]: https://example.org/MAESWorkingPaper2013.pdf"
+    out, n = _merge_continued_tables(_T1 + "\n\n" + note + "\n\n" + _T2 + "\n", pdf)
+    assert n == 1
+    assert out.count("<table>") == 1
+    assert note in out                                   # the footnote survives
+    assert out.index("</table>") < out.index(note)       # …below the joined table
+
+
+def test_prose_between_halves_still_blocks_the_merge(tmp_path):
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path)
+    out, n = _merge_continued_tables(
+        _T1 + "\n\nA sentence of real prose.\n\n" + _T2 + "\n", pdf)
+    assert n == 0 and out.count("<table>") == 2
+
+
+def test_sibling_tables_on_one_page_are_not_merged(tmp_path):
+    """Same header, adjacent in the document, but printed side by side on ONE page:
+    the page test is the only thing separating these from a continuation."""
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path, same_page=True)
+    out, n = _merge_continued_tables(_T1 + "\n\n" + _T2 + "\n", pdf)
+    assert n == 0 and out.count("<table>") == 2
+
+
+def test_tables_separated_by_prose_are_not_merged(tmp_path):
+    from pdf2md.postfix import _merge_continued_tables
+    pdf = _two_page_table_pdf(tmp_path)
+    out, n = _merge_continued_tables(_T1 + "\n\nSome paragraph.\n\n" + _T2 + "\n", pdf)
+    assert n == 0 and out.count("<table>") == 2
+
+
 def test_colorize_tables_samples_cell_colours(tmp_path):
     from pdf2md.postfix import _colorize_tables
     pdf = _colour_pdf(tmp_path)
